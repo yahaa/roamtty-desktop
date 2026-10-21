@@ -431,11 +431,14 @@ pub struct VtEncoder {
     key: bool,
     out: Arc<Mutex<Option<(Vec<u8>, bool)>>>,
     yuv: Vec<u8>,
+    /// Presentation times: the rate control paces by them, and drops frames that all claim 0.
+    start: std::time::Instant,
 }
 
 impl VtEncoder {
     pub fn new() -> VtEncoder {
-        VtEncoder { session: None, w: 0, h: 0, bitrate: 4_000_000, fps: 30.0, key: true, out: Arc::new(Mutex::new(None)), yuv: Vec::new() }
+        VtEncoder { session: None, w: 0, h: 0, bitrate: 4_000_000, fps: 30.0, key: true, out: Arc::new(Mutex::new(None)), yuv: Vec::new(),
+            start: std::time::Instant::now() }
     }
 
     fn set(&self, key: &CFString, value: &CFType) {
@@ -517,13 +520,16 @@ impl VideoEncoder for VtEncoder {
         } else { None };
         self.key = false;
         let out = self.out.clone();
-        let handler = RcBlock::new(move |status: i32, _flags: VTEncodeInfoFlags, sample: *mut CMSampleBuffer| {
+        let handler = RcBlock::new(move |status: i32, flags: VTEncodeInfoFlags, sample: *mut CMSampleBuffer| {
             if status != 0 { return; }
+            // The low-latency rate control drops frames to hold the bitrate: nothing to send, no error.
+            if flags.contains(VTEncodeInfoFlags::FrameDropped) { *out.lock().unwrap() = Some((Vec::new(), false)); return; }
             if let Some(s) = unsafe { sample.as_ref() } { *out.lock().unwrap() = annex_b(s); }
         });
         let session = self.session.as_ref().unwrap();
+        let pts = CMTime { value: self.start.elapsed().as_micros() as i64, timescale: 1_000_000, flags: CMTimeFlags::Valid, epoch: 0 };
         let st = unsafe {
-            session.encode_frame_with_output_handler(&pb, CMTime { value: 0, timescale: 1000, flags: CMTimeFlags::Valid, epoch: 0 },
+            session.encode_frame_with_output_handler(&pb, pts,
                 objc2_core_media::kCMTimeInvalid, props.as_ref().map(|p| p.as_opaque()), std::ptr::null_mut(), &*handler as *const _ as *mut _)
         };
         if st != 0 { return Err(format!("VTCompressionSessionEncodeFrame {st}")); }
@@ -595,6 +601,25 @@ mod tests {
         let types: Vec<u8> = all.windows(5).filter(|w| w[..4] == [0, 0, 0, 1]).map(|w| w[4] & 0x1f).collect();
         assert!(types.contains(&7) && types.contains(&8) && types.contains(&5), "nal types {types:?}");
         std::fs::write(std::env::temp_dir().join("roamtty-vt.h264"), &all).unwrap();
+    }
+
+    /// A full screen of noise at the session's pace is more than 4 Mbps holds: the frames the rate
+    /// control drops come back empty, not as errors, and the rest still decode as a stream.
+    #[test]
+    fn videotoolbox_keeps_every_frame_of_a_busy_screen() {
+        let (w, h) = (1920usize, 1246usize);
+        let mut enc = VtEncoder::new();
+        enc.set_bitrate(4_000_000);
+        let mut seed = 1u32;
+        let (mut sent, mut dropped) = (0, 0);
+        for f in 0..90usize {
+            let bgra: Vec<u8> = (0..w * h * 4).map(|_| { seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345); (seed >> 24) as u8 }).collect();
+            if f % 30 == 15 { enc.set_bitrate(1_000_000 + f as u32 * 50_000); }
+            let (data, _) = enc.encode(&bgra, w, h, w * 4, w, h).expect("a dropped frame is not an error");
+            if data.is_empty() { dropped += 1 } else { sent += 1 }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        assert!(sent > 0 && dropped > 0, "sent {sent} dropped {dropped}");
     }
 
     /// Needs the GUI session: over SSH there is no WindowServer, which is why the agent exists.

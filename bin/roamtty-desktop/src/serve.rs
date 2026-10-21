@@ -213,6 +213,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     let mut ssh_closed: Option<Instant> = None;
     let mut last_key = Instant::now() - Duration::from_secs(2);
     let mut last_udp_rate = Instant::now();
+    let mut last_step: Option<usize> = None;
     let mut was_udp = false;
     let mut last_needs: Vec<String> = Vec::new();
 
@@ -279,11 +280,14 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     }
                     _ => {}
                 },
-                ClientMsg::Ack { frame, .. } => {
+                ClientMsg::Ack { frame, recv_us, decoded_us } => {
                     while let Some(&(f, sent)) = in_flight.front() {
                         if f > frame { break; }
                         in_flight.pop_front();
-                        if f == frame { rc.on_ack(now_us().saturating_sub(sent)); }
+                        // Only the link's share is queueing: a phone decoder that holds a frame until
+                        // the next one arrives adds a whole frame interval, which at 5 fps (the
+                        // ladder's bottom) read as congestion for ever.
+                        if f == frame { rc.on_ack(now_us().saturating_sub(sent).saturating_sub(decoded_us.saturating_sub(recv_us))); }
                     }
                 }
                 ClientMsg::ClipSet(s) => x.clip_set(s),
@@ -347,6 +351,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                 last_udp_rate = Instant::now();
             }
         } else if rc.tick(Instant::now(), cap_bitrate, auto) {
+            if Some(rc.step) != last_step { crate::log!("ssh rate {} kbps, ladder {:?}", rc.bitrate / 1000, LADDER[rc.step]); last_step = Some(rc.step); }
             enc.set_bitrate(rc.bitrate);
             enc.set_fps(fps as f32);
         }

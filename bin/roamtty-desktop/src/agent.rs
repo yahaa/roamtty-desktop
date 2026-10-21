@@ -234,8 +234,16 @@ mod plat {
         if std::fs::write(plist_path(), plist).is_err() { return 1; }
         let uid = unsafe { libc::getuid() };
         let domain = format!("gui/{uid}");
-        let _ = run_quiet("launchctl", &["bootout", &format!("{domain}/{LABEL}")]);
-        if !run_quiet("launchctl", &["bootstrap", &domain, plist_path().to_str().unwrap()]) {
+        let job = format!("{domain}/{LABEL}");
+        let _ = run_quiet("launchctl", &["bootout", &job]);
+        // bootout returns before a busy agent (one serving a capture) has exited, and a bootstrap
+        // then fails with EIO, leaving no agent at all: wait for the old job to go, then retry.
+        for _ in 0..50 {
+            if !run_quiet("launchctl", &["print", &job]) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let bootstrap = || run_quiet("launchctl", &["bootstrap", &domain, plist_path().to_str().unwrap()]);
+        if !(0..5).any(|i| { if i > 0 { std::thread::sleep(std::time::Duration::from_millis(500)); } bootstrap() }) {
             println!("launchctl bootstrap failed: nobody logged in to the desktop?");
             return 5;
         }
