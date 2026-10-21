@@ -112,7 +112,10 @@ most 160 shards; a block of `len` bytes has `k = ceil(len / 1150)` equal shards 
   50 ms after it finished (so late parity counts) and NACKs missing shards when the round trip is under
   40 ms; a message silent for max(300 ms, 3 × RTT) is lost and the client asks for a keyframe (at most
   one a second, and the host sends at most one a second).
-- Reliable (`flags` bit0): resent every max(2 × RTT, 80 ms) until a RACK arrives. The client sends keys,
+- Reliable (`flags` bit0): resent every max(2 × RTT, 80 ms) until a RACK arrives. The client numbers
+  its reliable messages 2n + 1 (n = 0, 1, 2, …) and everything else with even ids; the host applies
+  reliable messages in n order, holding early ones back, so a key's release never overtakes its press.
+  A gap left by a message that never arrives is skipped after 1 s. The client sends keys,
   buttons, text, CONFIG, REQ, ACTION and CLIP_SET reliably; pointer moves, wheel, ACK and PING are not
   (the next one supersedes them). The host sends STATE and CURSOR_SHAPE reliably, with full parity.
 - Congestion control (a simplified GCC): the host compares the reported arrival spread with its send

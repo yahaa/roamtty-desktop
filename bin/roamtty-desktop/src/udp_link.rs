@@ -13,6 +13,35 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const PORTS: std::ops::Range<u16> = 60000..61000;
+
+/// Applies the client's reliable messages (odd ids, 2n + 1) in order: a key's release must never
+/// overtake its press because the press needed a resend. A gap is skipped after a second.
+#[derive(Default)]
+pub struct InOrder { next: u64, held: std::collections::BTreeMap<u64, Vec<u8>>, waiting_since: Option<Instant> }
+
+impl InOrder {
+    pub fn push(&mut self, msg: u32, bytes: Vec<u8>) -> Vec<Vec<u8>> {
+        let n = (msg as u64).saturating_sub(1) / 2;
+        if n < self.next { return Vec::new(); }
+        self.held.insert(n, bytes);
+        self.drain()
+    }
+
+    fn drain(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(b) = self.held.remove(&self.next) { out.push(b); self.next += 1; }
+        self.waiting_since = if self.held.is_empty() { None } else { self.waiting_since.or(Some(Instant::now())) };
+        out
+    }
+
+    /// After a second stuck on a gap, the held messages go out anyway.
+    pub fn overdue(&mut self) -> Vec<Vec<u8>> {
+        if self.waiting_since.is_none_or(|t| t.elapsed() < Duration::from_secs(1)) { return Vec::new(); }
+        if let Some(&first) = self.held.keys().next() { self.next = first; }
+        self.waiting_since = None;
+        self.drain()
+    }
+}
 /// Silence after which the link counts as down and video falls back to the SSH channel.
 pub const ALIVE_US: u64 = 3_000_000;
 
@@ -273,6 +302,7 @@ impl UdpLink {
         let mut buf = vec![0u8; 2048];
         let mut replay = ReplayWindow::default();
         let mut reasm = Reassembler::default();
+        let mut order = InOrder::default();
         loop {
             let Ok((n, from)) = self.sock.recv_from(&mut buf) else {
                 reasm.expire(now_us(), 2_000_000);
@@ -303,8 +333,11 @@ impl UdpLink {
                     match reasm.push(f, now_us()) {
                         Some(d) => {
                             if reliable { self.raw_send(&Packet::Rack(vec![msg]).encode(), false); }
-                            if let Some(Ok(Some((t, p)))) = Some(proto::read_frame(&mut d.bytes.as_slice())) {
-                                if let Ok(m) = proto::decode_client(t, &p) { let _ = tx.send(Some(m)); }
+                            let ready = if reliable { order.push(msg, d.bytes) } else { vec![d.bytes] };
+                            for bytes in ready {
+                                if let Ok(Some((t, p))) = proto::read_frame(&mut bytes.as_slice()) {
+                                    if let Ok(m) = proto::decode_client(t, &p) { let _ = tx.send(Some(m)); }
+                                }
                             }
                         }
                         // A resend of something already delivered: the RACK was lost, say it again.
@@ -312,6 +345,11 @@ impl UdpLink {
                         None => {}
                     }
                     reasm.expire(now_us(), 2_000_000);
+                    for bytes in order.overdue() {
+                        if let Ok(Some((t, p))) = proto::read_frame(&mut bytes.as_slice()) {
+                            if let Ok(m) = proto::decode_client(t, &p) { let _ = tx.send(Some(m)); }
+                        }
+                    }
                 }
                 Packet::Rack(ids) => { let mut r = self.reliable.lock().unwrap(); for i in ids { r.remove(&i); } }
                 Packet::Nack { msg, block, indices } => {
@@ -364,6 +402,18 @@ mod tests {
             g.on_report(&report(i as u32, 50_000 + i * 22_000, 10, 11), &s, i * 16_000);
         }
         assert!(g.target < 8_000_000.0, "target {}", g.target);
+    }
+
+    #[test]
+    fn reliable_messages_apply_in_order() {
+        let mut o = InOrder::default();
+        assert_eq!(o.push(1, vec![0]), vec![vec![0]]);
+        assert!(o.push(5, vec![2]).is_empty(), "held until 3 arrives");
+        assert_eq!(o.push(3, vec![1]), vec![vec![1], vec![2]]);
+        assert!(o.push(3, vec![1]).is_empty(), "a resend is dropped");
+        assert!(o.push(9, vec![4]).is_empty());
+        o.waiting_since = Some(Instant::now() - Duration::from_secs(2));
+        assert_eq!(o.overdue(), vec![vec![4]], "a lost message does not block forever");
     }
 
     #[test]
