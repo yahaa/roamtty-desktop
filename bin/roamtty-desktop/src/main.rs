@@ -11,7 +11,7 @@ mod x11;
 
 use std::path::Path;
 
-const OPENH264_URL: &str = "http://ciscobinary.openh264.org";
+const OPENH264_URL: &str = "https://ciscobinary.openh264.org";
 
 fn usage() -> i32 {
     eprintln!("usage: roamtty-desktop serve --proto N --client WxH@DPI [--resume S --token T]\n       roamtty-desktop doctor [--json] | install [--openh264 FILE.bz2] | uninstall | --version");
