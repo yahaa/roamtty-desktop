@@ -47,6 +47,7 @@ jobs:
         with:
           path: bins
       - run: scripts/package.sh "${GITHUB_REF_NAME#v}" linux-x86_64=bins/linux-x86_64/linux-x86_64 linux-aarch64=bins/linux-aarch64/linux-aarch64
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "roamtty-desktop $GITHUB_REF_NAME"
+      # A release is immutable once published: the app pins its SHA-256, so never replace its files.
+      - run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "roamtty-desktop $GITHUB_REF_NAME"
         env:
           GH_TOKEN: ${{ github.token }}

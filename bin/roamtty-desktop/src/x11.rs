@@ -79,7 +79,7 @@ pub struct X11 {
     keymap: Vec<u32>,
     min_keycode: u8,
     per_keycode: u8,
-    spare: Option<u8>,
+    spare: Vec<u8>,
     wheel: (i32, i32),
     cursor_serial: u32,
 }
@@ -113,11 +113,12 @@ impl X11 {
         let max_keycode = conn.setup().max_keycode;
         let map = conn.get_keyboard_mapping(min_keycode, max_keycode - min_keycode + 1).map_err(err)?.reply().map_err(err)?;
         let per = map.keysyms_per_keycode;
-        // The highest keycode with no symbols at all is borrowed for characters the layout lacks.
-        let spare = (min_keycode..=max_keycode).rev().find(|k| {
+        // Keycodes with no symbols at all are borrowed for characters the layout lacks. Several, used in
+        // turn, so a client still reading one remap never sees the next character's.
+        let spare: Vec<u8> = (min_keycode..=max_keycode).rev().filter(|k| {
             let i = (*k - min_keycode) as usize * per as usize;
             map.keysyms[i..i + per as usize].iter().all(|s| *s == 0)
-        });
+        }).take(8).collect();
         let mut x = X11 { conn, root, width, height, shm: None, keymap: map.keysyms, min_keycode, per_keycode: per, spare, wheel: (0, 0), cursor_serial: 0 };
         x.shm = x.make_shm().ok();
         Ok(x)
@@ -254,6 +255,7 @@ impl X11 {
     /// spare keycode remapped to the character for one press (what xdotool does).
     pub fn text(&mut self, s: &str) -> Result<()> {
         let shift = keymap::hid_to_evdev(keymap::HID_LEFT_SHIFT).unwrap() as u8 + 8;
+        let mut used = 0usize;
         for ch in s.chars() {
             let keysym = match ch {
                 '\n' | '\r' => 0xFF0D,
@@ -267,17 +269,29 @@ impl X11 {
                 self.keycode(code, true)?;
                 self.keycode(code, false)?;
                 if shifted { self.keycode(shift, false)?; }
-            } else if let Some(spare) = self.spare {
+            } else if !self.spare.is_empty() {
+                let spare = self.spare[used % self.spare.len()];
+                if used >= self.spare.len() {
+                    // Every spare is taken: let clients catch up before one is reused.
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+                used += 1;
                 let syms = vec![keysym; self.per_keycode as usize];
                 self.conn.change_keyboard_mapping(1, spare, self.per_keycode, &syms).map_err(err)?;
-                self.conn.sync().map_err(err)?;
+                self.conn.get_input_focus().map_err(err)?.reply().map_err(err)?;
+                // Clients apply the new mapping when MappingNotify reaches them; give that a moment.
+                std::thread::sleep(std::time::Duration::from_millis(12));
                 self.keycode(spare, true)?;
                 self.keycode(spare, false)?;
-                self.conn.sync().map_err(err)?;
-                // Give clients time to read the key before the mapping goes back to empty.
-                std::thread::sleep(std::time::Duration::from_millis(8));
-                let empty = vec![0u32; self.per_keycode as usize];
-                self.conn.change_keyboard_mapping(1, spare, self.per_keycode, &empty).map_err(err)?;
+                self.conn.get_input_focus().map_err(err)?.reply().map_err(err)?;
+            }
+        }
+        if used > 0 {
+            // The mappings go back to empty only after the clients read the last key.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            let empty = vec![0u32; self.per_keycode as usize];
+            for k in self.spare.iter().take(used) {
+                self.conn.change_keyboard_mapping(1, *k, self.per_keycode, &empty).map_err(err)?;
             }
         }
         self.flush();
