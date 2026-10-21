@@ -47,6 +47,8 @@ pub trait Backend {
         };
         self.tap(keys)
     }
+    /// "断开后锁定电脑": locks the session when the connection really ends.
+    fn lock_screen(&mut self) { let _ = std::process::Command::new("loginctl").arg("lock-session").status(); }
     /// What the user must allow on the host before the desktop works (macOS TCC).
     fn needs(&self) -> Vec<String> { Vec::new() }
 }

@@ -9,15 +9,17 @@ mod paths;
 mod serve;
 mod session;
 mod udp_link;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod openh264enc;
+#[cfg(windows)]
+mod win;
 #[cfg(target_os = "linux")]
 mod wl;
 #[cfg(target_os = "linux")]
 mod x11;
 #[cfg(target_os = "macos")]
 mod mac;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod agent;
 
 use std::path::Path;
@@ -30,7 +32,7 @@ pub const OS: &str = "macos";
 pub const OS: &str = "windows";
 
 /// The H.264 encoder for this platform.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub fn open_encoder() -> Result<Box<dyn encode::VideoEncoder>, String> {
     let lib = openh264enc::openh264_path().filter(|p| p.exists()).ok_or("OpenH264 is not installed")?;
     Ok(Box::new(openh264enc::H264::new(&lib)?))
@@ -38,6 +40,11 @@ pub fn open_encoder() -> Result<Box<dyn encode::VideoEncoder>, String> {
 
 #[cfg(target_os = "macos")]
 pub fn open_encoder() -> Result<Box<dyn encode::VideoEncoder>, String> { Ok(Box::new(mac::VtEncoder::new())) }
+
+#[cfg(windows)]
+pub fn open_desktop() -> Result<Box<dyn backend::Backend>, (&'static str, String)> {
+    win::Win::open().map(|w| Box::new(w) as Box<dyn backend::Backend>).map_err(|e| ("not_logged_in", e))
+}
 
 #[cfg(target_os = "macos")]
 pub fn open_desktop() -> Result<Box<dyn backend::Backend>, (&'static str, String)> {
@@ -60,7 +67,7 @@ pub fn open_desktop() -> Result<Box<dyn backend::Backend>, (&'static str, String
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const OPENH264_URL: &str = "https://ciscobinary.openh264.org";
 
 fn usage() -> i32 {
@@ -76,7 +83,7 @@ fn main() {
             0
         }
         Some("serve") => serve_cmd(&args[1..]),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Some("agent") => agent::run(),
         #[cfg(target_os = "macos")]
         Some("print-info-plist") => { print!("{}", agent::info_plist()); 0 }
@@ -102,18 +109,18 @@ fn serve_cmd(args: &[String]) -> i32 {
         .unwrap_or(1920);
     let a = serve::Args { proto, client_long, resume: flag(args, "--resume").map(String::from), token: flag(args, "--token").map(String::from),
         retired: Default::default(), claimed: None };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     return agent::bridge(&a);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     serve::run(a)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn doctor() -> i32 {
     let agent = agent::ask_doctor();
     let j = serde_json::json!({
         "ver": env!("CARGO_PKG_VERSION"), "proto": proto::PROTO, "os": OS, "arch": std::env::consts::ARCH,
-        "agent": agent.is_some(), "encoder": "videotoolbox",
+        "agent": agent.is_some(), "encoder": if cfg!(windows) { "openh264" } else { "videotoolbox" },
         "needs": agent.as_ref().map(|a| a["needs"].clone()).unwrap_or(serde_json::json!(["not-logged-in"])),
     });
     println!("{j}");
@@ -122,6 +129,14 @@ fn doctor() -> i32 {
 
 #[cfg(target_os = "macos")]
 fn install(_: &[String]) -> i32 { agent::install() }
+
+/// Windows: Cisco's OpenH264 first (as on Linux), then the scheduled task that runs the agent.
+#[cfg(windows)]
+fn install(args: &[String]) -> i32 {
+    let r = install_openh264(args);
+    if r != 0 { return r; }
+    agent::install()
+}
 
 #[cfg(target_os = "linux")]
 fn doctor() -> i32 {
@@ -143,15 +158,18 @@ fn doctor() -> i32 {
     0
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn sha256_hex(b: &[u8]) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Installs Cisco's OpenH264 from a .bz2 the app uploaded, or downloads it here (10 s at most).
 #[cfg(target_os = "linux")]
-fn install(args: &[String]) -> i32 {
+fn install(args: &[String]) -> i32 { install_openh264(args) }
+
+/// Installs Cisco's OpenH264 from a .bz2 the app uploaded, or downloads it here (10 s at most).
+#[cfg(any(target_os = "linux", windows))]
+fn install_openh264(args: &[String]) -> i32 {
     let Some(name) = openh264enc::openh264_name() else { eprintln!("unsupported architecture"); return 1 };
     let lib = paths::lib_dir().join(name);
     if lib.exists() && openh264::OpenH264API::from_blob_path(&lib).is_ok() {
@@ -186,7 +204,7 @@ fn install(args: &[String]) -> i32 {
     0
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn download(url: &str) -> Result<Vec<u8>, String> {
     for (tool, args) in [("curl", vec!["-fsSL", "--max-time", "10", url]), ("wget", vec!["-q", "-T", "10", "-O", "-", url])] {
         if let Ok(o) = std::process::Command::new(tool).args(&args).output() {
@@ -197,7 +215,7 @@ fn download(url: &str) -> Result<Vec<u8>, String> {
 }
 
 fn uninstall() -> i32 {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     agent::uninstall();
     let _ = std::fs::remove_dir_all(paths::desktop_dir());
     let bin = paths::bin_path();

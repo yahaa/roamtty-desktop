@@ -120,8 +120,7 @@ pub struct LinkStats { pub sent_packets: u64, pub resent: u64, pub received_pack
 impl UdpLink {
     /// Binds the first free port of the mosh range; None when none is free.
     pub fn bind(start_rate: f64) -> Option<Arc<UdpLink>> {
-        let mut key = [0u8; 16];
-        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").ok()?, &mut key).ok()?;
+        let key: [u8; 16] = crate::session::random_bytes(16).try_into().ok()?;
         let offset = (std::process::id() as u16) % (PORTS.end - PORTS.start);
         let sock = (0..PORTS.end - PORTS.start)
             .map(|i| PORTS.start + (offset + i) % (PORTS.end - PORTS.start))
@@ -162,8 +161,7 @@ impl UdpLink {
     fn dropped(&self) -> bool {
         let ppm = self.drop_ppm.load(Ordering::Relaxed);
         if ppm == 0 { return false; }
-        let mut b = [0u8; 4];
-        let _ = std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").unwrap(), &mut b);
+        let b: [u8; 4] = crate::session::random_bytes(4).try_into().unwrap();
         u32::from_le_bytes(b) % 1_000_000 < ppm
     }
 

@@ -388,6 +388,8 @@ impl Backend for Mac {
 
     fn flush(&mut self) {}
 
+    fn lock_screen(&mut self) { let _ = std::process::Command::new("pmset").arg("displaysleepnow").status(); }
+
     fn needs(&self) -> Vec<String> {
         let mut n = needs();
         if self.denied && !n.iter().any(|x| x == "screen-recording") { n.insert(0, "screen-recording".into()); }

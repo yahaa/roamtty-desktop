@@ -59,10 +59,10 @@ pub struct Args {
     pub claimed: Option<session::Session>,
 }
 
+/// Monotonic microseconds since the process started (never 0, which means "none" on the wire).
 pub fn now_us() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
-    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
 }
 
 fn fail_on(out: &mut dyn Write, code: &str, detail: impl Into<String>) -> i32 {
@@ -131,7 +131,7 @@ impl RateControl {
 }
 
 /// `serve` on the SSH channel itself.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn run(args: Args) -> i32 {
     let stdout = std::io::stdout();
     run_on(args, Box::new(std::io::stdin()), Box::new(stdout))
@@ -438,9 +438,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     crate::log!("serve end frames={frame_no} bytes={sent_total} retired={retired}");
     if retired == 0 && !agent_claimed {
         session::release();
-        if lock_on_close {
-            let _ = std::process::Command::new("loginctl").arg("lock-session").status();
-        }
+        if lock_on_close { x.lock_screen(); }
     }
     0
 }

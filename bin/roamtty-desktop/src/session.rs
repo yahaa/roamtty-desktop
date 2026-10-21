@@ -3,7 +3,9 @@
 
 use crate::paths;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicU8;
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Session {
@@ -14,17 +16,18 @@ pub struct Session {
 /// 0 = keep going, 1 = kicked by another device, 2 = replaced by the same device.
 pub static RETIRED: AtomicU8 = AtomicU8::new(0);
 
+#[cfg(unix)]
 extern "C" fn on_kick(_: libc::c_int) { RETIRED.store(1, Ordering::SeqCst); }
+#[cfg(unix)]
 extern "C" fn on_replace(_: libc::c_int) { RETIRED.store(2, Ordering::SeqCst); }
 
-pub fn random_b64(n: usize) -> String {
+pub fn random_bytes(n: usize) -> Vec<u8> {
     let mut b = vec![0u8; n];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut b);
-    }
-    b64(&b)
+    getrandom::fill(&mut b).expect("system randomness");
+    b
 }
+
+pub fn random_b64(n: usize) -> String { b64(&random_bytes(n)) }
 
 pub fn b64(b: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -40,6 +43,7 @@ pub fn b64(b: &[u8]) -> String {
 
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 
+#[cfg(unix)]
 fn is_serve(pid: i32) -> bool {
     std::fs::read(format!("/proc/{pid}/cmdline")).map(|c| {
         let args: Vec<&[u8]> = c.split(|b| *b == 0).collect();
@@ -48,6 +52,7 @@ fn is_serve(pid: i32) -> bool {
 }
 
 /// Takes over the desktop; returns the session the hello should carry.
+#[cfg(unix)]
 pub fn claim(resume: Option<&str>, token: Option<&str>) -> Session {
     unsafe {
         libc::signal(libc::SIGUSR1, on_kick as *const () as usize);
@@ -61,9 +66,7 @@ pub fn claim(resume: Option<&str>, token: Option<&str>) -> Session {
         Some(s) if same => s,
         Some(s) => Session { session: s.session, resume_token: random_b64(16) },
         None => {
-            let mut b = [0u8; 8];
-            if let Ok(mut f) = std::fs::File::open("/dev/urandom") { use std::io::Read; let _ = f.read_exact(&mut b); }
-            Session { session: hex(&b), resume_token: random_b64(16) }
+            Session { session: hex(&random_bytes(8)), resume_token: random_b64(16) }
         }
     };
     let _ = paths::write_private(&state, &serde_json::to_vec(&session).unwrap());
@@ -77,6 +80,10 @@ pub fn claim(resume: Option<&str>, token: Option<&str>) -> Session {
     let _ = paths::write_private(&pidfile, std::process::id().to_string().as_bytes());
     session
 }
+
+/// Windows and macOS hand the desktop out in their agent, never here.
+#[cfg(not(unix))]
+pub fn claim(_: Option<&str>, _: Option<&str>) -> Session { Session { session: hex(&random_bytes(8)), resume_token: random_b64(16) } }
 
 pub fn release() {
     let pidfile = paths::desktop_dir().join("controller.pid");

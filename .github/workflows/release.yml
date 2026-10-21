@@ -30,6 +30,25 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            name: windows-x64
+          - target: aarch64-pc-windows-msvc
+            name: windows-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - run: copy target\${{ matrix.target }}\release\roamtty-desktop.exe ${{ matrix.name }}
+        shell: cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
   deny:
     runs-on: ubuntu-22.04
     steps:
@@ -39,14 +58,16 @@ jobs:
           command: check licenses
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, deny]
+    needs: [linux, windows, deny]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: bins
-      - run: scripts/package.sh "${GITHUB_REF_NAME#v}" linux-x86_64=bins/linux-x86_64/linux-x86_64 linux-aarch64=bins/linux-aarch64/linux-aarch64
+      # macos-universal.zip is built, signed and notarized on a Mac (scripts/macos-release.sh) and
+      # added to the release with the manifest afterwards.
+      - run: scripts/package.sh "${GITHUB_REF_NAME#v}" linux-x86_64=bins/linux-x86_64/linux-x86_64 linux-aarch64=bins/linux-aarch64/linux-aarch64 windows-x64=bins/windows-x64/windows-x64 windows-arm64=bins/windows-arm64/windows-arm64
       # A release is immutable once published: the app pins its SHA-256, so never replace its files.
       - run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "roamtty-desktop $GITHUB_REF_NAME"
         env:

@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 
 /// The Cisco file name for this machine, e.g. `libopenh264-2.6.0-linux64.8.so`.
 pub fn openh264_name() -> Option<&'static str> {
-    match std::env::consts::ARCH {
-        "x86_64" => Some("libopenh264-2.6.0-linux64.8.so"),
-        "aarch64" => Some("libopenh264-2.6.0-linux-arm64.8.so"),
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("libopenh264-2.6.0-linux64.8.so"),
+        ("linux", "aarch64") => Some("libopenh264-2.6.0-linux-arm64.8.so"),
+        ("windows", "x86_64") => Some("openh264-2.6.0-win64.dll"),
+        ("windows", "aarch64") => Some("openh264-2.6.0-win-arm64.dll"),
         _ => None,
     }
 }
