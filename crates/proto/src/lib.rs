@@ -2,6 +2,9 @@
 //!
 //! After the hello line every message is `u8 type | u24 len | payload`, big endian.
 
+pub mod fec;
+pub mod udp;
+
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
@@ -103,6 +106,9 @@ pub struct Config {
     pub udp_client_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lock_on_close: Option<bool>,
+    /// Test fixtures only (the plugin honours it with ROAMTTY_DESKTOP_TEST=1): drop this share of UDP datagrams.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub debug_loss: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -340,6 +346,23 @@ mod tests {
                 let m = decode_client(t, &p).unwrap();
                 assert_eq!(encode_client(&m), (t, p.clone()), "{name} round trip");
             }
+        }
+        // UDP: one sealed heartbeat and the fragments of a 3000-byte video message at 50% parity,
+        // each fragment as `u16 len | plaintext`.
+        let mut key = [0u8; 16];
+        for (i, b) in key.iter_mut().enumerate() { *b = i as u8; }
+        let sealed = udp::Crypto::new(&key).seal(udp::DIR_S2C, 7, &udp::Packet::Heartbeat { t: 1, echo: 2 }.encode());
+        let message: Vec<u8> = (0..3000u32).map(|i| (i * 13 % 256) as u8).collect();
+        let mut frags = Vec::new();
+        for f in udp::fragment(5, udp::FLAG_VIDEO, &message, 0.5) {
+            let p = udp::Packet::Frag(f).encode();
+            frags.extend((p.len() as u16).to_be_bytes());
+            frags.extend(p);
+        }
+        for (name, bytes) in [("udp-sealed.bin", sealed), ("udp-frags.bin", frags)] {
+            let path = dir.join(name);
+            if update { std::fs::write(&path, &bytes).unwrap(); }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
         }
         let json = serde_json::to_string(&hello()).unwrap();
         let path = dir.join("hello.json");

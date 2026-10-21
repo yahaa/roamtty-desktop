@@ -7,6 +7,7 @@ mod log;
 mod paths;
 mod serve;
 mod session;
+mod udp_link;
 mod x11;
 
 use std::path::Path;

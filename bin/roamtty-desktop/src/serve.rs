@@ -4,13 +4,49 @@
 use crate::encode::{self, H264};
 use crate::keymap;
 use crate::session;
+use crate::udp_link::UdpLink;
 use crate::x11::{Clipboard, X11};
 use proto::{ty, ClientMsg, Hello, Input, StartError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Where frames go: over UDP while the link is alive, else down the SSH channel that started us.
+struct Out<W: Write> {
+    ssh: BufWriter<W>,
+    ssh_open: bool,
+    link: Option<Arc<UdpLink>>,
+}
+
+impl<W: Write> Out<W> {
+    fn udp(&self) -> bool { self.link.as_ref().is_some_and(|l| l.alive()) }
+
+    fn emit(&mut self, t: u8, payload: &[u8]) {
+        if let Some(l) = self.link.as_ref().filter(|l| l.alive()) {
+            l.send_frame(t, payload);
+            return;
+        }
+        if self.ssh_open && proto::write_frame(&mut self.ssh, t, payload).is_err() { self.ssh_open = false; }
+    }
+
+    fn flush(&mut self) {
+        if self.ssh_open && self.ssh.flush().is_err() { self.ssh_open = false; }
+    }
+}
+
+/// The auto ladder step for a bitrate the UDP controller settled on.
+fn step_for(bitrate: f64) -> usize {
+    match bitrate {
+        b if b >= 4_000_000.0 => 0,
+        b if b >= 2_500_000.0 => 1,
+        b if b >= 1_200_000.0 => 2,
+        b if b >= 600_000.0 => 3,
+        _ => 4,
+    }
+}
 
 pub struct Args {
     pub proto: u32,
@@ -109,17 +145,23 @@ pub fn run(args: Args) -> i32 {
     let clip = Clipboard::start().ok();
     let displays = x.displays();
     let sess = session::claim(args.resume.as_deref(), args.token.as_deref());
+    // The UDP port and a fresh key ride in the hello; the key never touches the disk.
+    let link = UdpLink::bind(4_000_000.0);
     let hello = Hello {
         proto: proto::PROTO, ver: env!("CARGO_PKG_VERSION").into(), os: "linux".into(),
         session: sess.session.clone(), resume_token: sess.resume_token.clone(), displays: displays.clone(),
-        enc: vec!["h264".into()], hw: "openh264".into(), needs: vec![], udp: None,
+        enc: vec!["h264".into()], hw: "openh264".into(), needs: vec![],
+        udp: link.as_ref().map(|l| proto::Udp { port: l.port, key: session::b64(&l.key) }),
     };
     let stdout = std::io::stdout();
-    let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
-    if writeln!(out, "{}", serde_json::to_string(&hello).unwrap()).and_then(|_| out.flush()).is_err() { return 1; }
+    let mut ssh = BufWriter::with_capacity(1 << 20, stdout.lock());
+    if writeln!(ssh, "{}", serde_json::to_string(&hello).unwrap()).and_then(|_| ssh.flush()).is_err() { return 1; }
+    let test_hooks = std::env::var("ROAMTTY_DESKTOP_TEST").as_deref() == Ok("1");
     crate::log!("serve start {}x{} displays={}", x.width, x.height, displays.len());
 
     let (tx, rx) = mpsc::channel::<Option<ClientMsg>>();
+    if let Some(l) = &link { l.start(tx.clone()); }
+    let mut out = Out { ssh, ssh_open: true, link: link.clone() };
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut r = std::io::BufReader::new(stdin.lock());
@@ -157,23 +199,21 @@ pub fn run(args: Args) -> i32 {
     let mut next_tick = Instant::now();
     let mut ended = false;
     let mut sent_total = 0u64;
-
-    macro_rules! send {
-        ($t:expr, $p:expr) => {
-            if proto::write_frame(&mut out, $t, &$p).is_err() { ended = true; }
-        };
-    }
+    let mut ssh_closed: Option<Instant> = None;
+    let mut last_key = Instant::now() - Duration::from_secs(2);
+    let mut last_udp_rate = Instant::now();
+    let mut was_udp = false;
 
     while !ended {
         match session::RETIRED.load(Ordering::SeqCst) {
-            1 => { let _ = proto::write_frame(&mut out, ty::STATE, br#"{"kicked":true}"#); let _ = out.flush(); break; }
+            1 => { out.emit(ty::STATE, br#"{"kicked":true}"#); out.flush(); std::thread::sleep(Duration::from_millis(300)); break; }
             2 => break,
             _ => {}
         }
         let wait = next_tick.saturating_duration_since(Instant::now());
         let msg = rx.recv_timeout(wait);
         let mut dirty_input = false;
-        let mut handle = |m: ClientMsg, x: &mut X11, out: &mut BufWriter<_>| -> Option<bool> {
+        let mut handle = |m: ClientMsg, x: &mut X11, out: &mut Out<_>| -> Option<bool> {
             match m {
                 ClientMsg::Config(c) => {
                     if let Some(d) = c.display { if (d as usize) < displays.len() && d as usize != display { display = d as usize; want_key = true; } }
@@ -181,6 +221,18 @@ pub fn run(args: Args) -> i32 {
                     if let Some(q) = c.quality { quality = q; rc.step = 0; want_key = true; }
                     if let Some(b) = c.max_bitrate { max_bitrate = Some(b); }
                     if let Some(l) = c.lock_on_close { lock_on_close = l; }
+                    if let (Some(on), Some(l)) = (c.udp, &out.link) { l.enabled.store(on, Ordering::Relaxed); }
+                    if let (Some(port), Some(l)) = (c.udp_client_port, &out.link) {
+                        // The phone's address as sshd saw it: punch a hole towards its UDP port.
+                        if let Some(ip) = std::env::var("SSH_CLIENT").ok().and_then(|v| v.split(' ').next().map(String::from))
+                            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok()) {
+                            l.punch(std::net::SocketAddr::new(ip, port));
+                        }
+                    }
+                    if let (Some(loss), Some(l), true) = (c.debug_loss, &out.link, test_hooks) {
+                        l.drop_ppm.store((loss.clamp(0.0, 1.0) * 1_000_000.0) as u32, Ordering::Relaxed);
+                        crate::log!("test hook: udp loss {loss}");
+                    }
                 }
                 ClientMsg::Input(i) if !view_only => {
                     let d = &displays[display];
@@ -218,8 +270,8 @@ pub fn run(args: Args) -> i32 {
                     proto::req::CLIP_GET => {
                         let text = clip.as_ref().and_then(|c| c.get()).unwrap_or_default();
                         let body = serde_json::json!({ "clip": text }).to_string();
-                        if proto::write_frame(out, ty::STATE, body.as_bytes()).is_err() { return None; }
-                        let _ = out.flush();
+                        out.emit(ty::STATE, body.as_bytes());
+                        out.flush();
                     }
                     _ => {}
                 },
@@ -233,8 +285,8 @@ pub fn run(args: Args) -> i32 {
                 ClientMsg::ClipSet(s) => { if let Some(c) = &clip { c.set(s); } }
                 ClientMsg::Ping(t1) => {
                     let t = now_us();
-                    if proto::write_frame(out, ty::PONG, &proto::pong_payload(t1, t, now_us())).is_err() { return None; }
-                    let _ = out.flush();
+                    out.emit(ty::PONG, &proto::pong_payload(t1, t, now_us()));
+                    out.flush();
                 }
                 ClientMsg::Pong { .. } | ClientMsg::Unknown(_) => {}
             }
@@ -247,17 +299,29 @@ pub fn run(args: Args) -> i32 {
                 loop {
                     match rx.try_recv() {
                         Ok(Some(m)) => match handle(m, &mut x, &mut out) { None => { ended = true; break } Some(d) => dirty_input |= d },
-                        Ok(None) => { ended = true; break }
+                        Ok(None) => { out.ssh_open = false; ssh_closed.get_or_insert_with(Instant::now); }
                         Err(_) => break,
                     }
                 }
                 if dirty_input { x.flush(); }
                 if Instant::now() < next_tick { continue; }
             }
-            Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            // The SSH channel closed. With UDP alive the desktop carries on (plan §7.3); without
+            // it, or after 30 s of UDP silence, this is the end.
+            Ok(None) => { out.ssh_open = false; ssh_closed.get_or_insert_with(Instant::now); }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if ended { break; }
+        if ssh_closed.is_some() && out.link.as_ref().is_none_or(|l| l.silent_us() > 30_000_000) { break; }
+        if let Some(l) = &out.link { l.tick(); }
+        let udp = out.udp();
+        if udp != was_udp {
+            crate::log!("transport {}", if udp { "udp" } else { "ssh" });
+            was_udp = udp;
+            in_flight.clear();
+            want_key = true;
+        }
         let (cap_long, cap_bitrate) = quality_cap(&quality);
         let cap_bitrate = max_bitrate.map_or(cap_bitrate, |m| m.min(cap_bitrate));
         let auto = quality == "auto";
@@ -265,7 +329,20 @@ pub fn run(args: Args) -> i32 {
         let fps = fps_limit.min(ladder_fps).max(1);
         next_tick = Instant::now() + Duration::from_micros(1_000_000 / fps as u64);
         if paused { continue; }
-        if rc.tick(Instant::now(), cap_bitrate, auto) {
+        if udp {
+            // GCC drives the rate on UDP. The encoder hears about it at most once a second, and
+            // only for a change of 10% or more: hardware encoders stutter on constant updates.
+            let l = out.link.as_ref().unwrap();
+            l.clamp_target(cap_bitrate as f64);
+            let (target, _, _, _) = l.estimate();
+            if last_udp_rate.elapsed() >= Duration::from_secs(1) && ((target - rc.bitrate as f64).abs() / rc.bitrate as f64) >= 0.10 {
+                rc.bitrate = target as u32;
+                if auto { rc.step = step_for(target); }
+                enc.set_bitrate(rc.bitrate);
+                enc.set_fps(fps as f32);
+                last_udp_rate = Instant::now();
+            }
+        } else if rc.tick(Instant::now(), cap_bitrate, auto) {
             enc.set_bitrate(rc.bitrate);
             enc.set_fps(fps as f32);
         }
@@ -276,7 +353,7 @@ pub fn run(args: Args) -> i32 {
             if let Some((hash, w, h, hx, hy, rgba)) = c.shape {
                 serial_hash.insert(c.serial, hash);
                 if sent_shapes.insert(hash) {
-                    send!(ty::CURSOR_SHAPE, proto::cursor_shape_payload(hash, w, h, hx, hy, &rgba));
+                    out.emit(ty::CURSOR_SHAPE, &proto::cursor_shape_payload(hash, w, h, hx, hy, &rgba));
                 }
                 shape_hash = hash;
             }
@@ -284,16 +361,20 @@ pub fn run(args: Args) -> i32 {
             let visible = cx >= 0 && cy >= 0 && (cx as u32) < d.w && (cy as u32) < d.h;
             let state = (cx.clamp(0, u16::MAX as i32) as u16, cy.clamp(0, u16::MAX as i32) as u16, visible, shape_hash);
             if cursor_state != Some(state) {
-                send!(ty::CURSOR_POS, proto::cursor_pos_payload(state.0, state.1, state.2, state.3));
+                out.emit(ty::CURSOR_POS, &proto::cursor_pos_payload(state.0, state.1, state.2, state.3));
                 cursor_state = Some(state);
             }
         }
 
-        // Newest frame wins: with two frames unacknowledged this tick is skipped, not queued.
-        if in_flight.len() >= 2 && !want_key {
-            let _ = out.flush();
+        // Newest frame wins: with two frames unacknowledged (four on UDP, where ACKs can be lost and
+        // expire after 500 ms) this tick is skipped, not queued.
+        if udp { while in_flight.front().is_some_and(|f| now_us() - f.1 > 500_000) { in_flight.pop_front(); } }
+        if in_flight.len() >= if udp { 4 } else { 2 } && !want_key {
+            out.flush();
             continue;
         }
+        // At most one keyframe a second; a request inside that waits for it.
+        let key_due = want_key && (frame_no == 0 || last_key.elapsed() >= Duration::from_secs(1));
         let capture_us = now_us();
         let frame = match x.capture(&d, &mut scratch) {
             Ok(f) => f,
@@ -301,13 +382,13 @@ pub fn run(args: Args) -> i32 {
         };
         let changed = frame.bgra != last_sent.as_slice();
         let refine = !changed && !refined && last_change.elapsed() >= Duration::from_millis(300);
-        if !changed && !want_key && !refine {
-            let _ = out.flush();
+        if !changed && !key_due && !refine {
+            out.flush();
             continue;
         }
         let long = cap_long.min(args.client_long.max(320)).min(ladder_long);
         let (w, h) = encode::fit(d.w, d.h, long);
-        if want_key || refine { enc.force_key(); }
+        if key_due || refine { enc.force_key(); }
         if refine { enc.set_bitrate(cap_bitrate.max(rc.bitrate) * 3); }
         let result = enc.encode(frame.bgra, frame.w, frame.h, frame.stride, w, h);
         if refine { enc.set_bitrate(rc.bitrate); }
@@ -323,18 +404,21 @@ pub fn run(args: Args) -> i32 {
         };
         if data.is_empty() { continue; }
         if refine { refined = true; }
-        want_key = false;
+        if key { last_key = Instant::now(); want_key = false; }
+        if key_due { want_key = false; }
         frame_no = frame_no.wrapping_add(1);
         let flags = (key as u8 * proto::VIDEO_KEY) | (refine as u8 * proto::VIDEO_REFINE);
         let payload = proto::video_payload(&proto::Video {
             frame: frame_no, flags, capture_us, encoded_us: now_us(), w: w as u16, h: h as u16, data: &data,
         });
         sent_total += payload.len() as u64;
-        send!(ty::VIDEO, payload);
-        if out.flush().is_err() { break; }
+        out.emit(ty::VIDEO, &payload);
+        out.flush();
+        if !out.ssh_open && !out.udp() && ssh_closed.is_none() { break; }
         in_flight.push_back((frame_no, now_us()));
     }
-    let _ = out.flush();
+    out.flush();
+    if let Some(l) = &out.link { crate::log!("udp {:?} rtt={}ms", l.stats(), l.rtt_ms()); }
     let retired = session::RETIRED.load(Ordering::SeqCst);
     crate::log!("serve end frames={frame_no} bytes={sent_total} retired={retired}");
     if retired == 0 {
