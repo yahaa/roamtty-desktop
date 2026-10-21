@@ -247,6 +247,18 @@ impl Mac {
     }
 }
 
+/// Keeps a point (global points) on some display. Posted moves are not clamped by macOS: a trackpad
+/// drag past the edge left the cursor off every screen, invisible here and on the phone, until dragged back.
+fn clamp(displays: &[(u32, Display)], p: CGPoint) -> CGPoint {
+    let bounds = |d: &Display| (d.x as f64, d.y as f64, d.x as f64 + d.w as f64 / d.scale as f64 - 1.0, d.y as f64 + d.h as f64 / d.scale as f64 - 1.0);
+    if displays.iter().any(|(_, d)| { let (l, t, r, b) = bounds(d); p.x >= l && p.x <= r && p.y >= t && p.y <= b }) { return p; }
+    displays.iter().map(|(_, d)| {
+        let (l, t, r, b) = bounds(d);
+        let q = CGPoint { x: p.x.clamp(l, r), y: p.y.clamp(t, b) };
+        ((q.x - p.x).powi(2) + (q.y - p.y).powi(2), q)
+    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, q)| q).unwrap_or(p)
+}
+
 /// The backing scale of a display's current mode (2 on Retina).
 fn native_scale(id: u32) -> Option<f64> {
     let mode = objc2_core_graphics::CGDisplayCopyDisplayMode(id)?;
@@ -316,7 +328,7 @@ impl Backend for Mac {
     }
 
     fn move_abs(&mut self, x: i32, y: i32) -> Result<()> {
-        let at = self.to_points(x, y);
+        let at = clamp(&self.displays, self.to_points(x, y));
         let ty = if self.buttons[0] { CGEventType::LeftMouseDragged } else if self.buttons[1] { CGEventType::RightMouseDragged } else { CGEventType::MouseMoved };
         self.mouse(ty, at, CGMouseButton::Left);
         Ok(())
@@ -325,7 +337,7 @@ impl Backend for Mac {
     fn move_rel(&mut self, dx: i16, dy: i16) -> Result<()> {
         let p = self.location();
         let d = &self.displays[0].1;
-        let at = CGPoint { x: p.x + dx as f64 / d.scale as f64, y: p.y + dy as f64 / d.scale as f64 };
+        let at = clamp(&self.displays, CGPoint { x: p.x + dx as f64 / d.scale as f64, y: p.y + dy as f64 / d.scale as f64 });
         let ty = if self.buttons[0] { CGEventType::LeftMouseDragged } else { CGEventType::MouseMoved };
         self.mouse(ty, at, CGMouseButton::Left);
         Ok(())
@@ -601,6 +613,17 @@ mod tests {
         let types: Vec<u8> = all.windows(5).filter(|w| w[..4] == [0, 0, 0, 1]).map(|w| w[4] & 0x1f).collect();
         assert!(types.contains(&7) && types.contains(&8) && types.contains(&5), "nal types {types:?}");
         std::fs::write(std::env::temp_dir().join("roamtty-vt.h264"), &all).unwrap();
+    }
+
+    #[test]
+    fn moves_stay_on_a_display() {
+        let d = |id: u8, x: i32| (id as u32, Display { id, w: 3024, h: 1964, scale: 2.0, x, y: 0, primary: id == 0, name: String::new() });
+        let two = [d(0, 0), d(1, 1512)];
+        let at = |x: f64, y: f64| { let p = clamp(&two, CGPoint { x, y }); (p.x, p.y) };
+        assert_eq!(at(100.0, 100.0), (100.0, 100.0));
+        assert_eq!(at(2000.0, 500.0), (2000.0, 500.0), "the second display");
+        assert_eq!(at(3500.0, 2000.0), (3023.0, 981.0), "past the right edge");
+        assert_eq!(at(-40.0, -9.0), (0.0, 0.0));
     }
 
     /// A full screen of noise at the session's pace is more than 4 Mbps holds: the frames the rate
