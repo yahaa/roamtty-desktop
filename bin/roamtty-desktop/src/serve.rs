@@ -5,7 +5,7 @@ use crate::encode::{self, H264};
 use crate::keymap;
 use crate::session;
 use crate::udp_link::UdpLink;
-use crate::x11::{Clipboard, X11};
+use crate::backend::Backend;
 use proto::{ty, ClientMsg, Hello, Input, StartError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufWriter, Write};
@@ -131,9 +131,9 @@ pub fn run(args: Args) -> i32 {
         println!("{}", serde_json::to_string(&e).unwrap());
         return 1;
     }
-    let mut x = match X11::open() {
+    let mut x: Box<dyn Backend> = match crate::open_desktop() {
         Ok(x) => x,
-        Err(e) => return fail(if crate::x11::find_display().is_none() { "no_desktop" } else { "capture_failed" }, e),
+        Err((code, e)) => return fail(code, e),
     };
     let Some(lib) = encode::openh264_path().filter(|p| p.exists()) else {
         return fail("encoder_failed", "OpenH264 is not installed");
@@ -142,7 +142,6 @@ pub fn run(args: Args) -> i32 {
         Ok(e) => e,
         Err(e) => return fail("encoder_failed", e),
     };
-    let clip = Clipboard::start().ok();
     let displays = x.displays();
     let sess = session::claim(args.resume.as_deref(), args.token.as_deref());
     // The UDP port and a fresh key ride in the hello; the key never touches the disk.
@@ -157,7 +156,7 @@ pub fn run(args: Args) -> i32 {
     let mut ssh = BufWriter::with_capacity(1 << 20, stdout.lock());
     if writeln!(ssh, "{}", serde_json::to_string(&hello).unwrap()).and_then(|_| ssh.flush()).is_err() { return 1; }
     let test_hooks = std::env::var("ROAMTTY_DESKTOP_TEST").as_deref() == Ok("1");
-    crate::log!("serve start {}x{} displays={}", x.width, x.height, displays.len());
+    crate::log!("serve start {} displays={}", x.kind(), displays.len());
 
     let (tx, rx) = mpsc::channel::<Option<ClientMsg>>();
     if let Some(l) = &link { l.start(tx.clone()); }
@@ -213,7 +212,7 @@ pub fn run(args: Args) -> i32 {
         let wait = next_tick.saturating_duration_since(Instant::now());
         let msg = rx.recv_timeout(wait);
         let mut dirty_input = false;
-        let mut handle = |m: ClientMsg, x: &mut X11, out: &mut Out<_>| -> Option<bool> {
+        let mut handle = |m: ClientMsg, x: &mut Box<dyn Backend>, out: &mut Out<_>| -> Option<bool> {
             match m {
                 ClientMsg::Config(c) => {
                     if let Some(d) = c.display { if (d as usize) < displays.len() && d as usize != display { display = d as usize; want_key = true; } }
@@ -268,7 +267,7 @@ pub fn run(args: Args) -> i32 {
                     proto::req::VIEW_ONLY_ON => view_only = true,
                     proto::req::VIEW_ONLY_OFF => view_only = false,
                     proto::req::CLIP_GET => {
-                        let text = clip.as_ref().and_then(|c| c.get()).unwrap_or_default();
+                        let text = x.clip_get().unwrap_or_default();
                         let body = serde_json::json!({ "clip": text }).to_string();
                         out.emit(ty::STATE, body.as_bytes());
                         out.flush();
@@ -282,7 +281,7 @@ pub fn run(args: Args) -> i32 {
                         if f == frame { rc.on_ack(now_us().saturating_sub(sent)); }
                     }
                 }
-                ClientMsg::ClipSet(s) => { if let Some(c) = &clip { c.set(s); } }
+                ClientMsg::ClipSet(s) => x.clip_set(s),
                 ClientMsg::Ping(t1) => {
                     let t = now_us();
                     out.emit(ty::PONG, &proto::pong_payload(t1, t, now_us()));
@@ -349,7 +348,7 @@ pub fn run(args: Args) -> i32 {
 
         // Cursor first: it is cheap and keeps moving even when frames are being skipped.
         let d = displays[display].clone();
-        if let Ok(c) = x.cursor() {
+        if let Some(c) = x.cursor() {
             if let Some((hash, w, h, hx, hy, rgba)) = c.shape {
                 serial_hash.insert(c.serial, hash);
                 if sent_shapes.insert(hash) {

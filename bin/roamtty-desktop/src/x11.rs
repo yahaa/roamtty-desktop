@@ -1,6 +1,7 @@
 //! Linux X11 backend: finds the user's display, grabs it over MIT-SHM, reads the cursor through
 //! XFIXES and injects input with XTEST.
 
+use crate::backend::{fnv, Backend, Cursor, Frame};
 use crate::keymap;
 use proto::Display;
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-pub type Result<T> = std::result::Result<T, String>;
+pub use crate::backend::Result;
 
 fn err(e: impl std::fmt::Display) -> String { e.to_string() }
 
@@ -82,21 +83,7 @@ pub struct X11 {
     spare: Vec<u8>,
     wheel: (i32, i32),
     cursor_serial: u32,
-}
-
-pub struct Frame<'a> {
-    pub bgra: &'a [u8],
-    pub w: usize,
-    pub h: usize,
-    pub stride: usize,
-}
-
-pub struct Cursor {
-    pub x: i32,
-    pub y: i32,
-    /// Set when the shape changed since the last call: hash, w, h, hot_x, hot_y, RGBA.
-    pub shape: Option<(u64, u16, u16, u16, u16, Vec<u8>)>,
-    pub serial: u32,
+    clip: Option<Clipboard>,
 }
 
 impl X11 {
@@ -119,8 +106,9 @@ impl X11 {
             let i = (*k - min_keycode) as usize * per as usize;
             map.keysyms[i..i + per as usize].iter().all(|s| *s == 0)
         }).take(8).collect();
-        let mut x = X11 { conn, root, width, height, shm: None, keymap: map.keysyms, min_keycode, per_keycode: per, spare, wheel: (0, 0), cursor_serial: 0 };
+        let mut x = X11 { conn, root, width, height, shm: None, keymap: map.keysyms, min_keycode, per_keycode: per, spare, wheel: (0, 0), cursor_serial: 0, clip: None };
         x.shm = x.make_shm().ok();
+        x.clip = Clipboard::start().ok();
         Ok(x)
     }
 
@@ -306,15 +294,6 @@ impl X11 {
     }
 }
 
-pub fn fnv(b: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for x in b {
-        h ^= *x as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
 /// CLIPBOARD access on its own connection and thread, so serving selection requests never
 /// waits on the capture loop.
 pub struct Clipboard {
@@ -411,4 +390,21 @@ impl Clipboard {
         self.tx.send(ClipCmd::Get(tx)).ok()?;
         rx.recv_timeout(std::time::Duration::from_secs(3)).ok().flatten()
     }
+}
+
+impl Backend for X11 {
+    fn kind(&self) -> &'static str { "x11" }
+    fn displays(&self) -> Vec<Display> { X11::displays(self) }
+    fn capture<'a>(&'a mut self, d: &Display, buf: &'a mut Vec<u8>) -> Result<Frame<'a>> { X11::capture(self, d, buf) }
+    fn cursor(&mut self) -> Option<Cursor> { X11::cursor(self).ok() }
+    fn move_abs(&mut self, x: i32, y: i32) -> Result<()> { X11::move_abs(self, x, y) }
+    fn move_rel(&mut self, dx: i16, dy: i16) -> Result<()> { X11::move_rel(self, dx, dy) }
+    fn button(&mut self, button: u8, down: bool) -> Result<()> { X11::button(self, button, down) }
+    fn wheel(&mut self, dx: i16, dy: i16) -> Result<()> { X11::wheel(self, dx, dy) }
+    fn key(&mut self, hid: u16, down: bool) -> Result<()> { X11::key(self, hid, down) }
+    fn text(&mut self, s: &str) -> Result<()> { X11::text(self, s) }
+    fn tap(&mut self, hids: &[u16]) -> Result<()> { X11::tap(self, hids) }
+    fn flush(&mut self) { X11::flush(self) }
+    fn clip_set(&mut self, text: String) { if let Some(c) = &self.clip { c.set(text); } }
+    fn clip_get(&mut self) -> Option<String> { self.clip.as_ref().and_then(|c| c.get()) }
 }

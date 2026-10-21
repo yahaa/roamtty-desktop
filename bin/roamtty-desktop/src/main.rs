@@ -1,6 +1,7 @@
 //! roamtty-desktop: the host side of Roamtty's remote desktop. The app starts `serve` over SSH;
 //! the other subcommands install, diagnose and remove it.
 
+mod backend;
 mod encode;
 mod keymap;
 mod log;
@@ -8,9 +9,25 @@ mod paths;
 mod serve;
 mod session;
 mod udp_link;
+mod wl;
 mod x11;
 
 use std::path::Path;
+
+/// The user's desktop: a wlroots Wayland session when one runs, else X11. Errors carry the
+/// protocol's error code.
+pub fn open_desktop() -> Result<Box<dyn backend::Backend>, (&'static str, String)> {
+    let wayland = wl::find_socket().map(|_| wl::Wayland::open());
+    match wayland {
+        Some(Ok(w)) => return Ok(Box::new(w)),
+        Some(Err(e)) if x11::find_display().is_none() => return Err(("capture_failed", e)),
+        _ => {}
+    }
+    match x11::X11::open() {
+        Ok(x) => Ok(Box::new(x)),
+        Err(e) => Err((if x11::find_display().is_none() { "no_desktop" } else { "capture_failed" }, e)),
+    }
+}
 
 const OPENH264_URL: &str = "https://ciscobinary.openh264.org";
 
@@ -51,17 +68,19 @@ fn serve_cmd(args: &[String]) -> i32 {
 }
 
 fn doctor() -> i32 {
-    let display = x11::find_display();
+    let display = x11::find_display().map(|d| d.0).or_else(|| wl::find_socket().map(|w| w.1));
     let lib = encode::openh264_path();
     let encoder = lib.as_ref().filter(|p| p.exists()).map(|_| "openh264");
-    let displays = x11::X11::open().map(|x| x.displays()).unwrap_or_default();
+    let opened = open_desktop();
+    let backend = opened.as_ref().map(|b| b.kind()).ok();
+    let displays = opened.map(|b| b.displays()).unwrap_or_default();
     let mut needs: Vec<&str> = Vec::new();
     if display.is_none() { needs.push("not-logged-in"); }
     let last_error = std::fs::read_to_string(paths::log_dir().join("desktop.log")).ok()
         .and_then(|l| l.lines().rev().find(|x| x.contains("failed")).map(String::from));
     let j = serde_json::json!({
         "ver": env!("CARGO_PKG_VERSION"), "proto": proto::PROTO, "os": "linux", "arch": std::env::consts::ARCH,
-        "display": display.map(|d| d.0), "encoder": encoder, "displays": displays, "needs": needs, "last_error": last_error,
+        "display": display, "backend": backend, "encoder": encoder, "displays": displays, "needs": needs, "last_error": last_error,
     });
     println!("{j}");
     0
