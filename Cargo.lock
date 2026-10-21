@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "roamtty-desktop"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "block2",
  "bzip2-rs",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "roamtty-desktop-proto"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "aes-gcm",
  "serde",

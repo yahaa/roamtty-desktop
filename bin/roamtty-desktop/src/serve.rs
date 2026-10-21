@@ -214,6 +214,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     let mut last_key = Instant::now() - Duration::from_secs(2);
     let mut last_udp_rate = Instant::now();
     let mut last_step: Option<usize> = None;
+    let mut inputs = 0u64;
     let mut was_udp = false;
     let mut last_needs: Vec<String> = Vec::new();
 
@@ -262,6 +263,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                         Input::Text(s) => x.text(&s),
                     };
                     if let Err(e) = r { crate::log!("input failed: {e}"); }
+                    inputs += 1;
                     return Some(true);
                 }
                 ClientMsg::Input(_) => {}
@@ -440,7 +442,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     out.flush();
     if let Some(l) = &out.link { crate::log!("udp {:?} rtt={}ms", l.stats(), l.rtt_ms()); }
     let retired = session::RETIRED.load(Ordering::SeqCst).max(args.retired.load(Ordering::SeqCst));
-    crate::log!("serve end frames={frame_no} bytes={sent_total} retired={retired}");
+    crate::log!("serve end frames={frame_no} bytes={sent_total} retired={retired} inputs={inputs}");
     if retired == 0 && !agent_claimed {
         session::release();
         if lock_on_close { x.lock_screen(); }

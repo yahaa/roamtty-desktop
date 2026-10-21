@@ -143,8 +143,12 @@ pub struct UdpLink {
     stats: Mutex<LinkStats>,
 }
 
-#[derive(Default, Clone, Copy, Debug)]
-pub struct LinkStats { pub sent_packets: u64, pub resent: u64, pub received_packets: u64 }
+#[derive(Default, Clone, Debug)]
+pub struct LinkStats {
+    pub sent_packets: u64, pub resent: u64, pub received_packets: u64,
+    /// Client messages that arrived whole, by protocol type (input, ack, ping...), and those that did not parse.
+    pub client: std::collections::BTreeMap<u8, u64>, pub undecodable: u64,
+}
 
 impl UdpLink {
     /// Binds the first free port of the mosh range; None when none is free.
@@ -173,7 +177,17 @@ impl UdpLink {
 
     pub fn silent_us(&self) -> u64 { now_us().saturating_sub(self.last_rx.load(Ordering::Relaxed)) }
     pub fn rtt_ms(&self) -> u64 { self.rtt_us.load(Ordering::Relaxed) / 1000 }
-    pub fn stats(&self) -> LinkStats { *self.stats.lock().unwrap() }
+    pub fn stats(&self) -> LinkStats { self.stats.lock().unwrap().clone() }
+
+    /// One whole client frame to the session.
+    fn deliver(&self, bytes: &[u8], tx: &Sender<Option<ClientMsg>>) {
+        let parsed = proto::read_frame(&mut &bytes[..]).ok().flatten().and_then(|(t, p)| proto::decode_client(t, &p).ok().map(|m| (t, m)));
+        let mut st = self.stats.lock().unwrap();
+        match parsed {
+            Some((t, m)) => { *st.client.entry(t).or_default() += 1; drop(st); let _ = tx.send(Some(m)); }
+            None => st.undecodable += 1,
+        }
+    }
 
     /// (bitrate, fec ratio, loss, overuse) from the congestion controller.
     pub fn estimate(&self) -> (f64, f32, f64, bool) {
@@ -334,22 +348,14 @@ impl UdpLink {
                         Some(d) => {
                             if reliable { self.raw_send(&Packet::Rack(vec![msg]).encode(), false); }
                             let ready = if reliable { order.push(msg, d.bytes) } else { vec![d.bytes] };
-                            for bytes in ready {
-                                if let Ok(Some((t, p))) = proto::read_frame(&mut bytes.as_slice()) {
-                                    if let Ok(m) = proto::decode_client(t, &p) { let _ = tx.send(Some(m)); }
-                                }
-                            }
+                            for bytes in ready { self.deliver(&bytes, &tx); }
                         }
                         // A resend of something already delivered: the RACK was lost, say it again.
                         None if reliable => self.raw_send(&Packet::Rack(vec![msg]).encode(), false),
                         None => {}
                     }
                     reasm.expire(now_us(), 2_000_000);
-                    for bytes in order.overdue() {
-                        if let Ok(Some((t, p))) = proto::read_frame(&mut bytes.as_slice()) {
-                            if let Ok(m) = proto::decode_client(t, &p) { let _ = tx.send(Some(m)); }
-                        }
-                    }
+                    for bytes in order.overdue() { self.deliver(&bytes, &tx); }
                 }
                 Packet::Rack(ids) => { let mut r = self.reliable.lock().unwrap(); for i in ids { r.remove(&i); } }
                 Packet::Nack { msg, block, indices } => {
