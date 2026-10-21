@@ -1,8 +1,8 @@
-//! `serve`: talks the protocol on stdin/stdout of the SSH channel that started it.
-//! The main thread owns the screen, the encoder and stdout; a reader thread decodes stdin.
+//! `serve`: talks the protocol over one byte stream: the SSH channel's stdin/stdout on Linux, the
+//! agent's socket on macOS. The main thread owns the screen, the encoder and the output; a reader
+//! thread decodes the input.
 
-use crate::encode::{self, H264};
-use crate::keymap;
+use crate::encode::{self, VideoEncoder};
 use crate::session;
 use crate::udp_link::UdpLink;
 use crate::backend::Backend;
@@ -53,6 +53,10 @@ pub struct Args {
     pub client_long: u32,
     pub resume: Option<String>,
     pub token: Option<String>,
+    /// Set by whoever hands out the desktop (the macOS agent): 1 kicked, 2 replaced.
+    pub retired: Arc<std::sync::atomic::AtomicU8>,
+    /// The session the macOS agent already claimed; Linux claims it here.
+    pub claimed: Option<session::Session>,
 }
 
 pub fn now_us() -> u64 {
@@ -61,9 +65,10 @@ pub fn now_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
-fn fail(code: &str, detail: impl Into<String>) -> i32 {
+fn fail_on(out: &mut dyn Write, code: &str, detail: impl Into<String>) -> i32 {
     let e = StartError { error: code.into(), detail: Some(detail.into()), min: None, max: None };
-    println!("{}", serde_json::to_string(&e).unwrap());
+    let _ = writeln!(out, "{}", serde_json::to_string(&e).unwrap());
+    let _ = out.flush();
     crate::log!("serve failed: {code}");
     1
 }
@@ -125,36 +130,44 @@ impl RateControl {
     }
 }
 
+/// `serve` on the SSH channel itself.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn run(args: Args) -> i32 {
+    let stdout = std::io::stdout();
+    run_on(args, Box::new(std::io::stdin()), Box::new(stdout))
+}
+
+/// Serves one controller over `input` / `output`; returns the exit code.
+pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dyn Write>) -> i32 {
+    let mut output = output;
     if args.proto != proto::PROTO {
         let e = StartError { error: "proto_unsupported".into(), detail: None, min: Some(proto::PROTO), max: Some(proto::PROTO) };
-        println!("{}", serde_json::to_string(&e).unwrap());
+        let _ = writeln!(output, "{}", serde_json::to_string(&e).unwrap());
         return 1;
     }
     let mut x: Box<dyn Backend> = match crate::open_desktop() {
         Ok(x) => x,
-        Err((code, e)) => return fail(code, e),
+        Err((code, e)) => return fail_on(&mut output, code, e),
     };
-    let Some(lib) = encode::openh264_path().filter(|p| p.exists()) else {
-        return fail("encoder_failed", "OpenH264 is not installed");
-    };
-    let mut enc = match H264::new(&lib) {
+    let mut enc: Box<dyn VideoEncoder> = match crate::open_encoder() {
         Ok(e) => e,
-        Err(e) => return fail("encoder_failed", e),
+        Err(e) => return fail_on(&mut output, "encoder_failed", e),
     };
     let displays = x.displays();
-    let sess = session::claim(args.resume.as_deref(), args.token.as_deref());
+    let agent_claimed = args.claimed.is_some();
+    let sess = match args.claimed.take() { Some(s) => s, None => session::claim(args.resume.as_deref(), args.token.as_deref()) };
     // The UDP port and a fresh key ride in the hello; the key never touches the disk.
     let link = UdpLink::bind(4_000_000.0);
     let hello = Hello {
-        proto: proto::PROTO, ver: env!("CARGO_PKG_VERSION").into(), os: "linux".into(),
+        proto: proto::PROTO, ver: env!("CARGO_PKG_VERSION").into(),
         session: sess.session.clone(), resume_token: sess.resume_token.clone(), displays: displays.clone(),
-        enc: vec!["h264".into()], hw: "openh264".into(), needs: vec![],
+        enc: vec!["h264".into()], hw: enc.name().into(), needs: x.needs(), os: crate::OS.into(),
         udp: link.as_ref().map(|l| proto::Udp { port: l.port, key: session::b64(&l.key) }),
     };
-    let stdout = std::io::stdout();
-    let mut ssh = BufWriter::with_capacity(1 << 20, stdout.lock());
+    let mut ssh = BufWriter::with_capacity(1 << 20, output);
     if writeln!(ssh, "{}", serde_json::to_string(&hello).unwrap()).and_then(|_| ssh.flush()).is_err() { return 1; }
+    // Missing permissions: the hello says which; the app asks again once the user allowed them.
+    if !hello.needs.is_empty() { crate::log!("serve needs {:?}", hello.needs); return 0; }
     let test_hooks = std::env::var("ROAMTTY_DESKTOP_TEST").as_deref() == Ok("1");
     crate::log!("serve start {} displays={}", x.kind(), displays.len());
 
@@ -162,8 +175,7 @@ pub fn run(args: Args) -> i32 {
     if let Some(l) = &link { l.start(tx.clone()); }
     let mut out = Out { ssh, ssh_open: true, link: link.clone() };
     std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut r = std::io::BufReader::new(stdin.lock());
+        let mut r = std::io::BufReader::new(input);
         loop {
             match proto::read_frame(&mut r) {
                 Ok(Some((t, p))) => match proto::decode_client(t, &p) {
@@ -202,9 +214,11 @@ pub fn run(args: Args) -> i32 {
     let mut last_key = Instant::now() - Duration::from_secs(2);
     let mut last_udp_rate = Instant::now();
     let mut was_udp = false;
+    let mut last_needs: Vec<String> = Vec::new();
 
     while !ended {
-        match session::RETIRED.load(Ordering::SeqCst) {
+        let flag = session::RETIRED.load(Ordering::SeqCst).max(args.retired.load(Ordering::SeqCst));
+        match flag {
             1 => { out.emit(ty::STATE, br#"{"kicked":true}"#); out.flush(); std::thread::sleep(Duration::from_millis(300)); break; }
             2 => break,
             _ => {}
@@ -250,16 +264,7 @@ pub fn run(args: Args) -> i32 {
                     return Some(true);
                 }
                 ClientMsg::Input(_) => {}
-                ClientMsg::Action(a) => {
-                    if !view_only {
-                        let keys: &[u16] = match a {
-                            proto::action::SHOW_DESKTOP => &[keymap::HID_LEFT_GUI, keymap::HID_D],
-                            proto::action::ALL_WINDOWS => &[keymap::HID_LEFT_GUI],
-                            _ => &[],
-                        };
-                        let _ = x.tap(keys);
-                    }
-                }
+                ClientMsg::Action(a) => { if !view_only { let _ = x.action(a); } }
                 ClientMsg::Req(r) => match r {
                     proto::req::KEYFRAME => want_key = true,
                     proto::req::PAUSE => { paused = true; in_flight.clear(); }
@@ -377,7 +382,18 @@ pub fn run(args: Args) -> i32 {
         let capture_us = now_us();
         let frame = match x.capture(&d, &mut scratch) {
             Ok(f) => f,
-            Err(e) => { crate::log!("capture failed: {e}"); continue; }
+            Err(e) => {
+                crate::log!("capture failed: {e}");
+                // A permission taken away (or never given) mid-session: tell the app what to ask for.
+                let needs = x.needs();
+                if !needs.is_empty() && needs != last_needs {
+                    out.emit(ty::STATE, serde_json::json!({ "needs": needs }).to_string().as_bytes());
+                    out.flush();
+                    last_needs = needs;
+                }
+                next_tick = Instant::now() + Duration::from_millis(500);
+                continue;
+            }
         };
         let changed = frame.bgra != last_sent.as_slice();
         let refine = !changed && !refined && last_change.elapsed() >= Duration::from_millis(300);
@@ -418,9 +434,9 @@ pub fn run(args: Args) -> i32 {
     }
     out.flush();
     if let Some(l) = &out.link { crate::log!("udp {:?} rtt={}ms", l.stats(), l.rtt_ms()); }
-    let retired = session::RETIRED.load(Ordering::SeqCst);
+    let retired = session::RETIRED.load(Ordering::SeqCst).max(args.retired.load(Ordering::SeqCst));
     crate::log!("serve end frames={frame_no} bytes={sent_total} retired={retired}");
-    if retired == 0 {
+    if retired == 0 && !agent_claimed {
         session::release();
         if lock_on_close {
             let _ = std::process::Command::new("loginctl").arg("lock-session").status();

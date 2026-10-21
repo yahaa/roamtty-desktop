@@ -1,6 +1,7 @@
 //! USB HID keyboard usages (page 0x07) to Linux evdev key codes; an X keycode is evdev + 8.
 //! Keys travel by physical position, so the remote keyboard layout does not matter.
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn hid_to_evdev(hid: u16) -> Option<u16> {
     let code = match hid {
         0x04..=0x1D => [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44][(hid - 0x04) as usize],
@@ -23,6 +24,7 @@ pub fn hid_to_evdev(hid: u16) -> Option<u16> {
     Some(code)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const HID_LEFT_SHIFT: u16 = 0xE1;
 pub const HID_LEFT_GUI: u16 = 0xE3;
 pub const HID_D: u16 = 0x07;

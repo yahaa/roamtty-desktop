@@ -38,8 +38,20 @@ pub trait Backend {
     fn flush(&mut self);
     fn clip_set(&mut self, text: String);
     fn clip_get(&mut self) -> Option<String>;
+    /// ACTION: show the desktop or all windows. Linux sends Super+D / Super; others override.
+    fn action(&mut self, action: u8) -> Result<()> {
+        let keys: &[u16] = match action {
+            proto::action::SHOW_DESKTOP => &[crate::keymap::HID_LEFT_GUI, crate::keymap::HID_D],
+            proto::action::ALL_WINDOWS => &[crate::keymap::HID_LEFT_GUI],
+            _ => &[],
+        };
+        self.tap(keys)
+    }
+    /// What the user must allow on the host before the desktop works (macOS TCC).
+    fn needs(&self) -> Vec<String> { Vec::new() }
 }
 
+#[cfg(target_os = "linux")]
 pub fn fnv(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for x in b {

@@ -8,6 +8,7 @@ pub fn home() -> PathBuf {
 
 pub fn root() -> PathBuf { home().join(".roamtty") }
 pub fn desktop_dir() -> PathBuf { root().join("desktop") }
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn lib_dir() -> PathBuf { desktop_dir().join("lib") }
 pub fn log_dir() -> PathBuf { desktop_dir().join("log") }
 pub fn bin_path() -> PathBuf { root().join("bin").join("roamtty-desktop") }
