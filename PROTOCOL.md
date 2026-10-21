@@ -84,7 +84,7 @@ Adding optional JSON fields keeps `proto`. Changing a binary layout or meaning b
 The hello's `udp` object offers a port (60000–61000, the mosh range) and a fresh 128-bit key; the
 key travels only over SSH and is never stored. The client sends to the address it reached over SSH.
 While UDP is alive (a valid datagram within the last 3 s) the host sends everything over it, and
-falls back to the SSH channel otherwise; the client keeps sending heartbeats twice a second, so the
+falls back to the SSH channel otherwise; the client keeps sending heartbeats four times a second, so the
 switch back happens on its own. When the SSH channel closes while UDP is alive, the host carries on
 until UDP has been silent for 30 s.
 
