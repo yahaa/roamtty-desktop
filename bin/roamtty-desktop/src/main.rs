@@ -15,6 +15,8 @@ mod openh264enc;
 mod win;
 #[cfg(windows)]
 mod win_mf;
+#[cfg(windows)]
+mod win_service;
 #[cfg(target_os = "linux")]
 mod wl;
 #[cfg(target_os = "linux")]
@@ -86,7 +88,9 @@ fn main() {
         }
         Some("serve") => serve_cmd(&args[1..]),
         #[cfg(any(target_os = "macos", windows))]
-        Some("agent") => agent::run(),
+        Some("agent") => agent::run(&args[1..]),
+        #[cfg(windows)]
+        Some("service") => win_service::run_service(),
         #[cfg(target_os = "macos")]
         Some("print-info-plist") => { print!("{}", agent::info_plist()); 0 }
         #[cfg(windows)]

@@ -22,6 +22,22 @@ pub use plat::info_plist;
 
 fn token_path() -> PathBuf { paths::desktop_dir().join("token") }
 
+/// Set in the Windows service's helper (`agent --system`): SYSTEM, its own pipe, every desktop.
+static SYSTEM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn system_mode() -> bool { SYSTEM.load(Ordering::Relaxed) }
+
+/// The agent to talk to and its token: the Windows service's helper when it runs (it serves the
+/// sign-in and lock screens too), else the user's own.
+fn open() -> Option<(String, Box<dyn Conn>)> {
+    #[cfg(windows)]
+    if let Ok(token) = std::fs::read_to_string(crate::win_service::root().join("desktop").join("token")) {
+        if let Ok(conn) = plat::connect_to(crate::win_service::PIPE) { return Some((token, conn)); }
+    }
+    let token = std::fs::read_to_string(token_path()).ok()?;
+    Some((token, plat::connect().ok()?))
+}
+
 /// One connection to the agent, both ways.
 pub trait Conn: Read + Write + Send {
     fn split(&self) -> std::io::Result<Box<dyn Conn>>;
@@ -42,7 +58,8 @@ fn ask_permissions() {
     plat::request_permissions();
 }
 
-pub fn run() -> i32 {
+pub fn run(args: &[String]) -> i32 {
+    if cfg!(windows) && args.iter().any(|a| a == "--system") { SYSTEM.store(true, Ordering::Relaxed); }
     plat::detach_console();
     let _ = paths::ensure(&paths::desktop_dir());
     let token = session::random_b64(24);
@@ -83,7 +100,7 @@ fn handle(conn: Box<dyn Conn>, token: &str) {
     let rest = parts.next().unwrap_or("");
     let mut out = conn;
     if rest == "doctor" {
-        let j = serde_json::json!({ "needs": plat::needs(), "agent": true });
+        let j = serde_json::json!({ "needs": plat::needs(), "agent": true, "system": system_mode() });
         let _ = writeln!(out, "{j}");
         return;
     }
@@ -97,8 +114,15 @@ fn handle(conn: Box<dyn Conn>, token: &str) {
         resume: None, token: None, retired: retired.clone(), claimed: Some(claimed),
     };
     serve::run_on(args, Box::new(reader), Box::new(out));
-    let mut cur = CURRENT.lock().unwrap();
-    if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, &retired)) { *cur = None; }
+    {
+        let mut cur = CURRENT.lock().unwrap();
+        if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, &retired)) { *cur = None; }
+    }
+    // 断开后锁定电脑: once the 30 s in which the phone may resume have passed with nobody back.
+    if serve::LOCK_REQUESTED.swap(false, Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        if CURRENT.lock().unwrap().is_none() { crate::log!("agent: locking after disconnect"); plat::lock(); }
+    }
 }
 
 /// One controller per desktop: the right resume token replaces the old connection quietly,
@@ -123,10 +147,7 @@ pub fn bridge(a: &serve::Args) -> i32 {
         println!("{}", serde_json::json!({ "error": code, "detail": detail }));
         1
     };
-    let Ok(token) = std::fs::read_to_string(token_path()) else {
-        return fail("not_logged_in", "Roamtty Desktop is not running: log in to the computer's desktop");
-    };
-    let Ok(mut conn) = plat::connect() else {
+    let Some((token, mut conn)) = open() else {
         return fail("not_logged_in", "Roamtty Desktop is not running: log in to the computer's desktop");
     };
     let args = serde_json::json!({ "proto": a.proto, "client_long": a.client_long, "resume": a.resume, "token": a.token });
@@ -150,8 +171,7 @@ pub fn bridge(a: &serve::Args) -> i32 {
 
 /// The agent's answer to `doctor`, or None when it is not running.
 pub fn ask_doctor() -> Option<serde_json::Value> {
-    let token = std::fs::read_to_string(token_path()).ok()?;
-    let mut conn = plat::connect().ok()?;
+    let (token, mut conn) = open()?;
     writeln!(conn, "{} doctor", token.trim()).ok()?;
     let mut line = String::new();
     BufReader::new(conn).read_line(&mut line).ok()?;
@@ -173,6 +193,7 @@ mod plat {
     }
 
     pub fn needs() -> Vec<String> { crate::mac::needs() }
+    pub fn lock() { let _ = std::process::Command::new("pmset").arg("displaysleepnow").status(); }
     pub fn detach_console() {}
     pub fn request_permissions() { crate::mac::request_permissions() }
 
@@ -300,6 +321,7 @@ mod plat {
     const TASK: &str = "Roamtty Desktop";
 
     fn pipe_name() -> String {
+        if system_mode() { return crate::win_service::PIPE.to_string(); }
         let user: String = std::env::var("USERNAME").unwrap_or_default().chars().filter(|c| c.is_alphanumeric()).collect();
         format!(r"\\.\pipe\roamtty-desktop-{user}")
     }
@@ -349,6 +371,15 @@ mod plat {
 
     pub fn needs() -> Vec<String> { Vec::new() }
     pub fn request_permissions() {}
+    /// The user's agent locks its own session; the service's helper (SYSTEM, where LockWorkStation
+    /// does nothing) disconnects the console's session, which leaves it at the lock screen.
+    pub fn lock() {
+        use windows::Win32::System::RemoteDesktop::{WTSDisconnectSession, WTSGetActiveConsoleSessionId, WTS_CURRENT_SERVER_HANDLE};
+        unsafe {
+            if system_mode() { let _ = WTSDisconnectSession(Some(WTS_CURRENT_SERVER_HANDLE), WTSGetActiveConsoleSessionId(), false); }
+            else { let _ = windows::Win32::System::Shutdown::LockWorkStation(); }
+        }
+    }
 
     /// The logon task gives the agent a console window on the user's desktop; it lets go of it, and
     /// the window closes (closing it by hand would have ended the agent).
@@ -359,7 +390,11 @@ mod plat {
     /// Accepts pipe clients forever. The pipe's DACL admits only its owner (and SYSTEM).
     pub fn listen() -> std::io::Result<Box<dyn Iterator<Item = Box<dyn Conn>>>> {
         let name = wide(&pipe_name());
-        let sddl = wide("D:P(A;;GA;;;OW)(A;;GA;;;SY)");
+        // The service's helper runs as SYSTEM: the pipe admits the user who installed the service.
+        let sddl = if system_mode() {
+            let sid = crate::win_service::allowed_sid().ok_or_else(|| std::io::Error::other("no service.json"))?;
+            wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})"))
+        } else { wide("D:P(A;;GA;;;OW)(A;;GA;;;SY)") };
         let mut sd = PSECURITY_DESCRIPTOR::default();
         unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), SDDL_REVISION_1, &mut sd, None) }
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -389,8 +424,10 @@ mod plat {
         })))
     }
 
-    pub fn connect() -> std::io::Result<Box<dyn Conn>> {
-        let name = wide(&pipe_name());
+    pub fn connect() -> std::io::Result<Box<dyn Conn>> { connect_to(&pipe_name()) }
+
+    pub fn connect_to(pipe: &str) -> std::io::Result<Box<dyn Conn>> {
+        let name = wide(pipe);
         let h = unsafe {
             CreateFileW(PCWSTR(name.as_ptr()), (GENERIC_READ | GENERIC_WRITE).0, FILE_SHARE_NONE, None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
         }.map_err(os_err)?;
@@ -402,8 +439,34 @@ mod plat {
             .status().is_ok_and(|s| s.success())
     }
 
-    /// A logon task in the user's interactive session (/IT), started now as well.
+    /// An administrator gets the service (the sign-in and lock screens too) instead of the logon
+    /// task. Anyone else gets the logon task, unless the service is there already.
     pub fn install() -> i32 {
+        if crate::win_service::elevated() {
+            let r = crate::win_service::install();
+            if r != 0 { return r; }
+            let _ = schtasks(&["/End", "/TN", TASK]);
+            let _ = schtasks(&["/Delete", "/F", "/TN", TASK]);
+            return wait_agent();
+        }
+        if crate::win_service::installed() {
+            println!("service installed: updating it needs an administrator");
+            return wait_agent();
+        }
+        logon_task()
+    }
+
+    fn wait_agent() -> i32 {
+        for _ in 0..80 {
+            if ask_doctor().is_some() { println!("agent ok"); return 0; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        println!("agent did not start: is the user logged in to the desktop?");
+        1
+    }
+
+    /// A logon task in the user's interactive session (/IT), started now as well.
+    fn logon_task() -> i32 {
         let exe = paths::bin_path();
         let tr = format!("\"{}\" agent", exe.display());
         if !schtasks(&["/Create", "/F", "/TN", TASK, "/SC", "ONLOGON", "/RL", "LIMITED", "/IT", "/TR", &tr]) {
@@ -420,12 +483,7 @@ mod plat {
             println!("firewall rule not added (not an administrator): Windows may ask once");
         }
         let _ = schtasks(&["/Run", "/TN", TASK]);
-        for _ in 0..50 {
-            if ask_doctor().is_some() { println!("agent ok"); return 0; }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        println!("agent did not start: is the user logged in to the desktop?");
-        1
+        wait_agent()
     }
 
     fn netsh(args: &[&str]) -> bool {
@@ -437,5 +495,6 @@ mod plat {
         let _ = netsh(&["delete", "rule", "name=Roamtty Desktop"]);
         let _ = schtasks(&["/End", "/TN", TASK]);
         let _ = schtasks(&["/Delete", "/F", "/TN", TASK]);
+        if crate::win_service::elevated() { crate::win_service::uninstall(); }
     }
 }

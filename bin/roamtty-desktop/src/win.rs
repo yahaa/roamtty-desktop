@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Shutdown::LockWorkStation;
-use windows::Win32::System::StationsAndDesktops::{CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME};
+use windows::Win32::System::StationsAndDesktops::{CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -47,6 +47,17 @@ pub struct Win {
     last_cursor: Option<isize>,
     /// Set once a hardware encoder took over: frames stay on the GPU.
     gpu: Option<std::rc::Rc<crate::win_mf::GpuFrame>>,
+    /// The service's helper (SYSTEM) moves to whichever desktop has the input: the sign-in screen,
+    /// the lock screen, the user's. The desktop this thread is on, and its name.
+    follow: Option<(HDESK, String)>,
+}
+
+/// A desktop's name: "Default" for the user's, "Winlogon" for sign-in and lock screens.
+fn desktop_name(desk: HDESK) -> Option<String> {
+    let mut name = [0u16; 64];
+    let mut len = 0u32;
+    unsafe { GetUserObjectInformationW(HANDLE(desk.0), UOI_NAME, Some(name.as_mut_ptr() as *mut _), (name.len() * 2) as u32, Some(&mut len)) }.ok()?;
+    Some(String::from_utf16_lossy(&name[..(len as usize / 2).saturating_sub(1)]))
 }
 
 /// USB HID usage to a set-1 scan code, with the E0 (extended) flag where the key has one.
@@ -171,7 +182,31 @@ impl Win {
             id: i as u8, w: (r.right - r.left) as u32, h: (r.bottom - r.top) as u32, scale: 1.0, x: r.left, y: r.top,
             primary: *primary, name: name.trim_start_matches("\\\\.\\").to_string(),
         }, *h)).collect();
-        Ok(Win { device, context, displays, dups: Vec::new(), last_cursor: None, gpu: None })
+        let follow = crate::agent::system_mode().then(|| (HDESK::default(), String::new()));
+        let mut w = Win { device, context, displays, dups: Vec::new(), last_cursor: None, gpu: None, follow };
+        w.follow_input();
+        Ok(w)
+    }
+
+    /// The service's helper only: puts this thread on the desktop that has the input now. The
+    /// duplications belong to the old one and are made again.
+    fn follow_input(&mut self) {
+        let Some((current, name)) = &self.follow else { return };
+        unsafe {
+            // GENERIC_ALL: SYSTEM may read and drive the Winlogon desktop too.
+            let Ok(desk) = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x10000000)) else { return };
+            let new = desktop_name(desk).unwrap_or_default();
+            if &new == name { let _ = CloseDesktop(desk); return; }
+            if let Err(e) = SetThreadDesktop(desk) {
+                crate::log!("desktop {new}: {e}");
+                let _ = CloseDesktop(desk);
+                return;
+            }
+            crate::log!("desktop {new}");
+            if !current.is_invalid() { let _ = CloseDesktop(*current); }
+            self.follow = Some((desk, new));
+            self.dups.clear();
+        }
     }
 
     /// The duplication of the output whose device name matches `name`.
@@ -216,6 +251,7 @@ impl Backend for Win {
     }
 
     fn capture<'a>(&'a mut self, d: &Display, buf: &'a mut Vec<u8>) -> Result<Frame<'a>> {
+        self.follow_input();
         let i = self.duplication(&d.name.clone())?;
         let (w, h) = (self.dups[i].w, self.dups[i].h);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -282,6 +318,7 @@ impl Backend for Win {
     }
 
     fn move_abs(&mut self, x: i32, y: i32) -> Result<()> {
+        self.follow_input();
         // Absolute moves are 0..65535 across the whole virtual desktop.
         let (vx, vy, vw, vh) = unsafe { (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1), GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1)) };
@@ -291,9 +328,14 @@ impl Backend for Win {
         Ok(())
     }
 
-    fn move_rel(&mut self, dx: i16, dy: i16) -> Result<()> { send(&[mouse(dx as i32, dy as i32, 0, MOUSEEVENTF_MOVE)]); Ok(()) }
+    fn move_rel(&mut self, dx: i16, dy: i16) -> Result<()> {
+        self.follow_input();
+        send(&[mouse(dx as i32, dy as i32, 0, MOUSEEVENTF_MOVE)]);
+        Ok(())
+    }
 
     fn button(&mut self, button: u8, down: bool) -> Result<()> {
+        self.follow_input();
         let f = match (button, down) {
             (1, true) => MOUSEEVENTF_LEFTDOWN, (1, false) => MOUSEEVENTF_LEFTUP,
             (2, true) => MOUSEEVENTF_RIGHTDOWN, (2, false) => MOUSEEVENTF_RIGHTUP,
@@ -306,12 +348,14 @@ impl Backend for Win {
 
     /// Windows counts wheels in 1/120 of a notch too (WHEEL_DELTA), positive away from the user.
     fn wheel(&mut self, dx: i16, dy: i16) -> Result<()> {
+        self.follow_input();
         if dy != 0 { send(&[mouse(0, 0, dy as i32, MOUSEEVENTF_WHEEL)]); }
         if dx != 0 { send(&[mouse(0, 0, dx as i32, MOUSEEVENTF_HWHEEL)]); }
         Ok(())
     }
 
     fn key(&mut self, hid: u16, down: bool) -> Result<()> {
+        self.follow_input();
         let Some((scan, ext)) = hid_to_scan(hid) else { return Ok(()) };
         let mut f = KEYEVENTF_SCANCODE;
         if ext { f |= KEYEVENTF_EXTENDEDKEY; }
@@ -322,12 +366,14 @@ impl Backend for Win {
 
     /// One UTF-16 unit per event pair; a surrogate pair is two units, as SendInput wants.
     fn text(&mut self, s: &str) -> Result<()> {
+        self.follow_input();
         let inputs: Vec<INPUT> = s.encode_utf16().flat_map(|u| [keyboard(u, 0, KEYEVENTF_UNICODE), keyboard(u, 0, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]).collect();
         for chunk in inputs.chunks(64) { send(chunk); }
         Ok(())
     }
 
     fn tap(&mut self, hids: &[u16]) -> Result<()> {
+        self.follow_input();
         for h in hids { self.key(*h, true)?; }
         for h in hids.iter().rev() { self.key(*h, false)?; }
         Ok(())
@@ -384,6 +430,8 @@ impl Backend for Win {
     /// Input goes to another desktop than ours (Winlogon: the lock screen's password, UAC): that
     /// desktop refuses us outright, or answers with another name than "Default".
     fn locked(&mut self) -> bool {
+        // The service's helper goes wherever the input is: nothing is out of its reach.
+        if self.follow.is_some() { return false; }
         unsafe {
             let Ok(desk) = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x0001)) else { return true };
             let mut name = [0u16; 64];
