@@ -43,6 +43,7 @@ fn ask_permissions() {
 }
 
 pub fn run() -> i32 {
+    plat::detach_console();
     let _ = paths::ensure(&paths::desktop_dir());
     let token = session::random_b64(24);
     if paths::write_private(&token_path(), token.as_bytes()).is_err() { return 1; }
@@ -172,6 +173,7 @@ mod plat {
     }
 
     pub fn needs() -> Vec<String> { crate::mac::needs() }
+    pub fn detach_console() {}
     pub fn request_permissions() { crate::mac::request_permissions() }
 
     pub fn listen() -> std::io::Result<Box<dyn Iterator<Item = Box<dyn Conn>>>> {
@@ -283,11 +285,16 @@ mod plat {
 #[cfg(windows)]
 mod plat {
     use super::*;
-    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE};
+    use windows::Win32::Storage::FileSystem::{CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING};
+    use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows::Win32::System::Console::FreeConsole;
+    use windows::Win32::System::Threading::CreateEventW;
     use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
     use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-    use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
     use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT};
 
     const TASK: &str = "Roamtty Desktop";
@@ -297,12 +304,55 @@ mod plat {
         format!(r"\\.\pipe\roamtty-desktop-{user}")
     }
 
-    impl Conn for std::fs::File {
-        fn split(&self) -> std::io::Result<Box<dyn Conn>> { Ok(Box::new(self.try_clone()?)) }
+    /// A pipe end opened for overlapped I/O, shared by its reading and writing halves. Synchronous
+    /// I/O on one file object is serialized: with a read waiting for the phone's next message, the
+    /// other half's write (the picture) waited behind it, and serve stalled right after the hello.
+    struct Pipe(Arc<OwnedHandle>);
+
+    fn os_err(e: windows::core::Error) -> std::io::Error { std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF) }
+
+    impl Pipe {
+        fn new(h: HANDLE) -> Pipe { Pipe(Arc::new(unsafe { OwnedHandle::from_raw_handle(h.0 as RawHandle) })) }
+
+        /// Starts one operation with its own event and waits for it.
+        fn io(&self, f: impl FnOnce(HANDLE, *mut OVERLAPPED) -> windows::core::Result<()>) -> std::io::Result<usize> {
+            let h = HANDLE(self.0.as_raw_handle() as _);
+            let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(os_err)?;
+            let event = unsafe { OwnedHandle::from_raw_handle(event.0 as RawHandle) };
+            let mut ov = OVERLAPPED { hEvent: HANDLE(event.as_raw_handle() as _), ..Default::default() };
+            if let Err(e) = f(h, &mut ov) {
+                if e.code() != ERROR_IO_PENDING.to_hresult() { return Err(os_err(e)); }
+            }
+            let mut n = 0u32;
+            unsafe { GetOverlappedResult(h, &ov, &mut n, true) }.map_err(os_err)?;
+            Ok(n as usize)
+        }
+    }
+
+    impl Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.io(|h, ov| unsafe { ReadFile(h, Some(buf), None, Some(ov)) }) {
+                Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE.0 as i32) => Ok(0),
+                r => r,
+            }
+        }
+    }
+
+    impl Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.io(|h, ov| unsafe { WriteFile(h, Some(buf), None, Some(ov)) }) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    impl Conn for Pipe {
+        fn split(&self) -> std::io::Result<Box<dyn Conn>> { Ok(Box::new(Pipe(self.0.clone()))) }
     }
 
     pub fn needs() -> Vec<String> { Vec::new() }
     pub fn request_permissions() {}
+
+    /// The logon task gives the agent a console window on the user's desktop; it lets go of it, and
+    /// the window closes (closing it by hand would have ended the agent).
+    pub fn detach_console() { unsafe { let _ = FreeConsole(); } }
 
     fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
@@ -313,23 +363,38 @@ mod plat {
         let mut sd = PSECURITY_DESCRIPTOR::default();
         unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), SDDL_REVISION_1, &mut sd, None) }
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd.0, bInheritHandle: false.into() };
-        let sa_ptr = &sa as *const SECURITY_ATTRIBUTES as usize;
+        // The descriptor lives for the whole process; the attributes are made afresh for each pipe
+        // (a pointer to ones on this function's stack dangled once it returned, and no pipe was made).
+        let sd_ptr = sd.0 as usize;
+        let mut failed = false;
         Ok(Box::new(std::iter::from_fn(move || loop {
+            let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd_ptr as *mut _, bInheritHandle: false.into() };
             let h = unsafe {
-                CreateNamedPipeW(PCWSTR(name.as_ptr()), PIPE_ACCESS_DUPLEX | FILE_FLAGS_AND_ATTRIBUTES(0), PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, Some(sa_ptr as *const SECURITY_ATTRIBUTES))
+                CreateNamedPipeW(PCWSTR(name.as_ptr()), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, Some(&sa))
             };
-            if h.is_invalid() { std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
-            // ERROR_PIPE_CONNECTED (a client was quicker) is a connection too.
-            let _ = unsafe { ConnectNamedPipe(h, None) };
-            let f = unsafe { std::fs::File::from_raw_handle(h.0 as RawHandle) };
-            return Some(Box::new(f) as Box<dyn Conn>);
+            if h.is_invalid() {
+                if !failed { crate::log!("agent pipe: {}", std::io::Error::last_os_error()); failed = true; }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+            let pipe = Pipe::new(h);
+            match pipe.io(|h, ov| unsafe { ConnectNamedPipe(h, Some(ov)) }) {
+                // ERROR_PIPE_CONNECTED: a client was quicker, a connection too.
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_CONNECTED.0 as i32) => {}
+                Err(_) => continue,
+            }
+            return Some(Box::new(pipe) as Box<dyn Conn>);
         })))
     }
 
     pub fn connect() -> std::io::Result<Box<dyn Conn>> {
-        Ok(Box::new(std::fs::OpenOptions::new().read(true).write(true).open(pipe_name())?))
+        let name = wide(&pipe_name());
+        let h = unsafe {
+            CreateFileW(PCWSTR(name.as_ptr()), (GENERIC_READ | GENERIC_WRITE).0, FILE_SHARE_NONE, None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
+        }.map_err(os_err)?;
+        Ok(Box::new(Pipe::new(h)))
     }
 
     fn schtasks(args: &[&str]) -> bool {
@@ -345,6 +410,15 @@ mod plat {
             println!("schtasks /Create failed");
             return 5;
         }
+        // An inbound rule for the UDP link, so Windows Firewall does not stop the desktop with a prompt
+        // the first time serve listens. Needs an elevated (administrator) login; skipped otherwise.
+        // Inbound rules for this exe go first, the Block ones Windows makes when its prompt was
+        // dismissed among them: a block rule beats any allow rule.
+        let prog = format!("program={}", exe.display());
+        let _ = netsh(&["delete", "rule", "name=all", "dir=in", &prog]);
+        if !netsh(&["add", "rule", "name=Roamtty Desktop", "dir=in", "action=allow", "protocol=UDP", "profile=any", &prog]) {
+            println!("firewall rule not added (not an administrator): Windows may ask once");
+        }
         let _ = schtasks(&["/Run", "/TN", TASK]);
         for _ in 0..50 {
             if ask_doctor().is_some() { println!("agent ok"); return 0; }
@@ -354,7 +428,13 @@ mod plat {
         1
     }
 
+    fn netsh(args: &[&str]) -> bool {
+        std::process::Command::new("netsh").args(["advfirewall", "firewall"]).args(args).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+    }
+
     pub fn uninstall() {
+        let _ = netsh(&["delete", "rule", "name=Roamtty Desktop"]);
         let _ = schtasks(&["/End", "/TN", TASK]);
         let _ = schtasks(&["/Delete", "/F", "/TN", TASK]);
     }

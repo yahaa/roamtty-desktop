@@ -45,6 +45,9 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }}
       - run: copy target\${{ matrix.target }}\release\roamtty-desktop.exe ${{ matrix.name }}
         shell: cmd
+      # It must start on a Windows without the VC++ Redistributable.
+      - run: if (Select-String -Path ${{ matrix.name }} -Pattern 'VCRUNTIME140' -SimpleMatch -Quiet) { throw 'links VCRUNTIME140.dll' }
+        shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
