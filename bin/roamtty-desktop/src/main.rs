@@ -90,7 +90,8 @@ fn main() {
         #[cfg(target_os = "macos")]
         Some("print-info-plist") => { print!("{}", agent::info_plist()); 0 }
         #[cfg(windows)]
-        Some("encode-test") => win_mf::self_test(flag(&args, "--out"), flag(&args, "--frames").and_then(|n| n.parse().ok()).unwrap_or(300)),
+        Some("encode-test") => win_mf::self_test(flag(&args, "--out"), flag(&args, "--frames").and_then(|n| n.parse().ok()).unwrap_or(300),
+            args.iter().any(|a| a == "--cpu")),
         Some("doctor") => doctor(),
         Some("install") => install(&args[1..]),
         Some("uninstall") => uninstall(),

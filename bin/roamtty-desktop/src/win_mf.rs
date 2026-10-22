@@ -434,8 +434,9 @@ impl VideoEncoder for MfEncoder {
 
 /// `encode-test [--frames N] [--out FILE]`: the hardware path without a desktop (it runs from an
 /// SSH login too): a 4K picture with a moving bar drawn on the GPU, encoded at 2400 wide like a
-/// phone asks for, timed. Writes the Annex-B stream to FILE for a decoder to check.
-pub fn self_test(out: Option<&str>, frames: u32) -> i32 {
+/// phone asks for, timed. Writes the Annex-B stream to FILE for a decoder to check. `--cpu` times
+/// the OpenH264 path on the same pictures instead (read back from the GPU like a capture is).
+pub fn self_test(out: Option<&str>, frames: u32, cpu: bool) -> i32 {
     let mut device = None;
     let mut context = None;
     let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
@@ -447,7 +448,8 @@ pub fn self_test(out: Option<&str>, frames: u32) -> i32 {
     let (sw, sh) = (3840u32, 2160u32);
     let (w, h) = crate::encode::fit(sw, sh, 2400);
     let gpu = Rc::new(GpuFrame { device: device.clone(), context: context.clone(), texture: Default::default() });
-    let mut enc = match MfEncoder::new(gpu.clone()) {
+    let hw = if cpu { crate::open_encoder() } else { MfEncoder::new(gpu.clone()).map(|e| Box::new(e) as Box<dyn VideoEncoder>) };
+    let mut enc = match hw {
         Ok(e) => e,
         Err(e) => { println!("{}", serde_json::json!({ "encoder": null, "error": e })); return 1; }
     };
@@ -476,7 +478,8 @@ pub fn self_test(out: Option<&str>, frames: u32) -> i32 {
         if let Err(e) = gpu.store(&src, sw, sh) { eprintln!("store: {e}"); return 1; }
         if f == 0 { enc.force_key(); }
         let t = Instant::now();
-        match enc.encode(&[], sw as usize, sh as usize, 0, w, h) {
+        let bgra: &[u8] = if cpu { &pixels } else { &[] };
+        match enc.encode(bgra, sw as usize, sh as usize, sw as usize * 4, w, h) {
             Ok((data, key)) => {
                 times.push(t.elapsed().as_micros() as u64);
                 if data.is_empty() { empty += 1; continue; }
