@@ -84,6 +84,8 @@ pub struct X11 {
     wheel: (i32, i32),
     cursor_serial: u32,
     clip: Option<Clipboard>,
+    /// X keycode per HID usage on this server.
+    keycodes: Vec<u8>,
 }
 
 impl X11 {
@@ -106,7 +108,8 @@ impl X11 {
             let i = (*k - min_keycode) as usize * per as usize;
             map.keysyms[i..i + per as usize].iter().all(|s| *s == 0)
         }).take(8).collect();
-        let mut x = X11 { conn, root, width, height, shm: None, keymap: map.keysyms, min_keycode, per_keycode: per, spare, wheel: (0, 0), cursor_serial: 0, clip: None };
+        let mut x = X11 { conn, root, width, height, shm: None, keymap: map.keysyms, min_keycode, per_keycode: per, spare, wheel: (0, 0), cursor_serial: 0, clip: None, keycodes: Vec::new() };
+        x.keycodes = (0..=0xFFu16).map(|hid| x.resolve(hid)).collect();
         x.shm = x.make_shm().ok();
         x.clip = Clipboard::start().ok();
         Ok(x)
@@ -223,8 +226,21 @@ impl X11 {
     }
 
     pub fn key(&self, hid: u16, down: bool) -> Result<()> {
-        let Some(code) = keymap::hid_to_evdev(hid) else { return Ok(()) };
-        self.keycode(code as u8 + 8, down)
+        match self.keycodes.get(hid as usize) {
+            Some(&code) if code != 0 => self.keycode(code, down),
+            _ => Ok(()),
+        }
+    }
+
+    /// A key's keycode: evdev + 8 by position, unless the server numbers its keys otherwise
+    /// (xfree86 codes under xrdp) and the key is a named one found by its keysym instead.
+    fn resolve(&self, hid: u16) -> u8 {
+        let Some(evdev) = keymap::hid_to_evdev(hid) else { return 0 };
+        let code = (evdev + 8) as u8;
+        let Some(sym) = keymap::hid_keysym(hid) else { return code };
+        let i = code.wrapping_sub(self.min_keycode) as usize * self.per_keycode as usize;
+        if code >= self.min_keycode && self.keymap.get(i) == Some(&sym) { return code; }
+        self.lookup(sym).map(|(c, _)| c).unwrap_or(code)
     }
 
     fn keycode(&self, code: u8, down: bool) -> Result<()> {

@@ -183,6 +183,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     if !hello.needs.is_empty() { crate::log!("serve needs {:?}", hello.needs); return 0; }
     let test_hooks = std::env::var("ROAMTTY_DESKTOP_TEST").as_deref() == Ok("1");
     crate::log!("serve start {} displays={}", x.kind(), displays.len());
+    x.wake();
 
     let (tx, rx) = mpsc::channel::<Option<ClientMsg>>();
     if let Some(l) = &link { l.start(tx.clone()); }

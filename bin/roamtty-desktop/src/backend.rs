@@ -47,6 +47,12 @@ pub trait Backend {
         };
         self.tap(keys)
     }
+    /// Wakes a blanked screen as serving starts, so the first picture is the desktop or its lock
+    /// screen rather than black until the user happens to touch it: a nudge there and back.
+    fn wake(&mut self) {
+        if self.move_rel(1, 0).is_ok() { let _ = self.move_rel(-1, 0); }
+        self.flush();
+    }
     /// "断开后锁定电脑": locks the session when the connection really ends.
     fn lock_screen(&mut self) { let _ = std::process::Command::new("loginctl").arg("lock-session").status(); }
     /// What the user must allow on the host before the desktop works (macOS TCC).
