@@ -13,6 +13,8 @@ mod udp_link;
 mod openh264enc;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod win_mf;
 #[cfg(target_os = "linux")]
 mod wl;
 #[cfg(target_os = "linux")]
@@ -87,6 +89,9 @@ fn main() {
         Some("agent") => agent::run(),
         #[cfg(target_os = "macos")]
         Some("print-info-plist") => { print!("{}", agent::info_plist()); 0 }
+        #[cfg(windows)]
+        Some("encode-test") => win_mf::self_test(flag(&args, "--out"), flag(&args, "--frames").and_then(|n| n.parse().ok()).unwrap_or(300),
+            args.iter().any(|a| a == "--cpu")),
         Some("doctor") => doctor(),
         Some("install") => install(&args[1..]),
         Some("uninstall") => uninstall(),

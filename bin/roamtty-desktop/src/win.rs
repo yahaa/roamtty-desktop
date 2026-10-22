@@ -10,6 +10,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT, HGLOBAL, HANDLE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_OUTDUPL_FRAME_INFO, DXGI_ERROR_WAIT_TIMEOUT};
@@ -44,6 +45,8 @@ pub struct Win {
     dups: Vec<Dup>,
     /// The cursor handle whose image went out last: a new handle is a new shape.
     last_cursor: Option<isize>,
+    /// Set once a hardware encoder took over: frames stay on the GPU.
+    gpu: Option<std::rc::Rc<crate::win_mf::GpuFrame>>,
 }
 
 /// USB HID usage to a set-1 scan code, with the E0 (extended) flag where the key has one.
@@ -150,9 +153,15 @@ impl Win {
         unsafe { let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); }
         let mut device = None;
         let mut context = None;
-        unsafe {
-            D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, Default::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None,
-                D3D11_SDK_VERSION, Some(&mut device), None, Some(&mut context)).map_err(err)?;
+        // Video support lets the video processor and the hardware encoder share the device; a
+        // driver without it still captures.
+        for flags in [D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_CREATE_DEVICE_BGRA_SUPPORT] {
+            let r = unsafe {
+                D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, Default::default(), flags, None,
+                    D3D11_SDK_VERSION, Some(&mut device), None, Some(&mut context))
+            };
+            if r.is_ok() { break; }
+            if flags == D3D11_CREATE_DEVICE_BGRA_SUPPORT { r.map_err(err)?; }
         }
         let (device, context) = (device.ok_or("no D3D11 device")?, context.ok_or("no D3D11 context")?);
         let mut list: Vec<(HMONITOR, RECT, String, bool)> = Vec::new();
@@ -162,7 +171,7 @@ impl Win {
             id: i as u8, w: (r.right - r.left) as u32, h: (r.bottom - r.top) as u32, scale: 1.0, x: r.left, y: r.top,
             primary: *primary, name: name.trim_start_matches("\\\\.\\").to_string(),
         }, *h)).collect();
-        Ok(Win { device, context, displays, dups: Vec::new(), last_cursor: None })
+        Ok(Win { device, context, displays, dups: Vec::new(), last_cursor: None, gpu: None })
     }
 
     /// The duplication of the output whose device name matches `name`.
@@ -190,22 +199,52 @@ impl Backend for Win {
 
     fn displays(&self) -> Vec<Display> { self.displays.iter().map(|(d, _)| d.clone()).collect() }
 
+    fn hw_encoder(&mut self) -> Option<Box<dyn crate::encode::VideoEncoder>> {
+        // ROAMTTY_DESKTOP_ENCODER=openh264 keeps the CPU path, to compare or to work around a driver.
+        if std::env::var("ROAMTTY_DESKTOP_ENCODER").as_deref() == Ok("openh264") { return None; }
+        let gpu = std::rc::Rc::new(crate::win_mf::GpuFrame {
+            device: self.device.clone(), context: self.context.clone(), texture: Default::default(),
+        });
+        match crate::win_mf::MfEncoder::new(gpu.clone()) {
+            Ok(e) => {
+                crate::log!("hardware encoder {}", crate::encode::VideoEncoder::name(&e));
+                self.gpu = Some(gpu);
+                Some(Box::new(e))
+            }
+            Err(e) => { crate::log!("no hardware encoder, OpenH264 instead: {e}"); None }
+        }
+    }
+
     fn capture<'a>(&'a mut self, d: &Display, buf: &'a mut Vec<u8>) -> Result<Frame<'a>> {
         let i = self.duplication(&d.name.clone())?;
         let (w, h) = (self.dups[i].w, self.dups[i].h);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        match unsafe { self.dups[i].dup.AcquireNextFrame(50, &mut info, &mut resource) } {
+        // No waiting: serve polls once per frame interval and handles input in between. A 50 ms wait
+        // here held back keys typed into a still screen by up to 50 ms.
+        match unsafe { self.dups[i].dup.AcquireNextFrame(0, &mut info, &mut resource) } {
             Ok(()) => {}
             // Nothing changed: the last frame stands.
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                if let Some(g) = &self.gpu {
+                    if g.texture.borrow().is_none() { return Err("no frame yet".into()); }
+                    return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(false) });
+                }
                 if buf.is_empty() { return Err("no frame yet".into()); }
-                return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4 });
+                return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None });
             }
             // Access lost (secure desktop, mode change): start over next time.
             Err(e) => { self.dups.remove(i); return Err(err(e)); }
         }
         let tex: ID3D11Texture2D = resource.ok_or("no frame resource")?.cast().map_err(err)?;
+        if let Some(g) = self.gpu.clone() {
+            // A pointer-only update (no new picture) leaves the texture as it is.
+            let changed = info.AccumulatedFrames > 0 || g.texture.borrow().is_none();
+            let r = if changed { g.store(&tex, w, h) } else { Ok(()) };
+            unsafe { let _ = self.dups[i].dup.ReleaseFrame(); }
+            r?;
+            return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(changed) });
+        }
         if self.dups[i].staging.is_none() {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             unsafe { tex.GetDesc(&mut desc) };
@@ -230,7 +269,7 @@ impl Backend for Win {
             }
             self.context.Unmap(&staging, 0);
         }
-        Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4 })
+        Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None })
     }
 
     fn cursor(&mut self) -> Option<Cursor> {

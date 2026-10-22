@@ -41,7 +41,12 @@ Low-rate control messages carry UTF-8 JSON; high-rate ones fixed binary. Unknown
 | `0x81` | S→C | VIDEO | `u32 frame` `u8 flags` (bit0 keyframe, bit1 refine) `u64 capture_us` `u64 encoded_us` `u16 w` `u16 h` + H.264 Annex-B |
 | `0x82` | S→C | CURSOR_POS | `u16 x` `u16 y` `u8 visible` `u64 shape_hash` |
 | `0x83` | S→C | CURSOR_SHAPE | `u64 hash` `u16 w` `u16 h` `u16 hot_x` `u16 hot_y` + RGBA (straight alpha); each shape once per connection |
-| `0x84` | S→C | STATE | JSON event: `displays`, `needs`, `locked`, `clip`, `kicked`, `error` |
+| `0x84` | S→C | STATE | JSON event: `displays`, `needs`, `locked`, `clip`, `kicked`, `error`, `timing` |
+
+`timing` comes about once a second while frames go out: the host's share of a frame's latency,
+averaged in µs: `{"frames": n, "capture_us", "convert_us", "encode_us", "encoder"}`. `capture_us` is
+grabbing the pixels and finding out whether they changed, `convert_us` scaling them and converting
+them to YUV (0 when the encoder does that on the GPU), `encode_us` the rest of the encoder's time.
 
 | INPUT kind | fields |
 |---|---|

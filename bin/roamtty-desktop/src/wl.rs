@@ -266,9 +266,9 @@ impl Backend for Wayland {
                 let s = stride as usize;
                 buf[row * s..(row + 1) * s].copy_from_slice(&data[(h as usize - 1 - row) * s..(h as usize - row) * s]);
             }
-            return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: stride as usize });
+            return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: stride as usize, changed: None });
         }
-        Ok(Frame { bgra: data, w: w as usize, h: h as usize, stride: stride as usize })
+        Ok(Frame { bgra: data, w: w as usize, h: h as usize, stride: stride as usize, changed: None })
     }
 
     fn cursor(&mut self) -> Option<Cursor> { None }

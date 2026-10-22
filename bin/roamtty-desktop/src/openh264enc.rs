@@ -31,6 +31,7 @@ pub struct H264 {
     h: usize,
     bitrate: u32,
     fps: f32,
+    convert_us: u64,
 }
 
 impl H264 {
@@ -38,7 +39,7 @@ impl H264 {
     pub fn new(lib: &Path) -> Result<H264, String> {
         // Checked against the hashes of Cisco's releases before it is ever loaded.
         OpenH264API::from_blob_path(lib).map_err(|e| format!("openh264: {e}"))?;
-        Ok(H264 { enc: None, api: lib.to_path_buf(), w: 0, h: 0, bitrate: 4_000_000, fps: 30.0 })
+        Ok(H264 { enc: None, api: lib.to_path_buf(), w: 0, h: 0, bitrate: 4_000_000, fps: 30.0, convert_us: 0 })
     }
 
     fn make(&self) -> Result<Encoder, String> {
@@ -93,8 +94,10 @@ impl VideoEncoder for H264 {
             self.w = w;
             self.h = h;
         }
+        let t = std::time::Instant::now();
         let mut yuv = Vec::new();
         to_i420(bgra, sw, sh, stride, w, h, &mut yuv);
+        self.convert_us = t.elapsed().as_micros() as u64;
         let src = YUVBuffer::from_vec(yuv, w, h);
         let enc = self.enc.as_mut().unwrap();
         let out = enc.encode(&src).map_err(|e| e.to_string())?;
@@ -102,4 +105,6 @@ impl VideoEncoder for H264 {
         let data = out.to_vec();
         Ok((data, key))
     }
+
+    fn convert_us(&self) -> u64 { self.convert_us }
 }
