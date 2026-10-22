@@ -431,3 +431,67 @@ impl VideoEncoder for MfEncoder {
     }
 }
 
+
+/// `encode-test [--frames N] [--out FILE]`: the hardware path without a desktop (it runs from an
+/// SSH login too): a 4K picture with a moving bar drawn on the GPU, encoded at 2400 wide like a
+/// phone asks for, timed. Writes the Annex-B stream to FILE for a decoder to check.
+pub fn self_test(out: Option<&str>, frames: u32) -> i32 {
+    let mut device = None;
+    let mut context = None;
+    let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    if let Err(e) = unsafe {
+        D3D11CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE, Default::default(), flags, None,
+            D3D11_SDK_VERSION, Some(&mut device), None, Some(&mut context))
+    } { eprintln!("D3D11: {e}"); return 1; }
+    let (device, context): (ID3D11Device, ID3D11DeviceContext) = (device.unwrap(), context.unwrap());
+    let (sw, sh) = (3840u32, 2160u32);
+    let (w, h) = crate::encode::fit(sw, sh, 2400);
+    let gpu = Rc::new(GpuFrame { device: device.clone(), context: context.clone(), texture: Default::default() });
+    let mut enc = match MfEncoder::new(gpu.clone()) {
+        Ok(e) => e,
+        Err(e) => { println!("{}", serde_json::json!({ "encoder": null, "error": e })); return 1; }
+    };
+    enc.set_bitrate(12_000_000);
+    // The source texture, refilled from memory each frame: a grey ramp, text-like stripes and a bar.
+    let src_desc = D3D11_TEXTURE2D_DESC {
+        Width: sw, Height: sh, MipLevels: 1, ArraySize: 1, Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Usage: D3D11_USAGE_DEFAULT, BindFlags: 0, CPUAccessFlags: 0, MiscFlags: 0,
+    };
+    let mut src = None;
+    if let Err(e) = unsafe { device.CreateTexture2D(&src_desc, None, Some(&mut src)) } { eprintln!("texture: {e}"); return 1; }
+    let src = src.unwrap();
+    let mut pixels = vec![0u8; (sw * sh * 4) as usize];
+    let mut file = out.and_then(|p| std::fs::File::create(p).ok());
+    let (mut times, mut bytes, mut keys, mut empty) = (Vec::new(), 0usize, 0u32, 0u32);
+    for f in 0..frames {
+        for y in 0..sh as usize {
+            for x in 0..sw as usize {
+                let i = (y * sw as usize + x) * 4;
+                let bar = (x + f as usize * 16) % sw as usize > sw as usize - 200;
+                let v = if bar { 255 } else if (y / 24) % 2 == 0 && (x / 9) % 3 != 0 { 40 } else { (x * 255 / sw as usize) as u8 };
+                pixels[i] = v; pixels[i + 1] = if bar { 64 } else { v }; pixels[i + 2] = v; pixels[i + 3] = 255;
+            }
+        }
+        unsafe { context.UpdateSubresource(&src, 0, None, pixels.as_ptr() as *const _, sw * 4, 0) };
+        if let Err(e) = gpu.store(&src, sw, sh) { eprintln!("store: {e}"); return 1; }
+        if f == 0 { enc.force_key(); }
+        let t = Instant::now();
+        match enc.encode(&[], sw as usize, sh as usize, 0, w, h) {
+            Ok((data, key)) => {
+                times.push(t.elapsed().as_micros() as u64);
+                if data.is_empty() { empty += 1; continue; }
+                bytes += data.len();
+                keys += key as u32;
+                if let Some(file) = &mut file { use std::io::Write; let _ = file.write_all(&data); }
+            }
+            Err(e) => { eprintln!("frame {f}: {e}"); return 1; }
+        }
+    }
+    times.sort_unstable();
+    let avg = times.iter().sum::<u64>() / times.len().max(1) as u64;
+    println!("{}", serde_json::json!({
+        "encoder": enc.name(), "size": format!("{w}x{h}"), "frames": frames, "empty": empty, "keys": keys, "bytes": bytes,
+        "encode_us": { "avg": avg, "p50": times.get(times.len() / 2), "p95": times.get(times.len() * 95 / 100), "max": times.last() },
+    }));
+    0
+}
