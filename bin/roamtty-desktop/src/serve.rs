@@ -89,8 +89,11 @@ const LADDER: [(u32, u32); 5] = [(1920, 60), (1920, 30), (1280, 30), (960, 15), 
 pub struct RateControl {
     pub bitrate: u32,
     pub step: usize,
-    base_rtt: u64,
-    worst_queue: u64,
+    /// The best round trip of each of the last ten seconds: the base adapts when the route changes.
+    best: VecDeque<u64>,
+    /// This second's round trips.
+    rtts: Vec<u64>,
+    congested_for: u32,
     last_adjust: Instant,
     stable_since: Instant,
 }
@@ -98,34 +101,44 @@ pub struct RateControl {
 impl RateControl {
     pub fn new(bitrate: u32) -> Self {
         let now = Instant::now();
-        RateControl { bitrate, step: 0, base_rtt: u64::MAX, worst_queue: 0, last_adjust: now, stable_since: now }
+        RateControl { bitrate, step: 0, best: VecDeque::new(), rtts: Vec::new(), congested_for: 0, last_adjust: now, stable_since: now }
     }
 
-    /// `rtt_us`: time from sending a frame to its ACK. Queueing is that minus the best seen.
-    pub fn on_ack(&mut self, rtt_us: u64) {
-        self.base_rtt = self.base_rtt.min(rtt_us);
-        self.worst_queue = self.worst_queue.max(rtt_us - self.base_rtt);
-    }
+    /// `rtt_us`: time from sending a frame to its ACK, the phone's decode time taken out.
+    pub fn on_ack(&mut self, rtt_us: u64) { self.rtts.push(rtt_us); }
 
-    /// At most one change a second: congested → ×0.8 and one ladder step down; otherwise +5%,
-    /// and one step up after 5 s without congestion. Returns true when anything changed.
+    /// At most one change a second. A second is congested when a quarter of its frames queued over
+    /// 50 ms, or one over 250 ms: a phone on Wi-Fi (or behind a VPN app) has single spikes of
+    /// 60-120 ms at any rate, and backing off for each sank the picture to 960×622 at 5 fps for good.
+    /// Congested → bitrate ×0.85, and a ladder step down after two such seconds in a row; otherwise
+    /// +8%, and a step up after 3 s without congestion. Returns true when anything changed.
     pub fn tick(&mut self, now: Instant, cap: u32, auto: bool) -> bool {
         if now.duration_since(self.last_adjust) < Duration::from_secs(1) { return false; }
         self.last_adjust = now;
         let before = (self.bitrate, self.step);
-        if self.worst_queue > 50_000 {
-            self.bitrate = (self.bitrate as f64 * 0.8) as u32;
-            if auto && self.step + 1 < LADDER.len() { self.step += 1; }
+        if let Some(&m) = self.rtts.iter().min() {
+            self.best.push_back(m);
+            if self.best.len() > 10 { self.best.pop_front(); }
+        }
+        let base = self.best.iter().copied().min().unwrap_or(0);
+        let late = self.rtts.iter().filter(|&&r| r.saturating_sub(base) > 50_000).count();
+        let worst = self.rtts.iter().map(|&r| r.saturating_sub(base)).max().unwrap_or(0);
+        let congested = !self.rtts.is_empty() && (late * 4 >= self.rtts.len() || worst > 250_000);
+        self.rtts.clear();
+        if congested {
+            self.bitrate = (self.bitrate as f64 * 0.85) as u32;
+            self.congested_for += 1;
+            if auto && self.congested_for >= 2 && self.step + 1 < LADDER.len() { self.step += 1; self.congested_for = 0; }
             self.stable_since = now;
         } else {
-            self.bitrate = (self.bitrate as f64 * 1.05) as u32;
-            if auto && self.step > 0 && now.duration_since(self.stable_since) >= Duration::from_secs(5) {
+            self.congested_for = 0;
+            self.bitrate = (self.bitrate as f64 * 1.08) as u32;
+            if auto && self.step > 0 && now.duration_since(self.stable_since) >= Duration::from_secs(3) {
                 self.step -= 1;
                 self.stable_since = now;
             }
         }
         self.bitrate = self.bitrate.clamp(200_000, cap);
-        self.worst_queue = 0;
         before != (self.bitrate, self.step)
     }
 }
@@ -377,10 +390,11 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
             }
         }
 
-        // Newest frame wins: with two frames unacknowledged (four on UDP, where ACKs can be lost and
-        // expire after 500 ms) this tick is skipped, not queued.
+        // Newest frame wins: with four frames unacknowledged this tick is skipped, not queued. The
+        // phone acknowledges a frame once decoded, ~30 ms on a phone's hardware decoder, so two held
+        // SSH to ~32 fps on a 12 Mbps link. On UDP, ACKs can be lost and expire after 500 ms.
         if udp { while in_flight.front().is_some_and(|f| now_us() - f.1 > 500_000) { in_flight.pop_front(); } }
-        if in_flight.len() >= if udp { 4 } else { 2 } && !want_key {
+        if in_flight.len() >= 4 && !want_key {
             out.flush();
             continue;
         }
@@ -454,20 +468,57 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
 mod tests {
     use super::*;
 
+    fn second(rc: &mut RateControl, at: Instant, rtts_ms: &[u64]) -> bool {
+        for r in rtts_ms { rc.on_ack(r * 1000); }
+        rc.tick(at, 12_000_000, true)
+    }
+
     #[test]
     fn congestion_backs_off_once_a_second() {
         let mut rc = RateControl::new(4_000_000);
         let t0 = Instant::now();
-        rc.on_ack(20_000);
-        rc.on_ack(120_000);
-        assert!(!rc.tick(t0, 12_000_000, true));
-        assert!(rc.tick(t0 + Duration::from_secs(1), 12_000_000, true));
-        assert_eq!((rc.bitrate, rc.step), (3_200_000, 1));
-        rc.on_ack(30_000);
-        assert!(rc.tick(t0 + Duration::from_secs(2), 12_000_000, true));
-        assert_eq!((rc.bitrate, rc.step), (3_360_000, 1));
-        for s in 3..8 { rc.tick(t0 + Duration::from_secs(s), 12_000_000, true); }
-        assert_eq!(rc.step, 0, "climbs back after 5 s");
+        assert!(!second(&mut rc, t0, &[20, 120]));
+        let t = |s: u64| t0 + Duration::from_secs(s);
+        assert!(second(&mut rc, t(1), &[20, 120, 130, 20]));
+        assert_eq!((rc.bitrate, rc.step), (3_400_000, 0), "one congested second: bitrate only");
+        second(&mut rc, t(2), &[20, 120, 130, 20]);
+        assert_eq!(rc.step, 1, "two in a row: a ladder step down");
+        for s in 3..6 { second(&mut rc, t(s), &[20, 22]); }
+        assert_eq!(rc.step, 0, "climbs back after 3 s");
+    }
+
+    /// A phone's Wi-Fi: one late frame in a second is jitter, not a full queue.
+    #[test]
+    fn single_spikes_are_not_congestion() {
+        let mut rc = RateControl::new(4_000_000);
+        let t0 = Instant::now();
+        for s in 1..20u64 {
+            let mut rtts = vec![13; 35];
+            if s % 2 == 0 { rtts[0] = 130; }
+            second(&mut rc, t0 + Duration::from_secs(s), &rtts);
+        }
+        assert_eq!(rc.step, 0);
+        assert_eq!(rc.bitrate, 12_000_000, "climbed to the cap");
+        // Five frames a second with a 90 ms one: still fine.
+        second(&mut rc, t0 + Duration::from_secs(21), &[13, 13, 90, 13, 13]);
+        assert_eq!(rc.bitrate, 12_000_000);
+        // But a quarter of them late is a queue, and one 300 ms stall is too.
+        assert!(second(&mut rc, t0 + Duration::from_secs(22), &[13, 80, 90, 13]));
+        assert!(rc.bitrate < 12_000_000);
+        let b = rc.bitrate;
+        second(&mut rc, t0 + Duration::from_secs(23), &[13; 30].iter().copied().chain([320]).collect::<Vec<_>>());
+        assert!(rc.bitrate < b);
+    }
+
+    /// A route change to a longer round trip is the new base within ten seconds, not a queue for ever.
+    #[test]
+    fn the_base_follows_a_slower_route() {
+        let mut rc = RateControl::new(4_000_000);
+        let t0 = Instant::now();
+        second(&mut rc, t0 + Duration::from_secs(1), &[10; 30]);
+        for s in 2..30u64 { second(&mut rc, t0 + Duration::from_secs(s), &[80; 30]); }
+        assert_eq!(rc.step, 0);
+        assert!(rc.bitrate > 4_000_000, "{}", rc.bitrate);
     }
 
     #[test]
