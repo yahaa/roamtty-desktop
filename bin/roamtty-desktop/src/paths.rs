@@ -1,4 +1,5 @@
 //! Everything lives under ~/.roamtty: the binary in bin/, state, logs and libraries in desktop/.
+//! The Windows service and its helper use C:\ProgramData\Roamtty instead (ROAMTTY_DESKTOP_ROOT).
 
 use std::path::PathBuf;
 
@@ -6,7 +7,7 @@ pub fn home() -> PathBuf {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
-pub fn root() -> PathBuf { home().join(".roamtty") }
+pub fn root() -> PathBuf { std::env::var_os("ROAMTTY_DESKTOP_ROOT").map(PathBuf::from).unwrap_or_else(|| home().join(".roamtty")) }
 pub fn desktop_dir() -> PathBuf { root().join("desktop") }
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn lib_dir() -> PathBuf { desktop_dir().join("lib") }
