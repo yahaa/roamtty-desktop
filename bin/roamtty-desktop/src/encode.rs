@@ -9,21 +9,40 @@ pub trait VideoEncoder {
     fn force_key(&mut self);
     /// Encodes `bgra` scaled to `w`×`h`; returns Annex-B and whether it is a keyframe.
     fn encode(&mut self, bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize) -> Result<(Vec<u8>, bool), String>;
+    /// The part of the last [encode](VideoEncoder::encode) spent scaling and converting pixels, in µs.
+    fn convert_us(&self) -> u64 { 0 }
 }
 
 /// Box-filtered downscale (or nearest upscale) from BGRA into planar I420, BT.601 limited range,
-/// which is what decoders assume when the stream carries no colour description.
+/// which is what decoders assume when the stream carries no colour description. Bands of rows go
+/// to up to four threads: a 4K screen took 14 ms on one core, more than the encoder itself.
 pub fn to_i420(bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize, out: &mut Vec<u8>) {
     out.resize(w * h * 3 / 2, 0);
     let (y_plane, uv) = out.split_at_mut(w * h);
     let (u_plane, v_plane) = uv.split_at_mut(w * h / 4);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+    // Whole row pairs per band, so each band owns its rows of every plane.
+    let band = (h / 2).div_ceil(threads).max(1) * 2;
+    std::thread::scope(|s| {
+        let bands = y_plane.chunks_mut(band * w).zip(u_plane.chunks_mut(band * w / 4)).zip(v_plane.chunks_mut(band * w / 4));
+        for (i, ((y, u), v)) in bands.enumerate() {
+            s.spawn(move || to_i420_rows(bgra, sw, sh, stride, w, h, i * band, y, u, v));
+        }
+    });
+}
+
+/// The output rows from `top` on that fit in `y_plane` (with their halves of U and V).
+#[allow(clippy::too_many_arguments)]
+fn to_i420_rows(bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize, top: usize,
+    y_plane: &mut [u8], u_plane: &mut [u8], v_plane: &mut [u8]) {
     // Fixed-point source span per output pixel.
     let fx = ((sw as u64) << 16) / w as u64;
     let fy = ((sh as u64) << 16) / h as u64;
     let mut rgb_row = vec![[0i32; 3]; w * 2];
-    for oy in (0..h).step_by(2) {
+    let rows = y_plane.len() / w;
+    for oy in (0..rows).step_by(2) {
         for r in 0..2 {
-            let y = oy + r;
+            let y = top + oy + r;
             let y0 = ((y as u64 * fy) >> 16) as usize;
             let y1 = ((((y + 1) as u64 * fy) >> 16) as usize).clamp(y0 + 1, sh);
             for x in 0..w {
@@ -44,7 +63,7 @@ pub fn to_i420(bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: us
                 }
                 let (rr, g, b) = (rr >> 2, g >> 2, b >> 2);
                 rgb_row[r * w + x] = [rr, g, b];
-                y_plane[y * w + x] = (((66 * rr + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+                y_plane[(oy + r) * w + x] = (((66 * rr + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
             }
         }
         for x in (0..w).step_by(2) {
@@ -62,6 +81,26 @@ pub fn to_i420(bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: us
         }
     }
 }
+
+/// The NAL units of an Annex-B access unit: (type, the unit with its start code).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn nal_units(data: &[u8]) -> Vec<(u8, &[u8])> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push((if i > 0 && data[i - 1] == 0 { i - 1 } else { i }, i + 3));
+            i += 3;
+        } else { i += 1; }
+    }
+    starts.iter().enumerate().map(|(n, &(start, body))| {
+        let end = starts.get(n + 1).map_or(data.len(), |s| s.0);
+        (data.get(body).map_or(0, |b| b & 0x1F), &data[start..end])
+    }).collect()
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn has_nal(data: &[u8], ty: u8) -> bool { nal_units(data).iter().any(|(t, _)| *t == ty) }
 
 /// Picks the encode size: the native size scaled so the long edge is at most `long`, even sides.
 pub fn fit(native_w: u32, native_h: u32, long: u32) -> (usize, usize) {
@@ -94,5 +133,29 @@ mod tests {
         let black = vec![0u8; 4 * 4 * 4];
         to_i420(&black, 4, 4, 16, 4, 4, &mut out);
         assert_eq!(out[0], 16);
+    }
+
+    #[test]
+    fn nal_units_of_an_access_unit() {
+        let au = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9];
+        let units = nal_units(&au);
+        assert_eq!(units.iter().map(|u| u.0).collect::<Vec<_>>(), vec![7, 8, 5]);
+        assert_eq!(units[0].1, &[0, 0, 0, 1, 0x67, 1, 2]);
+        assert_eq!(units[1].1, &[0, 0, 1, 0x68, 3]);
+        assert!(has_nal(&au, 5) && !has_nal(&au, 1));
+    }
+
+    /// Bands of rows on several threads give exactly the picture one pass over all rows gives.
+    #[test]
+    fn i420_bands_match_one_pass() {
+        let (sw, sh, w, h) = (333usize, 211usize, 202usize, 130usize);
+        let bgra: Vec<u8> = (0..sw * sh * 4).map(|i| (i * 7919 % 251) as u8).collect();
+        let mut banded = Vec::new();
+        to_i420(&bgra, sw, sh, sw * 4, w, h, &mut banded);
+        let mut whole = vec![0u8; w * h * 3 / 2];
+        let (y, uv) = whole.split_at_mut(w * h);
+        let (u, v) = uv.split_at_mut(w * h / 4);
+        to_i420_rows(&bgra, sw, sh, sw * 4, w, h, 0, y, u, v);
+        assert_eq!(banded, whole);
     }
 }

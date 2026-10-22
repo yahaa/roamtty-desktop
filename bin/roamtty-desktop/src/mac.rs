@@ -313,7 +313,7 @@ impl Backend for Mac {
         if l.seq == 0 { return Err("no frame yet".into()); }
         buf.clear();
         buf.extend_from_slice(&l.bgra);
-        Ok(Frame { bgra: buf, w: l.w, h: l.h, stride: l.stride })
+        Ok(Frame { bgra: buf, w: l.w, h: l.h, stride: l.stride, changed: None })
     }
 
     fn cursor(&mut self) -> Option<Cursor> {
@@ -453,11 +453,12 @@ pub struct VtEncoder {
     yuv: Vec<u8>,
     /// Presentation times: the rate control paces by them, and drops frames that all claim 0.
     start: std::time::Instant,
+    convert_us: u64,
 }
 
 impl VtEncoder {
     pub fn new() -> VtEncoder {
-        VtEncoder { session: None, w: 0, h: 0, bitrate: 4_000_000, fps: 30.0, key: true, out: Arc::new(Mutex::new(None)), yuv: Vec::new(),
+        VtEncoder { session: None, w: 0, h: 0, bitrate: 4_000_000, fps: 30.0, key: true, out: Arc::new(Mutex::new(None)), yuv: Vec::new(), convert_us: 0,
             start: std::time::Instant::now() }
     }
 
@@ -512,6 +513,7 @@ impl VideoEncoder for VtEncoder {
     fn encode(&mut self, bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize) -> std::result::Result<(Vec<u8>, bool), String> {
         use objc2_video_toolbox::*;
         if self.session.is_none() || (w, h) != (self.w, self.h) { self.make(w, h)?; }
+        let t = std::time::Instant::now();
         to_i420(bgra, sw, sh, stride, w, h, &mut self.yuv);
         // I420 into an NV12 pixel buffer (what the hardware encoder takes).
         let mut pb: *mut CVPixelBuffer = std::ptr::null_mut();
@@ -535,6 +537,7 @@ impl VideoEncoder for VtEncoder {
             }
             CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::empty());
         }
+        self.convert_us = t.elapsed().as_micros() as u64;
         let props = if self.key {
             Some(unsafe { CFDictionary::<CFString, CFBoolean>::from_slices(&[kVTEncodeFrameOptionKey_ForceKeyFrame], &[CFBoolean::new(true)]) })
         } else { None };
@@ -556,6 +559,8 @@ impl VideoEncoder for VtEncoder {
         unsafe { session.complete_frames(objc2_core_media::kCMTimeInvalid) };
         self.out.lock().unwrap().take().ok_or_else(|| "no output".to_string())
     }
+
+    fn convert_us(&self) -> u64 { self.convert_us }
 }
 
 /// An AVCC sample (length-prefixed NAL units) as Annex-B, with SPS and PPS before keyframes.

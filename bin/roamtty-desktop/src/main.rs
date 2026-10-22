@@ -13,6 +13,8 @@ mod udp_link;
 mod openh264enc;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod win_mf;
 #[cfg(target_os = "linux")]
 mod wl;
 #[cfg(target_os = "linux")]

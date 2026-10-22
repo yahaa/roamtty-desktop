@@ -84,6 +84,33 @@ fn quality_cap(q: &str) -> (u32, u32) {
 }
 
 /// The "auto" ladder: frame rate falls first, then resolution.
+/// Where the host's share of a frame's latency goes, summed over about a second and sent as STATE
+/// `timing` (averages in µs) so the app can show it beside the network and the phone's own share.
+#[derive(Default)]
+struct Timing { frames: u64, capture: u64, convert: u64, encode: u64, since: Option<Instant> }
+
+impl Timing {
+    fn add(&mut self, capture: u64, convert: u64, encode: u64) {
+        self.frames += 1;
+        self.capture += capture;
+        self.convert += convert;
+        self.encode += encode;
+    }
+
+    /// The JSON for the last second, once a second, when frames went out.
+    fn take(&mut self, encoder: &str) -> Option<String> {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() < Duration::from_secs(1) { return None; }
+        let t = std::mem::take(self);
+        self.since = Some(Instant::now());
+        if t.frames == 0 { return None; }
+        let n = t.frames;
+        Some(serde_json::json!({ "timing": {
+            "frames": n, "capture_us": t.capture / n, "convert_us": t.convert / n, "encode_us": t.encode / n, "encoder": encoder,
+        } }).to_string())
+    }
+}
+
 const LADDER: [(u32, u32); 5] = [(1920, 60), (1920, 30), (1280, 30), (960, 15), (960, 5)];
 
 pub struct RateControl {
@@ -162,7 +189,8 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         Ok(x) => x,
         Err((code, e)) => return fail_on(&mut output, code, e),
     };
-    let mut enc: Box<dyn VideoEncoder> = match crate::open_encoder() {
+    let hw = x.hw_encoder();
+    let mut enc: Box<dyn VideoEncoder> = match hw.map(Ok).unwrap_or_else(crate::open_encoder) {
         Ok(e) => e,
         Err(e) => return fail_on(&mut output, "encoder_failed", e),
     };
@@ -233,6 +261,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     let mut last_needs: Vec<String> = Vec::new();
     let mut last_capture_err = String::new();
     let mut locked = false;
+    let mut timing = Timing::default();
 
     while !ended {
         let flag = session::RETIRED.load(Ordering::SeqCst).max(args.retired.load(Ordering::SeqCst));
@@ -432,7 +461,8 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
             want_key = true;
             out.emit(ty::STATE, serde_json::json!({ "locked": false }).to_string().as_bytes());
         }
-        let changed = frame.bgra != last_sent.as_slice();
+        let changed = frame.changed.unwrap_or_else(|| frame.bgra != last_sent.as_slice());
+        let captured_us = now_us();
         let refine = !changed && !refined && last_change.elapsed() >= Duration::from_millis(300);
         if !changed && !key_due && !refine {
             out.flush();
@@ -442,7 +472,9 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         let (w, h) = encode::fit(d.w, d.h, long);
         if key_due || refine { enc.force_key(); }
         if refine { enc.set_bitrate(cap_bitrate.max(rc.bitrate) * 3); }
+        let encode_start = now_us();
         let result = enc.encode(frame.bgra, frame.w, frame.h, frame.stride, w, h);
+        let encode_us = now_us() - encode_start;
         if refine { enc.set_bitrate(rc.bitrate); }
         if changed {
             last_sent.clear();
@@ -455,6 +487,9 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
             Err(e) => { crate::log!("encode failed: {e}"); continue; }
         };
         if data.is_empty() { continue; }
+        let convert_us = enc.convert_us().min(encode_us);
+        timing.add(captured_us - capture_us, convert_us, encode_us - convert_us);
+        if let Some(t) = timing.take(enc.name()) { out.emit(ty::STATE, t.as_bytes()); }
         if refine { refined = true; }
         if key { last_key = Instant::now(); want_key = false; }
         if key_due { want_key = false; }

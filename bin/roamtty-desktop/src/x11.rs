@@ -156,7 +156,7 @@ impl X11 {
                 Ok(_) => {
                     let shm = self.shm.as_ref().unwrap();
                     let bgra = unsafe { std::slice::from_raw_parts(shm.ptr, n) };
-                    return Ok(Frame { bgra, w: w as usize, h: h as usize, stride: w as usize * 4 });
+                    return Ok(Frame { bgra, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None });
                 }
                 Err(e) => {
                     // A remote or sandboxed server can refuse shared memory: plain GetImage from now on.
@@ -167,7 +167,7 @@ impl X11 {
         }
         let r = self.conn.get_image(ImageFormat::Z_PIXMAP, self.root, d.x as i16, d.y as i16, w, h, !0).map_err(err)?.reply().map_err(err)?;
         *buf = r.data;
-        Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4 })
+        Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None })
     }
 
     pub fn cursor(&mut self) -> Result<Cursor> {

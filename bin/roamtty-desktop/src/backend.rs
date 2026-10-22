@@ -10,6 +10,9 @@ pub struct Frame<'a> {
     pub w: usize,
     pub h: usize,
     pub stride: usize,
+    /// Whether the picture changed since the last frame, when the backend knows (DXGI does); None
+    /// has `serve` compare the pixels. A frame that stays on the GPU has no `bgra` at all.
+    pub changed: Option<bool>,
 }
 
 pub struct Cursor {
@@ -25,6 +28,10 @@ pub trait Backend {
     fn displays(&self) -> Vec<Display>;
     /// One display's pixels as BGRA; `buf` holds them when the backend cannot lend its own memory.
     fn capture<'a>(&'a mut self, d: &Display, buf: &'a mut Vec<u8>) -> Result<Frame<'a>>;
+    /// An encoder that takes this backend's frames straight from the GPU (Media Foundation's
+    /// hardware encoders on Windows); None leaves it to the platform's usual one. Once it returned
+    /// one, [capture](Backend::capture) hands that encoder its frames and `bgra` stays empty.
+    fn hw_encoder(&mut self) -> Option<Box<dyn crate::encode::VideoEncoder>> { None }
     /// None when the backend draws the cursor into the frames instead.
     fn cursor(&mut self) -> Option<Cursor>;
     fn move_abs(&mut self, x: i32, y: i32) -> Result<()>;
