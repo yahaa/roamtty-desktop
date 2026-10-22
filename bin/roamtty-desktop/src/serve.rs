@@ -59,6 +59,10 @@ pub struct Args {
     pub claimed: Option<session::Session>,
 }
 
+/// Not a protocol type: the message a backend's [on_frame](Backend::on_frame) puts in the input
+/// queue to say a new frame is waiting. A phone that sent type 0 would only cause an extra look.
+const FRAME_READY: u8 = 0x00;
+
 /// Monotonic microseconds since the process started (never 0, which means "none" on the wire).
 pub fn now_us() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -215,6 +219,8 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
 
     let (tx, rx) = mpsc::channel::<Option<ClientMsg>>();
     if let Some(l) = &link { l.start(tx.clone()); }
+    let wake = tx.clone();
+    x.on_frame(Arc::new(move || { let _ = wake.send(Some(ClientMsg::Unknown(FRAME_READY))); }));
     let mut out = Out { ssh, ssh_open: true, link: link.clone() };
     std::thread::spawn(move || {
         let mut r = std::io::BufReader::new(input);
@@ -262,6 +268,12 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     let mut last_capture_err = String::new();
     let mut locked = false;
     let mut timing = Timing::default();
+    // When the last frame sent was taken, and the gap the frame rate asks for: a frame that wakes us
+    // sooner than three quarters of it waits for the tick. Counted from the take, not from when its
+    // encode finished: a 60 Hz screen's next frame arrives ~7 ms after a 9 ms encode, which read as
+    // too soon and left it waiting up to a whole tick (6.5 ms on average on a Mac).
+    let mut last_encode = Instant::now();
+    let mut interval = Duration::from_micros(1_000_000 / 60);
 
     while !ended {
         let flag = session::RETIRED.load(Ordering::SeqCst).max(args.retired.load(Ordering::SeqCst));
@@ -273,6 +285,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         let wait = next_tick.saturating_duration_since(Instant::now());
         let msg = rx.recv_timeout(wait);
         let mut dirty_input = false;
+        let mut frame_ready = false;
         let mut handle = |m: ClientMsg, x: &mut Box<dyn Backend>, out: &mut Out<_>| -> Option<bool> {
             match m {
                 ClientMsg::Config(c) => {
@@ -343,6 +356,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     out.emit(ty::PONG, &proto::pong_payload(t1, t, now_us()));
                     out.flush();
                 }
+                ClientMsg::Unknown(FRAME_READY) => frame_ready = true,
                 ClientMsg::Pong { .. } | ClientMsg::Unknown(_) => {}
             }
             Some(false)
@@ -359,7 +373,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     }
                 }
                 if dirty_input { x.flush(); }
-                if Instant::now() < next_tick { continue; }
+                if Instant::now() < next_tick && !(frame_ready && last_encode.elapsed() >= interval * 3 / 4) { continue; }
             }
             // The SSH channel closed. With UDP alive the desktop carries on (plan §7.3); without
             // it, or after 30 s of UDP silence, this is the end.
@@ -382,7 +396,8 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         let auto = quality == "auto";
         let (ladder_long, ladder_fps) = if auto { LADDER[rc.step] } else { (u32::MAX, u32::MAX) };
         let fps = fps_limit.min(ladder_fps).max(1);
-        next_tick = Instant::now() + Duration::from_micros(1_000_000 / fps as u64);
+        interval = Duration::from_micros(1_000_000 / fps as u64);
+        next_tick = Instant::now() + interval;
         if paused { continue; }
         if udp {
             // GCC drives the rate on UDP. The encoder hears about it at most once a second, and
@@ -433,6 +448,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         // At most one keyframe a second; a request inside that waits for it.
         let key_due = want_key && (frame_no == 0 || last_key.elapsed() >= Duration::from_secs(1));
         let capture_us = now_us();
+        let taken = Instant::now();
         let frame = match x.capture(&d, &mut scratch) {
             Ok(f) => f,
             Err(e) => {
@@ -463,6 +479,8 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         }
         let changed = frame.changed.unwrap_or_else(|| frame.bgra != last_sent.as_slice());
         let captured_us = now_us();
+        // A frame that came by itself was on the screen before we looked: its wait counts as capture.
+        let capture_us = frame.shown_us.map_or(capture_us, |t| t.min(capture_us));
         let refine = !changed && !refined && last_change.elapsed() >= Duration::from_millis(300);
         if !changed && !key_due && !refine {
             out.flush();
@@ -478,7 +496,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         if refine { enc.set_bitrate(rc.bitrate); }
         if changed {
             last_sent.clear();
-            last_sent.extend_from_slice(frame.bgra);
+            if frame.changed.is_none() { last_sent.extend_from_slice(frame.bgra); }
             last_change = Instant::now();
             refined = false;
         }
@@ -491,6 +509,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         timing.add(captured_us - capture_us, convert_us, encode_us - convert_us);
         if let Some(t) = timing.take(enc.name()) { out.emit(ty::STATE, t.as_bytes()); }
         if refine { refined = true; }
+        last_encode = taken;
         if key { last_key = Instant::now(); want_key = false; }
         if key_due { want_key = false; }
         frame_no = frame_no.wrapping_add(1);

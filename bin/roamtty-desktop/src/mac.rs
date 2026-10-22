@@ -15,10 +15,10 @@ use objc2_core_graphics::{
     CGEventType, CGGetActiveDisplayList, CGMainDisplayID, CGMouseButton, CGPreflightScreenCaptureAccess,
     CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
-use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
+use objc2_core_media::{CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
-    CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
-    CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
+    CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSString};
@@ -84,11 +84,29 @@ pub fn request_permissions() {
     }
 }
 
-/// The newest frame ScreenCaptureKit delivered, as BGRA.
-#[derive(Default)]
-struct Latest { bgra: Vec<u8>, w: usize, h: usize, stride: usize, seq: u64 }
+/// A CoreVideo buffer passed between ScreenCaptureKit's queue, `serve` and the encoder (CF retain
+/// and release are thread-safe; the pixels are only read).
+#[derive(Clone)]
+struct PixelBuffer(CFRetained<CVPixelBuffer>);
+unsafe impl Send for PixelBuffer {}
+unsafe impl Sync for PixelBuffer {}
 
-struct OutputIvars { latest: Arc<Mutex<Latest>> }
+impl PixelBuffer {
+    fn size(&self) -> (usize, usize) { (CVPixelBufferGetWidth(&self.0), CVPixelBufferGetHeight(&self.0)) }
+}
+
+/// The newest frame ScreenCaptureKit delivered: NV12, scaled by the GPU, still in its IOSurface.
+#[derive(Default)]
+struct Latest { buffer: Option<PixelBuffer>, seq: u64, shown_us: u64 }
+
+type Wake = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+/// Between the backend and its encoder: the frame `serve` took, which the encoder compresses as it
+/// is, and the size the encoder was asked for, which the next capture has ScreenCaptureKit deliver.
+#[derive(Default)]
+pub struct GpuSlot { frame: Mutex<Option<PixelBuffer>>, want: Mutex<Option<(usize, usize)>> }
+
+struct OutputIvars { latest: Arc<Mutex<Latest>>, wake: Wake }
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -103,32 +121,51 @@ define_class!(
             if ty != SCStreamOutputType::Screen { return; }
             // Idle frames (nothing changed) carry no image.
             let Some(image) = (unsafe { sample.image_buffer() }) else { return };
-            let pb: &CVPixelBuffer = &image;
-            unsafe {
-                if CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) != 0 { return; }
-                let base = CVPixelBufferGetBaseAddress(pb) as *const u8;
-                let stride = CVPixelBufferGetBytesPerRow(pb);
-                let (w, h) = (CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb));
-                if !base.is_null() {
-                    let mut l = self.ivars().latest.lock().unwrap();
-                    l.bgra.clear();
-                    l.bgra.extend_from_slice(std::slice::from_raw_parts(base, stride * h));
-                    l.w = w; l.h = h; l.stride = stride; l.seq += 1;
-                }
-                CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly);
+            {
+                let mut l = self.ivars().latest.lock().unwrap();
+                l.buffer = Some(PixelBuffer(image));
+                l.seq += 1;
+                l.shown_us = shown_us(sample);
             }
+            if let Some(wake) = self.ivars().wake.lock().unwrap().clone() { wake(); }
         }
     }
 );
 
 impl FrameSink {
-    fn new(latest: Arc<Mutex<Latest>>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(OutputIvars { latest });
+    fn new(latest: Arc<Mutex<Latest>>, wake: Wake) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(OutputIvars { latest, wake });
         unsafe { msg_send![super(this), init] }
     }
 }
 
-struct Capture { stream: Retained<SCStream>, _sink: Retained<FrameSink>, display: u32, latest: Arc<Mutex<Latest>> }
+/// When a sample was on the screen, on `serve::now_us`'s clock: its presentation time is host time.
+fn shown_us(sample: &CMSampleBuffer) -> u64 {
+    let now = crate::serve::now_us();
+    let pts = unsafe { sample.presentation_time_stamp() };
+    if !pts.flags.contains(CMTimeFlags::Valid) || pts.timescale <= 0 { return now; }
+    let host = unsafe { CMClock::host_time_clock().time() };
+    let secs = |t: CMTime| t.value as f64 / t.timescale.max(1) as f64;
+    now.saturating_sub(((secs(host) - secs(pts)) * 1e6).clamp(0.0, 1e6) as u64)
+}
+
+/// What ScreenCaptureKit delivers: NV12 at the encoder's size (scaled on the GPU), BT.601 like the
+/// other platforms' converters, no cursor (the phone draws it).
+fn stream_config(w: usize, h: usize) -> Retained<SCStreamConfiguration> {
+    let config = unsafe { SCStreamConfiguration::new() };
+    unsafe {
+        config.setWidth(w);
+        config.setHeight(h);
+        config.setPixelFormat(u32::from_be_bytes(*b"420v"));
+        config.setColorMatrix(objc2_core_graphics::kCGDisplayStreamYCbCrMatrix_ITU_R_601_4);
+        config.setShowsCursor(false);
+        config.setMinimumFrameInterval(CMTime { value: 1, timescale: 60, flags: CMTimeFlags::Valid, epoch: 0 });
+        config.setQueueDepth(3);
+    }
+    config
+}
+
+struct Capture { stream: Retained<SCStream>, _sink: Retained<FrameSink>, display: u32, size: (usize, usize), latest: Arc<Mutex<Latest>> }
 
 pub struct Mac {
     _awake: AwakeDisplay,
@@ -141,6 +178,10 @@ pub struct Mac {
     last_cursor: Option<(i32, i32)>,
     /// ScreenCaptureKit refused (TCC): its answer beats CGPreflightScreenCaptureAccess, which can disagree.
     denied: bool,
+    slot: Arc<GpuSlot>,
+    wake: Wake,
+    /// The `seq` of the frame last handed to `serve`.
+    taken: u64,
 }
 
 fn shareable() -> Result<Retained<SCShareableContent>> {
@@ -179,7 +220,7 @@ impl Mac {
         if displays.is_empty() { return Err("no display".into()); }
         let source = CGEventSource::new(objc2_core_graphics::CGEventSourceStateID::HIDSystemState);
         let mut m = Mac { _awake: awake, displays, capture: None, source, flags: CGEventFlags::empty(), buttons: [false; 3],
-            wheel: (0, 0), last_cursor: None, denied: false };
+            wheel: (0, 0), last_cursor: None, denied: false, slot: Arc::new(GpuSlot::default()), wake: Wake::default(), taken: 0 };
         // Try the main display now, so the hello's `needs` says what ScreenCaptureKit really thinks.
         let main = m.displays.iter().map(|(_, d)| d.clone()).find(|d| d.primary).unwrap();
         if let Err(e) = m.start_capture(&main) { crate::log!("capture probe: {e}"); }
@@ -194,19 +235,12 @@ impl Mac {
         let displays = unsafe { content.displays() };
         let sc: Retained<SCDisplay> = displays.iter().find(|x| unsafe { x.displayID() } == id).ok_or("display not shareable")?;
         let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &sc, &NSArray::new()) };
-        let config = unsafe { SCStreamConfiguration::new() };
-        unsafe {
-            config.setWidth(d.w as usize);
-            config.setHeight(d.h as usize);
-            config.setPixelFormat(u32::from_be_bytes(*b"BGRA"));
-            // The phone draws the cursor.
-            config.setShowsCursor(false);
-            config.setMinimumFrameInterval(CMTime { value: 1, timescale: 60, flags: CMTimeFlags::Valid, epoch: 0 });
-            config.setQueueDepth(3);
-        }
+        // The size the encoder last asked for, else the display's own until it asks.
+        let size = self.slot.want.lock().unwrap().unwrap_or((d.w as usize, d.h as usize));
+        let config = stream_config(size.0, size.1);
         let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None) };
         let latest = Arc::new(Mutex::new(Latest::default()));
-        let sink = FrameSink::new(latest.clone());
+        let sink = FrameSink::new(latest.clone(), self.wake.clone());
         unsafe {
             stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*sink), SCStreamOutputType::Screen, None)
                 .map_err(|e| e.localizedDescription().to_string())?;
@@ -222,7 +256,7 @@ impl Mac {
             return Err(e);
         }
         self.denied = false;
-        self.capture = Some(Capture { stream, _sink: sink, display: id, latest });
+        self.capture = Some(Capture { stream, _sink: sink, display: id, size, latest });
         Ok(())
     }
 
@@ -301,20 +335,40 @@ impl Backend for Mac {
 
     fn displays(&self) -> Vec<Display> { self.displays.iter().map(|(_, d)| d.clone()).collect() }
 
-    fn capture<'a>(&'a mut self, d: &Display, buf: &'a mut Vec<u8>) -> Result<Frame<'a>> {
+    /// Lends the newest frame to the encoder ([hw_encoder](Backend::hw_encoder)): no pixel is
+    /// copied, compared or converted on the CPU, and a frame counts as changed when ScreenCaptureKit
+    /// delivered a new one (it sends none while the screen stands still).
+    fn capture<'a>(&'a mut self, d: &Display, _buf: &'a mut Vec<u8>) -> Result<Frame<'a>> {
         self.start_capture(d)?;
-        let c = self.capture.as_ref().unwrap();
+        let want = *self.slot.want.lock().unwrap();
+        let c = self.capture.as_mut().unwrap();
+        if let Some(size) = want.filter(|s| *s != c.size) {
+            // The encoder's size changed (quality, the auto ladder): scaled by ScreenCaptureKit from now on.
+            unsafe { c.stream.updateConfiguration_completionHandler(&stream_config(size.0, size.1), None) };
+            c.size = size;
+        }
         // Wait briefly for the first frame; later calls take whatever is newest.
         for _ in 0..50 {
             if c.latest.lock().unwrap().seq > 0 { break; }
             std::thread::sleep(Duration::from_millis(10));
         }
         let l = c.latest.lock().unwrap();
-        if l.seq == 0 { return Err("no frame yet".into()); }
-        buf.clear();
-        buf.extend_from_slice(&l.bgra);
-        Ok(Frame { bgra: buf, w: l.w, h: l.h, stride: l.stride, changed: None })
+        let Some(buffer) = l.buffer.clone() else { return Err("no frame yet".into()) };
+        let changed = l.seq != self.taken;
+        self.taken = l.seq;
+        let (w, h) = buffer.size();
+        let shown_us = changed.then_some(l.shown_us);
+        *self.slot.frame.lock().unwrap() = Some(buffer);
+        Ok(Frame { bgra: &[], w, h, stride: 0, changed: Some(changed), shown_us })
     }
+
+    fn hw_encoder(&mut self) -> Option<Box<dyn VideoEncoder>> {
+        let mut e = VtEncoder::new();
+        e.gpu = Some(self.slot.clone());
+        Some(Box::new(e))
+    }
+
+    fn on_frame(&mut self, wake: Arc<dyn Fn() + Send + Sync>) { *self.wake.lock().unwrap() = Some(wake); }
 
     fn cursor(&mut self) -> Option<Cursor> {
         let p = self.location();
@@ -441,7 +495,8 @@ impl Backend for Mac {
 }
 
 /// H.264 through VideoToolbox: real time, no frame reordering, low-latency rate control, keyframes
-/// only when asked. Frames go in as NV12, scaled with the same filter as the other platforms.
+/// only when asked. The backend's frames go in as the NV12 IOSurfaces ScreenCaptureKit made; BGRA
+/// (the tests) is converted with the same filter as the other platforms.
 pub struct VtEncoder {
     session: Option<CFRetained<objc2_video_toolbox::VTCompressionSession>>,
     w: usize,
@@ -454,12 +509,19 @@ pub struct VtEncoder {
     /// Presentation times: the rate control paces by them, and drops frames that all claim 0.
     start: std::time::Instant,
     convert_us: u64,
+    /// The backend's frames, when it lends them ([Mac::hw_encoder]).
+    gpu: Option<Arc<GpuSlot>>,
+    /// Scales a frame of the old size while ScreenCaptureKit switches to a new one.
+    transfer: Option<CFRetained<objc2_video_toolbox::VTPixelTransferSession>>,
+    scaled: Option<PixelBuffer>,
+    /// What VideoToolbox reports: false when it fell back to its software encoder.
+    hardware: bool,
 }
 
 impl VtEncoder {
     pub fn new() -> VtEncoder {
         VtEncoder { session: None, w: 0, h: 0, bitrate: 4_000_000, fps: 30.0, key: true, out: Arc::new(Mutex::new(None)), yuv: Vec::new(), convert_us: 0,
-            start: std::time::Instant::now() }
+            start: std::time::Instant::now(), gpu: None, transfer: None, scaled: None, hardware: true }
     }
 
     fn set(&self, key: &CFString, value: &CFType) {
@@ -470,14 +532,24 @@ impl VtEncoder {
 
     fn make(&mut self, w: usize, h: usize) -> Result<()> {
         use objc2_video_toolbox::*;
-        let spec = unsafe {
-            CFDictionary::<CFString, CFBoolean>::from_slices(&[kVTVideoEncoderSpecification_EnableLowLatencyRateControl], &[CFBoolean::new(true)])
-        };
+        // Hardware required first, so the name says which one runs (this Mac answers "not supported"
+        // when asked afterwards); a software session only when no hardware encoder takes the size.
         let mut session: *mut VTCompressionSession = std::ptr::null_mut();
-        let status = unsafe {
-            VTCompressionSession::create(None, w as i32, h as i32, u32::from_be_bytes(*b"avc1"), Some(spec.as_opaque()), None, None,
-                None, std::ptr::null_mut(), NonNull::new(&mut session).unwrap())
-        };
+        let mut status = 0;
+        for require in [true, false] {
+            let spec = unsafe {
+                CFDictionary::<CFString, CFBoolean>::from_slices(
+                    &[kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder],
+                    &[CFBoolean::new(true), CFBoolean::new(require)])
+            };
+            session = std::ptr::null_mut();
+            status = unsafe {
+                VTCompressionSession::create(None, w as i32, h as i32, u32::from_be_bytes(*b"avc1"), Some(spec.as_opaque()), None, None,
+                    None, std::ptr::null_mut(), NonNull::new(&mut session).unwrap())
+            };
+            self.hardware = require;
+            if status == 0 && !session.is_null() { break; }
+        }
         if status != 0 || session.is_null() { return Err(format!("VTCompressionSessionCreate {status}")); }
         self.session = Some(unsafe { CFRetained::from_raw(NonNull::new(session).unwrap()) });
         unsafe {
@@ -488,44 +560,47 @@ impl VtEncoder {
             self.set(kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i32(self.bitrate as i32));
             self.set(kVTCompressionPropertyKey_ExpectedFrameRate, &CFNumber::new_f64(self.fps as f64));
         }
+        crate::log!("videotoolbox {w}x{h} hardware={}", self.hardware);
         self.w = w;
         self.h = h;
         self.key = true;
         Ok(())
     }
-}
 
-impl VideoEncoder for VtEncoder {
-    fn name(&self) -> &'static str { "videotoolbox" }
-
-    fn set_bitrate(&mut self, bps: u32) {
-        self.bitrate = bps;
-        unsafe { self.set(objc2_video_toolbox::kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i32(bps as i32)) };
-    }
-
-    fn set_fps(&mut self, fps: f32) {
-        self.fps = fps;
-        unsafe { self.set(objc2_video_toolbox::kVTCompressionPropertyKey_ExpectedFrameRate, &CFNumber::new_f64(fps as f64)) };
-    }
-
-    fn force_key(&mut self) { self.key = true; }
-
-    fn encode(&mut self, bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize) -> std::result::Result<(Vec<u8>, bool), String> {
-        use objc2_video_toolbox::*;
-        if self.session.is_none() || (w, h) != (self.w, self.h) { self.make(w, h)?; }
-        let t = std::time::Instant::now();
-        to_i420(bgra, sw, sh, stride, w, h, &mut self.yuv);
-        // I420 into an NV12 pixel buffer (what the hardware encoder takes).
+    fn new_buffer(w: usize, h: usize) -> std::result::Result<PixelBuffer, String> {
         let mut pb: *mut CVPixelBuffer = std::ptr::null_mut();
         let st = unsafe { CVPixelBufferCreate(None, w, h, u32::from_be_bytes(*b"420v"), None, NonNull::new(&mut pb).unwrap()) };
         if st != 0 || pb.is_null() { return Err(format!("CVPixelBufferCreate {st}")); }
-        let pb: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(NonNull::new(pb).unwrap()) };
+        Ok(PixelBuffer(unsafe { CFRetained::from_raw(NonNull::new(pb).unwrap()) }))
+    }
+
+    /// A frame of another size, scaled by VideoToolbox (on the GPU): only until ScreenCaptureKit
+    /// delivers the size the encoder asked for.
+    fn scale(&mut self, frame: &PixelBuffer, w: usize, h: usize) -> std::result::Result<PixelBuffer, String> {
+        use objc2_video_toolbox::VTPixelTransferSession;
+        if self.transfer.is_none() {
+            let mut t: *mut VTPixelTransferSession = std::ptr::null_mut();
+            let st = unsafe { VTPixelTransferSession::create(None, NonNull::new(&mut t).unwrap()) };
+            if st != 0 || t.is_null() { return Err(format!("VTPixelTransferSessionCreate {st}")); }
+            self.transfer = Some(unsafe { CFRetained::from_raw(NonNull::new(t).unwrap()) });
+        }
+        if self.scaled.as_ref().is_none_or(|b| b.size() != (w, h)) { self.scaled = Some(Self::new_buffer(w, h)?); }
+        let out = self.scaled.clone().unwrap();
+        let st = unsafe { self.transfer.as_ref().unwrap().transfer_image(&frame.0, &out.0) };
+        if st != 0 { return Err(format!("VTPixelTransferSessionTransferImage {st}")); }
+        Ok(out)
+    }
+
+    /// BGRA scaled and converted on the CPU into an NV12 buffer (what the hardware encoder takes).
+    fn from_bgra(&mut self, bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize) -> std::result::Result<PixelBuffer, String> {
+        to_i420(bgra, sw, sh, stride, w, h, &mut self.yuv);
+        let pb = Self::new_buffer(w, h)?;
         unsafe {
-            CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags::empty());
-            let y = CVPixelBufferGetBaseAddressOfPlane(&pb, 0) as *mut u8;
-            let ys = CVPixelBufferGetBytesPerRowOfPlane(&pb, 0);
-            let uv = CVPixelBufferGetBaseAddressOfPlane(&pb, 1) as *mut u8;
-            let uvs = CVPixelBufferGetBytesPerRowOfPlane(&pb, 1);
+            CVPixelBufferLockBaseAddress(&pb.0, CVPixelBufferLockFlags::empty());
+            let y = CVPixelBufferGetBaseAddressOfPlane(&pb.0, 0) as *mut u8;
+            let ys = CVPixelBufferGetBytesPerRowOfPlane(&pb.0, 0);
+            let uv = CVPixelBufferGetBaseAddressOfPlane(&pb.0, 1) as *mut u8;
+            let uvs = CVPixelBufferGetBytesPerRowOfPlane(&pb.0, 1);
             for r in 0..h { std::ptr::copy_nonoverlapping(self.yuv.as_ptr().add(r * w), y.add(r * ys), w); }
             let (u_plane, v_plane) = (w * h, w * h + w * h / 4);
             for r in 0..h / 2 {
@@ -535,9 +610,13 @@ impl VideoEncoder for VtEncoder {
                     *row.add(2 * c + 1) = self.yuv[v_plane + r * (w / 2) + c];
                 }
             }
-            CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::empty());
+            CVPixelBufferUnlockBaseAddress(&pb.0, CVPixelBufferLockFlags::empty());
         }
-        self.convert_us = t.elapsed().as_micros() as u64;
+        Ok(pb)
+    }
+
+    fn compress(&mut self, pb: &CVPixelBuffer) -> std::result::Result<(Vec<u8>, bool), String> {
+        use objc2_video_toolbox::*;
         let props = if self.key {
             Some(unsafe { CFDictionary::<CFString, CFBoolean>::from_slices(&[kVTEncodeFrameOptionKey_ForceKeyFrame], &[CFBoolean::new(true)]) })
         } else { None };
@@ -552,12 +631,43 @@ impl VideoEncoder for VtEncoder {
         let session = self.session.as_ref().unwrap();
         let pts = CMTime { value: self.start.elapsed().as_micros() as i64, timescale: 1_000_000, flags: CMTimeFlags::Valid, epoch: 0 };
         let st = unsafe {
-            session.encode_frame_with_output_handler(&pb, pts,
+            session.encode_frame_with_output_handler(pb, pts,
                 objc2_core_media::kCMTimeInvalid, props.as_ref().map(|p| p.as_opaque()), std::ptr::null_mut(), &*handler as *const _ as *mut _)
         };
         if st != 0 { return Err(format!("VTCompressionSessionEncodeFrame {st}")); }
         unsafe { session.complete_frames(objc2_core_media::kCMTimeInvalid) };
         self.out.lock().unwrap().take().ok_or_else(|| "no output".to_string())
+    }
+}
+
+impl VideoEncoder for VtEncoder {
+    fn name(&self) -> &'static str { if self.hardware { "videotoolbox" } else { "videotoolbox-sw" } }
+
+    fn set_bitrate(&mut self, bps: u32) {
+        self.bitrate = bps;
+        unsafe { self.set(objc2_video_toolbox::kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i32(bps as i32)) };
+    }
+
+    fn set_fps(&mut self, fps: f32) {
+        self.fps = fps;
+        unsafe { self.set(objc2_video_toolbox::kVTCompressionPropertyKey_ExpectedFrameRate, &CFNumber::new_f64(fps as f64)) };
+    }
+
+    fn force_key(&mut self) { self.key = true; }
+
+    fn encode(&mut self, bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize) -> std::result::Result<(Vec<u8>, bool), String> {
+        if self.session.is_none() || (w, h) != (self.w, self.h) { self.make(w, h)?; }
+        let t = std::time::Instant::now();
+        let pb = if bgra.is_empty() {
+            let slot = self.gpu.clone().ok_or("no frame")?;
+            let frame = slot.frame.lock().unwrap().clone().ok_or("no frame")?;
+            *slot.want.lock().unwrap() = Some((w, h));
+            if frame.size() == (w, h) { frame } else { self.scale(&frame, w, h)? }
+        } else {
+            self.from_bgra(bgra, sw, sh, stride, w, h)?
+        };
+        self.convert_us = t.elapsed().as_micros() as u64;
+        self.compress(&pb.0)
     }
 
     fn convert_us(&self) -> u64 { self.convert_us }
@@ -626,6 +736,23 @@ mod tests {
         let types: Vec<u8> = all.windows(5).filter(|w| w[..4] == [0, 0, 0, 1]).map(|w| w[4] & 0x1f).collect();
         assert!(types.contains(&7) && types.contains(&8) && types.contains(&5), "nal types {types:?}");
         std::fs::write(std::env::temp_dir().join("roamtty-vt.h264"), &all).unwrap();
+    }
+
+    /// The backend's own buffers go in as they are; one of another size (ScreenCaptureKit not yet
+    /// reconfigured) is scaled on the GPU, and the size asked for is left for the next capture.
+    #[test]
+    fn videotoolbox_takes_capture_buffers_as_they_are() {
+        let slot = Arc::new(GpuSlot::default());
+        let mut enc = VtEncoder::new();
+        enc.gpu = Some(slot.clone());
+        *slot.frame.lock().unwrap() = Some(VtEncoder::new_buffer(1280, 832).unwrap());
+        let (data, key) = enc.encode(&[], 0, 0, 0, 1280, 832).expect("same size");
+        assert!(key && data.starts_with(&[0, 0, 0, 1]));
+        assert!(enc.transfer.is_none(), "no scaling for a buffer of the encoder's size");
+        let (data, _) = enc.encode(&[], 0, 0, 0, 960, 624).expect("scaled");
+        assert!(data.starts_with(&[0, 0, 0, 1]));
+        assert_eq!(*slot.want.lock().unwrap(), Some((960, 624)));
+        assert!(enc.hardware, "VideoToolbox fell back to software");
     }
 
     #[test]
