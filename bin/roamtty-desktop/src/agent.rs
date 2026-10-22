@@ -313,14 +313,21 @@ mod plat {
         let mut sd = PSECURITY_DESCRIPTOR::default();
         unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), SDDL_REVISION_1, &mut sd, None) }
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd.0, bInheritHandle: false.into() };
-        let sa_ptr = &sa as *const SECURITY_ATTRIBUTES as usize;
+        // The descriptor lives for the whole process; the attributes are made afresh for each pipe
+        // (a pointer to ones on this function's stack dangled once it returned, and no pipe was made).
+        let sd_ptr = sd.0 as usize;
+        let mut failed = false;
         Ok(Box::new(std::iter::from_fn(move || loop {
+            let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd_ptr as *mut _, bInheritHandle: false.into() };
             let h = unsafe {
                 CreateNamedPipeW(PCWSTR(name.as_ptr()), PIPE_ACCESS_DUPLEX | FILE_FLAGS_AND_ATTRIBUTES(0), PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, Some(sa_ptr as *const SECURITY_ATTRIBUTES))
+                    PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, Some(&sa))
             };
-            if h.is_invalid() { std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+            if h.is_invalid() {
+                if !failed { crate::log!("agent pipe: {}", std::io::Error::last_os_error()); failed = true; }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
             // ERROR_PIPE_CONNECTED (a client was quicker) is a connection too.
             let _ = unsafe { ConnectNamedPipe(h, None) };
             let f = unsafe { std::fs::File::from_raw_handle(h.0 as RawHandle) };
