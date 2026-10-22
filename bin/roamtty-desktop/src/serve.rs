@@ -454,7 +454,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         in_flight.push_back((frame_no, now_us()));
     }
     out.flush();
-    if let Some(l) = &out.link { crate::log!("udp {:?} rtt={}ms", l.stats(), l.rtt_ms()); }
+    if let Some(l) = &out.link { crate::log!("udp {:?} rtt={}ms", l.stats(), l.rtt_ms()); l.close(); }
     let retired = session::RETIRED.load(Ordering::SeqCst).max(args.retired.load(Ordering::SeqCst));
     crate::log!("serve end frames={frame_no} bytes={sent_total} retired={retired} inputs={inputs}");
     if retired == 0 && !agent_claimed {

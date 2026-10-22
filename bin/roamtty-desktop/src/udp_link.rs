@@ -141,6 +141,8 @@ pub struct UdpLink {
     pub drop_ppm: AtomicU32,
     pub enabled: AtomicBool,
     stats: Mutex<LinkStats>,
+    /// Set when the session ends: both threads leave, the last Arc goes and the port is free again.
+    closed: AtomicBool,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -151,13 +153,19 @@ pub struct LinkStats {
 }
 
 impl UdpLink {
-    /// Binds the first free port of the mosh range; None when none is free.
+    /// Binds the first free port of the mosh range; None when none is free. IPv6 only where the host
+    /// has no IPv4 at all: a port whose IPv4 side is taken is skipped, because an IPv6 socket on it
+    /// binds fine while the IPv4 datagrams keep going to the other socket, and the link never comes up.
     pub fn bind(start_rate: f64) -> Option<Arc<UdpLink>> {
         let key: [u8; 16] = crate::session::random_bytes(16).try_into().ok()?;
         let offset = (std::process::id() as u16) % (PORTS.end - PORTS.start);
         let sock = (0..PORTS.end - PORTS.start)
             .map(|i| PORTS.start + (offset + i) % (PORTS.end - PORTS.start))
-            .find_map(|p| UdpSocket::bind(("0.0.0.0", p)).ok().or_else(|| UdpSocket::bind(("::", p)).ok()))?;
+            .find_map(|p| match UdpSocket::bind(("0.0.0.0", p)) {
+                Ok(s) => Some(s),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(_) => UdpSocket::bind(("::", p)).ok(),
+            })?;
         let port = sock.local_addr().ok()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok()?;
         let link = Arc::new(UdpLink {
@@ -166,8 +174,17 @@ impl UdpLink {
             sent: Mutex::new(HashMap::new()), reliable: Mutex::new(HashMap::new()), gcc: Mutex::new(Gcc::new(start_rate)),
             pace: Mutex::new(None), pace_rate: AtomicU64::new((start_rate * 1.5 / 8.0) as u64), rtt_us: AtomicU64::new(0),
             drop_ppm: AtomicU32::new(0), enabled: AtomicBool::new(true), stats: Mutex::new(LinkStats::default()),
+            closed: AtomicBool::new(false),
         });
         Some(link)
+    }
+
+    /// The session is over. The macOS and Windows agents serve every session from one long-lived
+    /// process: without this each one leaked its socket and two threads, and the next session to
+    /// land on the port never heard from the phone.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.pace.lock().unwrap().take();
     }
 
     pub fn alive(&self) -> bool {
@@ -297,6 +314,7 @@ impl UdpLink {
             let mut tokens = 0f64;
             let mut last = Instant::now();
             while let Ok(p) = prx.recv() {
+                if me.closed.load(Ordering::Relaxed) { break; }
                 loop {
                     let rate = me.pace_rate.load(Ordering::Relaxed) as f64;
                     tokens = (tokens + last.elapsed().as_secs_f64() * rate).min(8.0 * 1250.0);
@@ -317,7 +335,7 @@ impl UdpLink {
         let mut replay = ReplayWindow::default();
         let mut reasm = Reassembler::default();
         let mut order = InOrder::default();
-        loop {
+        while !self.closed.load(Ordering::Relaxed) {
             let Ok((n, from)) = self.sock.recv_from(&mut buf) else {
                 reasm.expire(now_us(), 2_000_000);
                 continue;
@@ -382,6 +400,26 @@ impl UdpLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One process serving session after session (the macOS and Windows agents): a closed link frees
+    /// its port, and while a link is open the next one takes another port instead of an IPv6 twin.
+    #[test]
+    fn sessions_in_one_process_reuse_ports_cleanly() {
+        let (tx, _rx) = mpsc::channel();
+        let a = UdpLink::bind(1_000_000.0).unwrap();
+        a.start(tx.clone());
+        let b = UdpLink::bind(1_000_000.0).unwrap();
+        assert_ne!(a.port, b.port);
+        assert!(b.sock.local_addr().unwrap().is_ipv4(), "{:?}", b.sock.local_addr());
+        let port = a.port;
+        a.close();
+        drop(a);
+        drop(b);
+        std::thread::sleep(Duration::from_millis(400));
+        let c = UdpLink::bind(1_000_000.0).unwrap();
+        assert_eq!(c.port, port, "the closed link let its port go");
+        assert!(c.sock.local_addr().unwrap().is_ipv4());
+    }
 
     fn report(msg: u32, last: u64, received: u16, total: u16) -> Report {
         Report { msg, received, total, first_us: last - 1000, last_us: last, outcome: 1 }
