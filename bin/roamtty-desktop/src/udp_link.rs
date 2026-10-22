@@ -47,7 +47,15 @@ pub const ALIVE_US: u64 = 3_000_000;
 
 fn now_us() -> u64 { crate::serve::now_us() }
 
-struct Sent { frame_bytes: usize, last_us: u64 }
+/// `data`: the message's data shards. The phone stamps `last_us` when they are all in (it is whole
+/// then), so they, not the parity that keeps arriving, span first_us..last_us.
+struct Sent { frame_bytes: usize, last_us: u64, data: usize }
+
+/// Datagrams the pacer lets out back to back. Most frames of a desktop (a cursor's worth of change,
+/// typing) fit, so they leave at once instead of trickling out at the target bitrate; and their
+/// spread on arrival is the bottleneck's rate ([Gcc::capacity]).
+const BURST: usize = 16;
+const DATAGRAM: usize = udp::SHARD + 40;
 
 struct Gcc {
     target: f64,
@@ -56,6 +64,8 @@ struct Gcc {
     smooth: f64,
     samples: VecDeque<(f64, f64)>,
     window: VecDeque<(u64, usize, u16, u16)>, // (time, bytes, received, total)
+    /// Arrival rates of bursts (bits/s), with when they were measured.
+    trains: VecDeque<(u64, f64)>,
     last_increase: Instant,
     pub loss: f64,
     pub fec: f32,
@@ -64,7 +74,7 @@ struct Gcc {
 
 impl Gcc {
     fn new(start: f64) -> Gcc {
-        Gcc { target: start, last_send: None, acc: 0.0, smooth: 0.0, samples: VecDeque::new(), window: VecDeque::new(),
+        Gcc { target: start, last_send: None, acc: 0.0, smooth: 0.0, samples: VecDeque::new(), window: VecDeque::new(), trains: VecDeque::new(),
             last_increase: Instant::now(), loss: 0.0, fec: 0.1, overuse: false }
     }
 
@@ -77,6 +87,13 @@ impl Gcc {
         // Parity follows loss: twice the measured loss plus a margin, 5–30%.
         self.fec = ((self.loss * 2.0 + 0.05) as f32).clamp(0.05, 0.30);
         if r.outcome == 0 { return; }
+        // A burst's datagrams left together: how far apart they arrived is how fast the narrowest
+        // link drains them. Bigger messages were paced, which would only measure the pacer.
+        let n = sent.data;
+        if n >= 4 && r.outcome == 1 && (r.total as usize) <= BURST && r.last_us > r.first_us {
+            self.trains.push_back((now, ((n - 1) * DATAGRAM * 8) as f64 * 1e6 / (r.last_us - r.first_us) as f64));
+        }
+        while self.trains.front().is_some_and(|t| now - t.0 > 3_000_000) { self.trains.pop_front(); }
         if let Some((ps, pa)) = self.last_send {
             // Delay variation between consecutive messages: grows while a queue builds.
             let d = (r.last_us as f64 - pa as f64) - (sent.last_us as f64 - ps as f64);
@@ -92,7 +109,11 @@ impl Gcc {
         self.overuse = modified > 12.0;
         let received = self.window.iter().map(|w| w.1).sum::<usize>() as f64 * 8.0;
         if self.overuse {
-            self.target = (received * 0.85).max(200_000.0).min(self.target);
+            // A desktop seldom fills the link: what it sent in the last second (often a few hundred
+            // kbps of typing) says nothing of what fits, and backing off to it starved the encoder,
+            // which then dropped frames. Below half the target, step down from the target instead.
+            let base = if received >= self.target * 0.5 { received } else { self.target };
+            self.target = (base * 0.85).max(200_000.0).min(self.target);
             self.samples.clear();
             self.acc = 0.0;
             self.smooth = 0.0;
@@ -107,6 +128,25 @@ impl Gcc {
             }
         }
         self.last_increase = Instant::now();
+    }
+}
+
+impl Gcc {
+    /// The bottleneck's rate (bits/s): the 75th percentile of the last 3 s of bursts, once there are
+    /// three. Not the maximum: a queue that releases datagrams together reads faster than the link.
+    fn capacity(&self) -> Option<f64> {
+        if self.trains.len() < 3 { return None; }
+        let mut r: Vec<f64> = self.trains.iter().map(|t| t.1).collect();
+        r.sort_by(f64::total_cmp);
+        Some(r[r.len() * 3 / 4])
+    }
+
+    /// The pacer's rate in bytes/s. Paced at the target bitrate, a frame twice the average size took
+    /// two frame intervals to leave (40 ms of a 63 ms "network" on a phone); it only has to keep a
+    /// big frame (a keyframe, a scrolled page) from overflowing the narrowest link's queue.
+    fn pace_rate(&self) -> u64 {
+        let bits = self.capacity().map_or(0.0, |c| c * 0.9).max(self.target * 2.5);
+        (bits / 8.0).max(200_000.0) as u64
     }
 }
 
@@ -176,7 +216,7 @@ impl UdpLink {
             port, key, crypto: Crypto::new(&key), sock, peer: Mutex::new(None), last_rx: AtomicU64::new(0),
             seq: AtomicU64::new(1), msg: AtomicU32::new(1), history: Mutex::new(VecDeque::new()),
             sent: Mutex::new(HashMap::new()), reliable: Mutex::new(HashMap::new()), gcc: Mutex::new(Gcc::new(start_rate)),
-            pace: Mutex::new(None), pace_rate: AtomicU64::new((start_rate * 1.5 / 8.0) as u64), rtt_us: AtomicU64::new(0),
+            pace: Mutex::new(None), pace_rate: AtomicU64::new((start_rate * 2.5 / 8.0) as u64), rtt_us: AtomicU64::new(0),
             drop_ppm: AtomicU32::new(0), enabled: AtomicBool::new(true), stats: Mutex::new(LinkStats::default()),
             closed: AtomicBool::new(false), probe_t: AtomicU64::new(0),
         });
@@ -219,7 +259,7 @@ impl UdpLink {
     pub fn clamp_target(&self, cap: f64) {
         let mut g = self.gcc.lock().unwrap();
         g.target = g.target.clamp(200_000.0, cap);
-        self.pace_rate.store((g.target * 1.5 / 8.0).max(200_000.0) as u64, Ordering::Relaxed);
+        self.pace_rate.store(g.pace_rate(), Ordering::Relaxed);
     }
 
     fn dropped(&self) -> bool {
@@ -281,10 +321,11 @@ impl UdpLink {
         for f in &frags { self.raw_send(&Packet::Frag(f.clone()).encode(), video); }
         if video {
             let mut s = self.sent.lock().unwrap();
-            // The pacer spreads the shards out; the last one leaves about bytes / rate later.
+            // The pacer spreads out what does not fit its burst; the last shard leaves about that / rate later.
             let rate = self.pace_rate.load(Ordering::Relaxed).max(1);
-            let spread = (frags.len() * (udp::SHARD + 40)) as u64 * 1_000_000 / rate;
-            s.insert(msg, Sent { frame_bytes: bytes.len(), last_us: start + spread });
+            let spread = (frags.len().saturating_sub(BURST) * DATAGRAM) as u64 * 1_000_000 / rate;
+            let data = frags.iter().filter(|f| f.index < f.k).count();
+            s.insert(msg, Sent { frame_bytes: bytes.len(), last_us: start + spread, data });
             if s.len() > 600 { let min = *s.keys().min().unwrap(); s.remove(&min); }
         }
         if flags & FLAG_RELIABLE != 0 { self.reliable.lock().unwrap().insert(msg, (frags, Instant::now(), 0)); }
@@ -319,14 +360,15 @@ impl UdpLink {
         *self.pace.lock().unwrap() = Some(ptx);
         let me = self.clone();
         std::thread::spawn(move || {
-            // Token bucket at 1.5× the target bitrate, bursts of up to 8 datagrams.
-            let mut tokens = 0f64;
+            // Token bucket at [Gcc::pace_rate], bursts of up to BURST datagrams.
+            let burst = (BURST * DATAGRAM) as f64;
+            let mut tokens = burst;
             let mut last = Instant::now();
             while let Ok(p) = prx.recv() {
                 if me.closed.load(Ordering::Relaxed) { break; }
                 loop {
                     let rate = me.pace_rate.load(Ordering::Relaxed) as f64;
-                    tokens = (tokens + last.elapsed().as_secs_f64() * rate).min(8.0 * 1250.0);
+                    tokens = (tokens + last.elapsed().as_secs_f64() * rate).min(burst);
                     last = Instant::now();
                     if tokens >= p.len() as f64 { tokens -= p.len() as f64; break; }
                     let need = (p.len() as f64 - tokens) / rate.max(1.0);
@@ -401,7 +443,7 @@ impl UdpLink {
                         if let Some(s) = sent { self.gcc.lock().unwrap().on_report(&r, &s, now); }
                     }
                     let g = self.gcc.lock().unwrap();
-                    self.pace_rate.store((g.target * 1.5 / 8.0).max(200_000.0) as u64, Ordering::Relaxed);
+                    self.pace_rate.store(g.pace_rate(), Ordering::Relaxed);
                 }
             }
         }
@@ -440,7 +482,7 @@ mod tests {
     fn steady_arrivals_raise_the_rate() {
         let mut g = Gcc::new(2_000_000.0);
         for i in 0..40u64 {
-            let s = Sent { frame_bytes: 10_000, last_us: i * 16_000 + 1000 };
+            let s = Sent { frame_bytes: 10_000, last_us: i * 16_000 + 1000, data: 9 };
             g.on_report(&report(i as u32, 50_000 + i * 16_000 + 1000, 10, 11), &s, i * 16_000);
             g.last_increase -= Duration::from_millis(16);
         }
@@ -452,11 +494,42 @@ mod tests {
     fn growing_delay_is_overuse() {
         let mut g = Gcc::new(8_000_000.0);
         for i in 0..40u64 {
-            let s = Sent { frame_bytes: 10_000, last_us: i * 16_000 + 1000 };
+            let s = Sent { frame_bytes: 10_000, last_us: i * 16_000 + 1000, data: 9 };
             // Each arrival 6 ms later than the last send gap: a queue fills.
             g.on_report(&report(i as u32, 50_000 + i * 22_000, 10, 11), &s, i * 16_000);
         }
         assert!(g.target < 8_000_000.0, "target {}", g.target);
+    }
+
+    /// Bursts that arrive 1 ms per datagram (about 10 Mbps) set the pace, well above 2.5× a low target.
+    #[test]
+    fn bursts_measure_the_link_and_set_the_pace() {
+        let mut g = Gcc::new(600_000.0);
+        assert_eq!(g.capacity(), None);
+        assert_eq!(g.pace_rate(), 200_000, "2.5 × 600 kbps is under the floor");
+        for i in 0..5u64 {
+            let s = Sent { frame_bytes: 10 * 1150, last_us: i * 50_000, data: 10 };
+            let r = Report { msg: i as u32, received: 10, total: 10, first_us: 100_000 + i * 50_000, last_us: 109_000 + i * 50_000, outcome: 1 };
+            g.on_report(&r, &s, i * 50_000);
+        }
+        let c = g.capacity().unwrap();
+        assert!((c - 9.0 * 1190.0 * 8.0 / 0.009).abs() < 1.0, "{c}");
+        assert_eq!(g.pace_rate(), (c * 0.9 / 8.0) as u64);
+        // A paced message (more than a burst) is not a sample.
+        let r = Report { msg: 9, received: 40, total: 40, first_us: 0, last_us: 1_000_000, outcome: 1 };
+        g.on_report(&r, &Sent { frame_bytes: 40 * 1150, last_us: 0, data: 36 }, 300_000);
+        assert_eq!(g.trains.len(), 5);
+    }
+
+    /// Typing sends a few hundred kbps: a queue then takes the target down a step, not to that.
+    #[test]
+    fn a_quiet_screen_keeps_its_target_through_overuse() {
+        let mut g = Gcc::new(8_000_000.0);
+        for i in 0..40u64 {
+            let s = Sent { frame_bytes: 1_000, last_us: i * 16_000 + 1000, data: 1 };
+            g.on_report(&report(i as u32, 50_000 + i * 22_000, 2, 2), &s, i * 16_000);
+        }
+        assert!(g.target < 8_000_000.0 && g.target > 2_000_000.0, "target {}", g.target);
     }
 
     #[test]
@@ -474,7 +547,7 @@ mod tests {
     #[test]
     fn parity_follows_loss() {
         let mut g = Gcc::new(4_000_000.0);
-        let s = Sent { frame_bytes: 1000, last_us: 1 };
+        let s = Sent { frame_bytes: 1000, last_us: 1, data: 1 };
         g.on_report(&report(1, 1000, 90, 100), &s, 0);
         assert!((g.fec - 0.25).abs() < 0.01, "fec {}", g.fec);
         g.on_report(&report(2, 2000, 1000, 1000), &s, 1);

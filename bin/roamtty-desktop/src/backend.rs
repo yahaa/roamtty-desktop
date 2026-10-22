@@ -13,6 +13,9 @@ pub struct Frame<'a> {
     /// Whether the picture changed since the last frame, when the backend knows (DXGI does); None
     /// has `serve` compare the pixels. A frame that stays on the GPU has no `bgra` at all.
     pub changed: Option<bool>,
+    /// When this picture was on the screen (`serve::now_us`), when the backend knows it was earlier
+    /// than the capture call: a frame ScreenCaptureKit delivered waits for `serve` to take it.
+    pub shown_us: Option<u64>,
 }
 
 pub struct Cursor {
@@ -32,6 +35,9 @@ pub trait Backend {
     /// hardware encoders on Windows); None leaves it to the platform's usual one. Once it returned
     /// one, [capture](Backend::capture) hands that encoder its frames and `bgra` stays empty.
     fn hw_encoder(&mut self) -> Option<Box<dyn crate::encode::VideoEncoder>> { None }
+    /// Called once: `wake` is for a backend whose frames arrive by themselves (ScreenCaptureKit), so
+    /// `serve` encodes each as it comes instead of at its next tick, up to a frame interval later.
+    fn on_frame(&mut self, _wake: std::sync::Arc<dyn Fn() + Send + Sync>) {}
     /// None when the backend draws the cursor into the frames instead.
     fn cursor(&mut self) -> Option<Cursor>;
     fn move_abs(&mut self, x: i32, y: i32) -> Result<()>;

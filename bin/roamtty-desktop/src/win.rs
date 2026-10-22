@@ -264,10 +264,10 @@ impl Backend for Win {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 if let Some(g) = &self.gpu {
                     if g.texture.borrow().is_none() { return Err("no frame yet".into()); }
-                    return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(false) });
+                    return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(false), shown_us: None });
                 }
                 if buf.is_empty() { return Err("no frame yet".into()); }
-                return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None });
+                return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None, shown_us: None });
             }
             // Access lost (secure desktop, mode change): start over next time.
             Err(e) => { self.dups.remove(i); return Err(err(e)); }
@@ -279,7 +279,7 @@ impl Backend for Win {
             let r = if changed { g.store(&tex, w, h) } else { Ok(()) };
             unsafe { let _ = self.dups[i].dup.ReleaseFrame(); }
             r?;
-            return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(changed) });
+            return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(changed), shown_us: None });
         }
         if self.dups[i].staging.is_none() {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -305,7 +305,7 @@ impl Backend for Win {
             }
             self.context.Unmap(&staging, 0);
         }
-        Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None })
+        Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None, shown_us: None })
     }
 
     fn cursor(&mut self) -> Option<Cursor> {
