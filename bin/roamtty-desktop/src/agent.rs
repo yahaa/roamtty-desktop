@@ -412,8 +412,10 @@ mod plat {
         }
         // An inbound rule for the UDP link, so Windows Firewall does not stop the desktop with a prompt
         // the first time serve listens. Needs an elevated (administrator) login; skipped otherwise.
+        // Inbound rules for this exe go first, the Block ones Windows makes when its prompt was
+        // dismissed among them: a block rule beats any allow rule.
         let prog = format!("program={}", exe.display());
-        let _ = netsh(&["delete", "rule", "name=Roamtty Desktop"]);
+        let _ = netsh(&["delete", "rule", "name=all", "dir=in", &prog]);
         if !netsh(&["add", "rule", "name=Roamtty Desktop", "dir=in", "action=allow", "protocol=UDP", "profile=any", &prog]) {
             println!("firewall rule not added (not an administrator): Windows may ask once");
         }

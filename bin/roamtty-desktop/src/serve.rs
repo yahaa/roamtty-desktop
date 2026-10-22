@@ -231,6 +231,8 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     let mut inputs = 0u64;
     let mut was_udp = false;
     let mut last_needs: Vec<String> = Vec::new();
+    let mut last_capture_err = String::new();
+    let mut locked = false;
 
     while !ended {
         let flag = session::RETIRED.load(Ordering::SeqCst).max(args.retired.load(Ordering::SeqCst));
@@ -405,7 +407,14 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         let frame = match x.capture(&d, &mut scratch) {
             Ok(f) => f,
             Err(e) => {
-                crate::log!("capture failed: {e}");
+                // Once per kind of failure: a locked screen fails every tick for as long as it lasts.
+                if e != last_capture_err { crate::log!("capture failed: {e}"); last_capture_err = e; }
+                // The lock screen's secure desktop: nothing to show or type into, so the app says so.
+                if !locked && x.locked() {
+                    locked = true;
+                    out.emit(ty::STATE, serde_json::json!({ "locked": true }).to_string().as_bytes());
+                    out.flush();
+                }
                 // A permission taken away (or never given) mid-session: tell the app what to ask for.
                 let needs = x.needs();
                 if !needs.is_empty() && needs != last_needs {
@@ -417,6 +426,12 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                 continue;
             }
         };
+        last_capture_err.clear();
+        if locked {
+            locked = false;
+            want_key = true;
+            out.emit(ty::STATE, serde_json::json!({ "locked": false }).to_string().as_bytes());
+        }
         let changed = frame.bgra != last_sent.as_slice();
         let refine = !changed && !refined && last_change.elapsed() >= Duration::from_millis(300);
         if !changed && !key_due && !refine {

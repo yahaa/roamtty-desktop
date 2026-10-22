@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, H
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Shutdown::LockWorkStation;
+use windows::Win32::System::StationsAndDesktops::{CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -274,4 +275,17 @@ impl Backend for Win {
     }
 
     fn lock_screen(&mut self) { unsafe { let _ = LockWorkStation(); } }
+
+    /// Input goes to another desktop than ours (Winlogon: the lock screen's password, UAC): that
+    /// desktop refuses us outright, or answers with another name than "Default".
+    fn locked(&mut self) -> bool {
+        unsafe {
+            let Ok(desk) = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x0001)) else { return true };
+            let mut name = [0u16; 64];
+            let mut len = 0u32;
+            let ok = GetUserObjectInformationW(HANDLE(desk.0), UOI_NAME, Some(name.as_mut_ptr() as *mut _), (name.len() * 2) as u32, Some(&mut len)).is_ok();
+            let _ = CloseDesktop(desk);
+            !ok || String::from_utf16_lossy(&name[..(len as usize / 2).saturating_sub(1)]) != "Default"
+        }
+    }
 }
