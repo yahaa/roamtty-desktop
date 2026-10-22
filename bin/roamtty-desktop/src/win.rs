@@ -220,7 +220,9 @@ impl Backend for Win {
         let (w, h) = (self.dups[i].w, self.dups[i].h);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        match unsafe { self.dups[i].dup.AcquireNextFrame(50, &mut info, &mut resource) } {
+        // No waiting: serve polls once per frame interval and handles input in between. A 50 ms wait
+        // here held back keys typed into a still screen by up to 50 ms.
+        match unsafe { self.dups[i].dup.AcquireNextFrame(0, &mut info, &mut resource) } {
             Ok(()) => {}
             // Nothing changed: the last frame stands.
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
