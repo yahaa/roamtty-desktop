@@ -143,6 +143,10 @@ pub struct UdpLink {
     stats: Mutex<LinkStats>,
     /// Set when the session ends: both threads leave, the last Arc goes and the port is free again.
     closed: AtomicBool,
+    /// The time in this end's last RTT probe (a heartbeat with no echo). Only its echo is a round
+    /// trip: the phone echoes other heartbeats in its own next one, up to 250 ms later, which read as
+    /// a 265 ms round trip on a 15 ms link and slowed every resend to match.
+    probe_t: AtomicU64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -174,7 +178,7 @@ impl UdpLink {
             sent: Mutex::new(HashMap::new()), reliable: Mutex::new(HashMap::new()), gcc: Mutex::new(Gcc::new(start_rate)),
             pace: Mutex::new(None), pace_rate: AtomicU64::new((start_rate * 1.5 / 8.0) as u64), rtt_us: AtomicU64::new(0),
             drop_ppm: AtomicU32::new(0), enabled: AtomicBool::new(true), stats: Mutex::new(LinkStats::default()),
-            closed: AtomicBool::new(false),
+            closed: AtomicBool::new(false), probe_t: AtomicU64::new(0),
         });
         Some(link)
     }
@@ -288,6 +292,11 @@ impl UdpLink {
 
     /// Resends reliable frames nobody acknowledged: every max(2×RTT, 80 ms), five times at most.
     pub fn tick(&self) {
+        let t = now_us();
+        if self.peer.lock().unwrap().is_some() && t.saturating_sub(self.probe_t.load(Ordering::Relaxed)) > 500_000 {
+            self.probe_t.store(t, Ordering::Relaxed);
+            self.raw_send(&Packet::Heartbeat { t, echo: 0 }.encode(), false);
+        }
         let wait = Duration::from_micros((self.rtt_us.load(Ordering::Relaxed) * 2).max(80_000));
         let mut again = Vec::new();
         {
@@ -356,7 +365,9 @@ impl UdpLink {
             let Some(packet) = Packet::decode(&plain) else { continue };
             match packet {
                 Packet::Heartbeat { t, echo } => {
-                    if echo != 0 { self.rtt_us.store(now_us().saturating_sub(echo), Ordering::Relaxed); }
+                    if echo != 0 && echo == self.probe_t.load(Ordering::Relaxed) {
+                        self.rtt_us.store(now_us().saturating_sub(echo), Ordering::Relaxed);
+                    }
                     self.raw_send(&Packet::Heartbeat { t: now_us(), echo: t }.encode(), false);
                 }
                 Packet::Frag(f) => {
