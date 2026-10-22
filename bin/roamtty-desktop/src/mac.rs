@@ -422,13 +422,19 @@ impl Backend for Mac {
         unsafe { NSPasteboard::generalPasteboard().stringForType(NSPasteboardTypeString).map(|s| s.to_string()) }
     }
 
+    /// Through Mission Control itself (argument 1 = show the desktop, none = all windows): a posted
+    /// F11 or Control+Up never reached the Dock's hot keys, which also differ per user and keyboard.
     fn action(&mut self, action: u8) -> Result<()> {
-        // Show desktop: F11; all windows (Mission Control): Control + Up.
-        match action {
-            proto::action::SHOW_DESKTOP => self.tap(&[0x44]),
-            proto::action::ALL_WINDOWS => self.tap(&[0xE0, 0x52]),
-            _ => Ok(()),
-        }
+        const MC: &str = "/System/Applications/Mission Control.app/Contents/MacOS/Mission Control";
+        let args: &[&str] = match action {
+            proto::action::SHOW_DESKTOP => &["1"],
+            proto::action::ALL_WINDOWS => &[],
+            _ => return Ok(()),
+        };
+        // It returns at once; reap it on a thread so no zombie is left behind.
+        let mut child = std::process::Command::new(MC).args(args).spawn().map_err(|e| e.to_string())?;
+        std::thread::spawn(move || { let _ = child.wait(); });
+        Ok(())
     }
 }
 

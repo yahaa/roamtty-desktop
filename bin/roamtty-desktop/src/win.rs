@@ -6,14 +6,17 @@
 use crate::backend::{Backend, Cursor, Frame, Result};
 use proto::Display;
 use windows::core::Interface;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, HGLOBAL, HANDLE};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, HGLOBAL, HANDLE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_OUTDUPL_FRAME_INFO, DXGI_ERROR_WAIT_TIMEOUT};
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, MONITORINFO};
+use windows::Win32::Graphics::Gdi::{
+    DeleteObject, EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HMONITOR, MONITORINFOEXW, MONITORINFO,
+};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Shutdown::LockWorkStation;
@@ -25,7 +28,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, GetIconInfo, CURSORINFO, HCURSOR, HICON, ICONINFO, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
 use windows::core::BOOL;
 
 fn err(e: impl std::fmt::Display) -> String { e.to_string() }
@@ -39,7 +42,8 @@ pub struct Win {
     context: ID3D11DeviceContext,
     displays: Vec<(Display, HMONITOR)>,
     dups: Vec<Dup>,
-    last_cursor: Option<(i32, i32)>,
+    /// The cursor handle whose image went out last: a new handle is a new shape.
+    last_cursor: Option<isize>,
 }
 
 /// USB HID usage to a set-1 scan code, with the E0 (extended) flag where the key has one.
@@ -67,6 +71,67 @@ fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
 
 fn keyboard(scan: u16, vk: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } } }
+}
+
+/// A cursor's image as straight RGBA plus its hot spot, from its colour bitmap (with alpha, or the
+/// mask's transparency when it has none) or, for a monochrome cursor, the AND/XOR mask pair.
+fn cursor_image(cursor: HCURSOR) -> Option<(u64, u16, u16, u16, u16, Vec<u8>)> {
+    let mut ii = ICONINFO::default();
+    unsafe { GetIconInfo(HICON(cursor.0), &mut ii) }.ok()?;
+    let bits = |bm: HBITMAP| -> Option<(usize, usize, Vec<u8>)> {
+        if bm.is_invalid() { return None; }
+        let mut b = BITMAP::default();
+        if unsafe { GetObjectW(bm.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut b as *mut _ as *mut _)) } == 0 { return None; }
+        let (w, h) = (b.bmWidth as usize, b.bmHeight as usize);
+        let mut bi = BITMAPINFO::default();
+        bi.bmiHeader = BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w as i32, biHeight: -(h as i32),
+            biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() };
+        let mut out = vec![0u8; w * h * 4];
+        let dc = unsafe { GetDC(None) };
+        let n = unsafe { GetDIBits(dc, bm, 0, h as u32, Some(out.as_mut_ptr() as *mut _), &mut bi, DIB_RGB_COLORS) };
+        unsafe { ReleaseDC(None, dc) };
+        (n > 0).then_some((w, h, out))
+    };
+    let color = bits(ii.hbmColor);
+    let mask = bits(ii.hbmMask);
+    unsafe {
+        if !ii.hbmColor.is_invalid() { let _ = DeleteObject(ii.hbmColor.into()); }
+        if !ii.hbmMask.is_invalid() { let _ = DeleteObject(ii.hbmMask.into()); }
+    }
+    let (w, h, rgba) = match (color, mask) {
+        (Some((w, h, bgra)), mask) => {
+            let has_alpha = bgra.chunks(4).any(|p| p[3] != 0);
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for (i, p) in bgra.chunks(4).enumerate() {
+                // No alpha channel: the AND mask says what is transparent (white in the mask).
+                let a = if has_alpha { p[3] } else { mask.as_ref().map_or(255, |m| if m.2[i * 4] == 0 { 255 } else { 0 }) };
+                rgba.extend([p[2], p[1], p[0], a]);
+            }
+            (w, h, rgba)
+        }
+        // Monochrome: the mask is twice as tall, AND above XOR.
+        (None, Some((w, h2, m))) => {
+            let h = h2 / 2;
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for i in 0..w * h {
+                let and = m[i * 4] != 0;
+                let xor = m[(w * h + i) * 4] != 0;
+                rgba.extend(match (and, xor) {
+                    (false, false) => [0, 0, 0, 255],
+                    (false, true) => [255, 255, 255, 255],
+                    (true, false) => [0, 0, 0, 0],
+                    // Inverts the screen under it (the I-beam): black reads on the usual light background.
+                    (true, true) => [0, 0, 0, 255],
+                });
+            }
+            (w, h, rgba)
+        }
+        _ => return None,
+    };
+    if w == 0 || h == 0 || w > 256 || h > 256 { return None; }
+    let (hx, hy) = (ii.xHotspot as u16, ii.yHotspot as u16);
+    let hash = crate::backend::fnv(&rgba) ^ ((w as u64) << 48 | (h as u64) << 32 | (hx as u64) << 16 | hy as u64);
+    Some((hash, w as u16, h as u16, hx, hy, rgba))
 }
 
 unsafe extern "system" fn monitor(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
@@ -169,11 +234,12 @@ impl Backend for Win {
     }
 
     fn cursor(&mut self) -> Option<Cursor> {
-        let mut p = POINT::default();
-        unsafe { GetCursorPos(&mut p) }.ok()?;
-        let first = self.last_cursor.is_none();
-        self.last_cursor = Some((p.x, p.y));
-        Some(Cursor { x: p.x, y: p.y, shape: first.then(|| (0xA770_u64, 0, 0, 0, 0, Vec::new())), serial: 0 })
+        let mut info = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+        unsafe { GetCursorInfo(&mut info) }.ok()?;
+        let handle = info.hCursor.0 as isize;
+        let shape = (self.last_cursor != Some(handle)).then(|| cursor_image(info.hCursor)).flatten();
+        if shape.is_some() || self.last_cursor.is_none() { self.last_cursor = Some(handle); }
+        Some(Cursor { x: info.ptScreenPos.x, y: info.ptScreenPos.y, shape, serial: 0 })
     }
 
     fn move_abs(&mut self, x: i32, y: i32) -> Result<()> {

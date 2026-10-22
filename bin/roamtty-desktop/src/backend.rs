@@ -61,7 +61,7 @@ pub trait Backend {
     fn needs(&self) -> Vec<String> { Vec::new() }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub fn fnv(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for x in b {
