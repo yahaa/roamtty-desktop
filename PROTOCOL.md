@@ -45,8 +45,11 @@ Low-rate control messages carry UTF-8 JSON; high-rate ones fixed binary. Unknown
 
 `timing` comes about once a second while frames go out: the host's share of a frame's latency,
 averaged in µs: `{"frames": n, "capture_us", "convert_us", "encode_us", "encoder"}`. `capture_us` is
-grabbing the pixels and finding out whether they changed, `convert_us` scaling them and converting
-them to YUV (0 when the encoder does that on the GPU), `encode_us` the rest of the encoder's time.
+grabbing the pixels and finding out whether they changed, counted from when the picture was on the
+screen where the host knows that (macOS: the frame's presentation time, so the wait for `serve` to
+take it is in it); `convert_us` scaling them and converting them to YUV (0 when the encoder does
+that on the GPU), `encode_us` the rest of the encoder's time. VIDEO's `capture_us` is that same
+start, so the client's end-to-end figure runs from the screen.
 
 | INPUT kind | fields |
 |---|---|

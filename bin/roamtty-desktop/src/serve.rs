@@ -268,8 +268,10 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     let mut last_capture_err = String::new();
     let mut locked = false;
     let mut timing = Timing::default();
-    // When the last frame went out, and the gap the frame rate asks for: a frame that wakes us
-    // sooner than that waits for the tick.
+    // When the last frame sent was taken, and the gap the frame rate asks for: a frame that wakes us
+    // sooner than three quarters of it waits for the tick. Counted from the take, not from when its
+    // encode finished: a 60 Hz screen's next frame arrives ~7 ms after a 9 ms encode, which read as
+    // too soon and left it waiting up to a whole tick (6.5 ms on average on a Mac).
     let mut last_encode = Instant::now();
     let mut interval = Duration::from_micros(1_000_000 / 60);
 
@@ -371,7 +373,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     }
                 }
                 if dirty_input { x.flush(); }
-                if Instant::now() < next_tick && !(frame_ready && last_encode.elapsed() >= interval) { continue; }
+                if Instant::now() < next_tick && !(frame_ready && last_encode.elapsed() >= interval * 3 / 4) { continue; }
             }
             // The SSH channel closed. With UDP alive the desktop carries on (plan §7.3); without
             // it, or after 30 s of UDP silence, this is the end.
@@ -446,6 +448,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         // At most one keyframe a second; a request inside that waits for it.
         let key_due = want_key && (frame_no == 0 || last_key.elapsed() >= Duration::from_secs(1));
         let capture_us = now_us();
+        let taken = Instant::now();
         let frame = match x.capture(&d, &mut scratch) {
             Ok(f) => f,
             Err(e) => {
@@ -506,7 +509,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         timing.add(captured_us - capture_us, convert_us, encode_us - convert_us);
         if let Some(t) = timing.take(enc.name()) { out.emit(ty::STATE, t.as_bytes()); }
         if refine { refined = true; }
-        last_encode = Instant::now();
+        last_encode = taken;
         if key { last_key = Instant::now(); want_key = false; }
         if key_due { want_key = false; }
         frame_no = frame_no.wrapping_add(1);
