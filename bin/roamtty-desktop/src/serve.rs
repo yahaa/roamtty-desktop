@@ -512,8 +512,13 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         session::release();
         if lock_on_close { x.lock_screen(); }
     }
+    // The agent may still see this desktop resumed: it locks once the resume window passed.
+    if retired == 0 && agent_claimed && lock_on_close { LOCK_REQUESTED.store(true, Ordering::SeqCst); }
     0
 }
+
+/// Set when an agent's connection ended for good with 断开后锁定电脑 on (see `agent`).
+pub static LOCK_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests {

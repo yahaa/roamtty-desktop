@@ -114,8 +114,15 @@ fn handle(conn: Box<dyn Conn>, token: &str) {
         resume: None, token: None, retired: retired.clone(), claimed: Some(claimed),
     };
     serve::run_on(args, Box::new(reader), Box::new(out));
-    let mut cur = CURRENT.lock().unwrap();
-    if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, &retired)) { *cur = None; }
+    {
+        let mut cur = CURRENT.lock().unwrap();
+        if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, &retired)) { *cur = None; }
+    }
+    // 断开后锁定电脑: once the 30 s in which the phone may resume have passed with nobody back.
+    if serve::LOCK_REQUESTED.swap(false, Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        if CURRENT.lock().unwrap().is_none() { crate::log!("agent: locking after disconnect"); plat::lock(); }
+    }
 }
 
 /// One controller per desktop: the right resume token replaces the old connection quietly,
@@ -186,6 +193,7 @@ mod plat {
     }
 
     pub fn needs() -> Vec<String> { crate::mac::needs() }
+    pub fn lock() { let _ = std::process::Command::new("pmset").arg("displaysleepnow").status(); }
     pub fn detach_console() {}
     pub fn request_permissions() { crate::mac::request_permissions() }
 
@@ -363,6 +371,15 @@ mod plat {
 
     pub fn needs() -> Vec<String> { Vec::new() }
     pub fn request_permissions() {}
+    /// The user's agent locks its own session; the service's helper (SYSTEM, where LockWorkStation
+    /// does nothing) disconnects the console's session, which leaves it at the lock screen.
+    pub fn lock() {
+        use windows::Win32::System::RemoteDesktop::{WTSDisconnectSession, WTSGetActiveConsoleSessionId, WTS_CURRENT_SERVER_HANDLE};
+        unsafe {
+            if system_mode() { let _ = WTSDisconnectSession(Some(WTS_CURRENT_SERVER_HANDLE), WTSGetActiveConsoleSessionId(), false); }
+            else { let _ = windows::Win32::System::Shutdown::LockWorkStation(); }
+        }
+    }
 
     /// The logon task gives the agent a console window on the user's desktop; it lets go of it, and
     /// the window closes (closing it by hand would have ended the agent).
