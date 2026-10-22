@@ -1,0 +1,4 @@
+# The MSVC C runtime linked in: a fresh Windows has no VC++ Redistributable (VCRUNTIME140.dll), and the
+# plugin would not even start (STATUS_DLL_NOT_FOUND).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
