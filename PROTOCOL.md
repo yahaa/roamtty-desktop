@@ -14,8 +14,10 @@ Hello:
 ```json
 {"proto":1,"ver":"0.1.0","os":"linux","session":"9f2c…","resume_token":"base64(16 bytes)",
  "displays":[{"id":0,"w":1920,"h":1080,"scale":1.0,"x":0,"y":0,"primary":true,"name":"screen"}],
- "enc":["h264"],"hw":"openh264","needs":[],"udp":{"port":60123,"key":"base64(16 bytes)"}}
+ "enc":["h264"],"hw":"openh264","needs":[],"udp":{"port":60123,"key":"base64(16 bytes)"},"audio":["opus"]}
 ```
+
+`audio` lists the sound codecs the host can send; it is absent on plugins before 0.9.0.
 
 `udp` is absent until the UDP transport ships. `needs` lists what the user must do on the host:
 `screen-recording`, `accessibility` (macOS), `not-logged-in`, `locked`, `portal-approval` (Wayland).
@@ -30,7 +32,7 @@ Low-rate control messages carry UTF-8 JSON; high-rate ones fixed binary. Unknown
 
 | type | dir | name | payload |
 |---|---|---|---|
-| `0x01` | C→S | CONFIG | JSON, changed fields only: `display`, `fps`, `quality` (`auto`/`smooth`/`clear`/`original`), `max_bitrate`, `udp`, `udp_client_port`, `lock_on_close` |
+| `0x01` | C→S | CONFIG | JSON, changed fields only: `display`, `fps`, `quality` (`auto`/`smooth`/`clear`/`original`), `max_bitrate`, `udp`, `udp_client_port`, `lock_on_close`, `audio` |
 | `0x02` | C→S | INPUT | `u8 kind` + fields below |
 | `0x03` | C→S | ACTION | `u8`: 1 show desktop, 2 all windows |
 | `0x04` | C→S | REQ | `u8`: 1 keyframe, 2 pause, 3 resume, 4 view only on, 5 view only off, 6 get remote clipboard |
@@ -41,7 +43,8 @@ Low-rate control messages carry UTF-8 JSON; high-rate ones fixed binary. Unknown
 | `0x81` | S→C | VIDEO | `u32 frame` `u8 flags` (bit0 keyframe, bit1 refine) `u64 capture_us` `u64 encoded_us` `u16 w` `u16 h` + H.264 Annex-B |
 | `0x82` | S→C | CURSOR_POS | `u16 x` `u16 y` `u8 visible` `u64 shape_hash` |
 | `0x83` | S→C | CURSOR_SHAPE | `u64 hash` `u16 w` `u16 h` `u16 hot_x` `u16 hot_y` + RGBA (straight alpha); each shape once per connection |
-| `0x84` | S→C | STATE | JSON event: `displays`, `needs`, `locked`, `clip`, `kicked`, `error`, `timing` |
+| `0x84` | S→C | STATE | JSON event: `displays`, `needs`, `locked`, `clip`, `kicked`, `error`, `timing`, `audio` |
+| `0x85` | S→C | AUDIO | `u32 seq` `u64 capture_us` + one Opus packet |
 
 `timing` comes about once a second while frames go out: the host's share of a frame's latency,
 averaged in µs: `{"frames": n, "capture_us", "convert_us", "encode_us", "encoder"}`. `capture_us` is
@@ -74,6 +77,19 @@ Cursor positions are relative to the selected display.
   to ×0.8 (and, for `auto`, one step down the ladder 1080p60 → 1080p30 → 720p30 → 540p15 → 540p5);
   otherwise +5% a second, and one step up after 5 s clean. At most one change a second.
 - `REQ pause` stops capture and encode until `REQ resume`, which sends a keyframe.
+
+## Sound
+
+`CONFIG {"audio":true}` starts sending what plays on the host's default output; `false` stops it,
+and so does `REQ pause` until `REQ resume`. Each AUDIO frame is one 20 ms Opus packet of 48 kHz
+stereo (about 96 kbps; RFC 7845's pre-skip is 312 samples). `seq` goes up by one per 20 ms, so a gap
+is sound that is missing: lost, or not sent because the host was silent (after ten silent packets
+nothing goes out until sound returns). `capture_us` is when its last sample was captured, on the
+host's clock. Linux takes the default sink's monitor through PulseAudio (or PipeWire's pulse server),
+Windows a WASAPI loopback of the default output, macOS ScreenCaptureKit (13 or later).
+
+When the host cannot capture sound, it sends `STATE {"audio":"unavailable","detail":"…"}` once;
+the picture carries on. Setting `audio` again tries once more.
 
 ## One controller
 
@@ -125,7 +141,8 @@ most 160 shards; a block of `len` bytes has `k = ceil(len / 1150)` equal shards 
   reliable messages in n order, holding early ones back, so a key's release never overtakes its press.
   A gap left by a message that never arrives is skipped after 1 s. The client sends keys,
   buttons, text, CONFIG, REQ, ACTION and CLIP_SET reliably; pointer moves, wheel, ACK and PING are not
-  (the next one supersedes them). The host sends STATE and CURSOR_SHAPE reliably, with full parity.
+  (the next one supersedes them). The host sends STATE and CURSOR_SHAPE reliably, with full parity, and AUDIO
+  unreliably with full parity (each packet twice): a resend would come too late to play.
 - Congestion control (a simplified GCC): the host compares the reported arrival spread with its send
   spread, keeps a trend of the accumulated delay over the last 20 messages, and on overuse sets the rate
   to 85% of what arrived; with over 10% loss it lowers the rate by half the loss rate per second;

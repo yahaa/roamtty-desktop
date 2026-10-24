@@ -25,6 +25,7 @@ pub mod ty {
     pub const CURSOR_POS: u8 = 0x82;
     pub const CURSOR_SHAPE: u8 = 0x83;
     pub const STATE: u8 = 0x84;
+    pub const AUDIO: u8 = 0x85;
 }
 
 pub mod req {
@@ -75,6 +76,9 @@ pub struct Hello {
     pub needs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub udp: Option<Udp>,
+    /// The host's sound, when it can capture it: `["opus"]`. Absent on plugins without audio.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub audio: Vec<String>,
 }
 
 /// The first stdout line when `serve` cannot start.
@@ -106,6 +110,9 @@ pub struct Config {
     pub udp_client_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lock_on_close: Option<bool>,
+    /// Sends the host's sound (AUDIO frames) while true; off until the app asks.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub audio: Option<bool>,
     /// Test fixtures only (the plugin honours it with ROAMTTY_DESKTOP_TEST=1): drop this share of UDP datagrams.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub debug_loss: Option<f32>,
@@ -258,6 +265,16 @@ pub fn video_payload(v: &Video) -> Vec<u8> {
     p
 }
 
+/// AUDIO: one Opus packet of 48 kHz stereo. `seq` counts packets up by one; a packet skipped
+/// because the host was silent leaves a gap, as does one lost on the way.
+pub fn audio_payload(seq: u32, capture_us: u64, opus: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(12 + opus.len());
+    p.extend(seq.to_be_bytes());
+    p.extend(capture_us.to_be_bytes());
+    p.extend_from_slice(opus);
+    p
+}
+
 pub fn cursor_pos_payload(x: u16, y: u16, visible: bool, shape_hash: u64) -> Vec<u8> {
     let mut p = Vec::with_capacity(13);
     p.extend(x.to_be_bytes());
@@ -317,6 +334,7 @@ mod tests {
         })));
         s.push(("cursor-pos", ty::CURSOR_POS, cursor_pos_payload(300, 200, true, 0xDEAD_BEEF)));
         s.push(("cursor-shape", ty::CURSOR_SHAPE, cursor_shape_payload(0xDEAD_BEEF, 2, 1, 1, 0, &[255, 0, 0, 255, 0, 255, 0, 128])));
+        s.push(("audio", ty::AUDIO, audio_payload(9, 30, &[0xFC, 0xFF, 0xFE])));
         s.push(("state", ty::STATE, br#"{"kicked":true}"#.to_vec()));
         s
     }
@@ -326,6 +344,7 @@ mod tests {
             proto: 1, ver: "0.1.0".into(), os: "linux".into(), session: "9f2c".into(), resume_token: "AAAAAAAAAAAAAAAAAAAAAA==".into(),
             displays: vec![Display { id: 0, w: 1920, h: 1080, scale: 1.0, x: 0, y: 0, primary: true, name: "screen".into() }],
             enc: vec!["h264".into()], hw: "openh264".into(), needs: vec![], udp: None,
+            audio: vec!["opus".into()],
         }
     }
 
