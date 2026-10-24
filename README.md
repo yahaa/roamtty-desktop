@@ -6,7 +6,7 @@ H.264 and injects input, all over the SSH channel that started it. It listens on
 
 | Platform | Status |
 |---|---|
-| Linux X11 | capture (MIT-SHM), cursor (XFIXES), input and text (XTEST), clipboard, OpenH264 |
+| Linux X11 | capture (MIT-SHM, woken by DAMAGE), cursor (XFIXES), input and text (XTEST), clipboard, OpenH264 |
 | Transport | SSH channel, and UDP (AES-128-GCM, Reed-Solomon FEC, NACK, simplified GCC, pacing, roaming) |
 | Linux Wayland (wlroots: sway, Hyprland, labwc, river) | capture (wlr-screencopy, cursor drawn in), input (wlr-virtual-pointer, virtual-keyboard with spliced keymaps for any character), clipboard (wlr-data-control) |
 | macOS 13+ | ScreenCaptureKit, VideoToolbox, CGEvent; a notarized LaunchAgent app |
