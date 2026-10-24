@@ -96,7 +96,7 @@ fn handle(conn: Box<dyn Conn>, token: &str) {
     let mut first = String::new();
     if reader.read_line(&mut first).is_err() { return; }
     let mut parts = first.trim_end().splitn(2, ' ');
-    if parts.next() != Some(token) { crate::log!("agent: bad token"); return; }
+    if !parts.next().is_some_and(|t| crate::session::same_secret(t, token)) { crate::log!("agent: bad token"); return; }
     let rest = parts.next().unwrap_or("");
     let mut out = conn;
     if rest == "doctor" {
@@ -129,7 +129,7 @@ fn handle(conn: Box<dyn Conn>, token: &str) {
 /// anything else kicks it and gets a new token.
 fn claim(resume: Option<&str>, token: Option<&str>, me: Arc<AtomicU8>) -> Session {
     let mut s = SESSION.lock().unwrap();
-    let same = matches!((&*s, resume, token), (Some(x), Some(r), Some(t)) if x.session == r && x.resume_token == t);
+    let same = matches!((&*s, resume, token), (Some(x), Some(r), Some(t)) if x.session == r && session::same_secret(&x.resume_token, t));
     let next = match &*s {
         Some(x) if same => x.clone(),
         Some(x) => Session { session: x.session.clone(), resume_token: session::random_b64(16) },

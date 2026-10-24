@@ -422,7 +422,8 @@ impl UdpLink {
                             for bytes in ready { self.deliver(&bytes, &tx); }
                         }
                         // A resend of something already delivered: the RACK was lost, say it again.
-                        None if reliable => self.raw_send(&Packet::Rack(vec![msg]).encode(), false),
+                        // Not for a shard of a message still being assembled: that RACK would stop its resends.
+                        None if reliable && reasm.is_done(msg) => self.raw_send(&Packet::Rack(vec![msg]).encode(), false),
                         None => {}
                     }
                     reasm.expire(now_us(), 2_000_000);

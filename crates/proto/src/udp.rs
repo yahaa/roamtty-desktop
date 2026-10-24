@@ -261,7 +261,9 @@ impl Reassembler {
             *slot = Some(Block { k, len: f.len as usize, shards: vec![None; n], data: None, parity_used: false });
         }
         let b = slot.as_mut().unwrap();
-        if b.data.is_some() || b.shards.len() != n || b.shards[f.index as usize].is_some() { return None; }
+        // A shard of a block already rebuilt still arrived: count it, or rate control sees loss.
+        if b.data.is_some() { p.received += 1; return None; }
+        if b.shards.len() != n || b.shards[f.index as usize].is_some() { return None; }
         b.shards[f.index as usize] = Some(f.shard);
         p.received += 1;
         if b.shards.iter().filter(|s| s.is_some()).count() >= b.k {
@@ -292,6 +294,9 @@ impl Reassembler {
         }
     }
 
+    /// Whether `msg` was delivered (or given up on): a reliable resend of it only needs its RACK again.
+    pub fn is_done(&self, msg: u32) -> bool { self.done.contains_key(&msg) }
+
     /// Missing shard indices of messages still waiting after `older_than_us`: what a NACK asks for.
     pub fn missing(&self, now_us: u64, older_than_us: u64) -> Vec<(u32, u8, Vec<u16>)> {
         let mut out = Vec::new();
@@ -317,6 +322,9 @@ impl Reassembler {
         for m in stale {
             let p = self.pending.remove(&m).unwrap();
             if p.flags & FLAG_VIDEO != 0 { lost.push(m); }
+            // A reliable message is only forgotten: the sender resends it until acknowledged, and that
+            // resend must start it over rather than be acknowledged unseen.
+            if p.flags & FLAG_RELIABLE != 0 { continue; }
             self.finish(m, p.flags, p.first_us, p.last_us, p.received, p.total, 0, now_us);
         }
         lost
@@ -389,6 +397,29 @@ mod tests {
         assert_eq!(r.missing(50_000, 20_000), vec![(2, 0, vec![1, 2])]);
         assert_eq!(r.expire(2_000_000, 1_000_000), vec![2]);
         assert_eq!(r.take_reports(u64::MAX)[0].outcome, 0);
+    }
+
+    #[test]
+    fn an_expired_reliable_message_can_still_arrive() {
+        let mut r = Reassembler::default();
+        let frags = fragment(9, FLAG_RELIABLE, &vec![7; SHARD * 3], 0.0);
+        assert!(r.push(frags[0].clone(), 0).is_none());
+        assert!(!r.is_done(9), "half a message is not done: no RACK for it");
+        assert!(r.expire(3_000_000, 2_000_000).is_empty());
+        assert!(!r.is_done(9), "forgotten, not given up on");
+        let out = frags.iter().filter_map(|f| r.push(f.clone(), 3_000_001)).next();
+        assert_eq!(out.unwrap().bytes.len(), SHARD * 3);
+        assert!(r.is_done(9));
+    }
+
+    #[test]
+    fn late_shards_of_a_rebuilt_block_count() {
+        let mut r = Reassembler::default();
+        let frags = fragment(3, FLAG_VIDEO, &vec![5; SHARD * 2 * MAX_K], 0.25);
+        assert!(frags[0].blocks > 1);
+        for f in &frags { r.push(f.clone(), 0); }
+        let rep = r.take_reports(u64::MAX);
+        assert_eq!((rep[0].received as usize, rep[0].total as usize), (frags.len(), frags.len()));
     }
 
     #[test]
