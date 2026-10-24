@@ -52,6 +52,11 @@ fn is_serve(pid: i32) -> bool {
 }
 
 /// Takes over the desktop; returns the session the hello should carry.
+/// Compares secrets in time that depends only on their length, not on where they first differ.
+pub fn same_secret(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
 #[cfg(unix)]
 pub fn claim(resume: Option<&str>, token: Option<&str>) -> Session {
     unsafe {
@@ -61,7 +66,7 @@ pub fn claim(resume: Option<&str>, token: Option<&str>) -> Session {
     let dir = paths::desktop_dir();
     let state = dir.join("session.json");
     let stored: Option<Session> = std::fs::read(&state).ok().and_then(|b| serde_json::from_slice(&b).ok());
-    let same = matches!((&stored, resume, token), (Some(s), Some(r), Some(t)) if s.session == r && s.resume_token == t);
+    let same = matches!((&stored, resume, token), (Some(s), Some(r), Some(t)) if s.session == r && same_secret(&s.resume_token, t));
     let session = match stored {
         Some(s) if same => s,
         Some(s) => Session { session: s.session, resume_token: random_b64(16) },
@@ -99,5 +104,13 @@ mod tests {
         assert_eq!(super::b64(b"Man"), "TWFu");
         assert_eq!(super::b64(b"Ma"), "TWE=");
         assert_eq!(super::b64(&[0u8; 16]).len(), 24);
+    }
+
+    #[test]
+    fn same_secret() {
+        assert!(super::same_secret("abc", "abc"));
+        assert!(!super::same_secret("abc", "abd"));
+        assert!(!super::same_secret("abc", "ab"));
+        assert!(super::same_secret("", ""));
     }
 }
