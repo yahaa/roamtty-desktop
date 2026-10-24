@@ -306,6 +306,8 @@ impl UdpLink {
             proto::ty::VIDEO if keyframe => (FLAG_VIDEO, self.gcc.lock().unwrap().fec.max(0.30)),
             proto::ty::VIDEO => (FLAG_VIDEO, self.gcc.lock().unwrap().fec),
             proto::ty::STATE | proto::ty::CURSOR_SHAPE => (FLAG_RELIABLE, 1.0),
+            // A packet is one datagram and a resend would come too late to play: send it twice.
+            proto::ty::AUDIO => (0, 1.0),
             _ => (0, 0.0),
         };
         let frags = udp::fragment(msg, flags, &bytes, ratio);

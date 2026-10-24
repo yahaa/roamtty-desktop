@@ -15,7 +15,8 @@ use objc2_core_graphics::{
     CGEventType, CGGetActiveDisplayList, CGMainDisplayID, CGMouseButton, CGPreflightScreenCaptureAccess,
     CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
-use objc2_core_media::{CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
+use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
+use objc2_core_media::{CMBlockBuffer, CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
     CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
     CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
@@ -497,6 +498,115 @@ impl Backend for Mac {
 /// H.264 through VideoToolbox: real time, no frame reordering, low-latency rate control, keyframes
 /// only when asked. The backend's frames go in as the NV12 IOSurfaces ScreenCaptureKit made; BGRA
 /// (the tests) is converted with the same filter as the other platforms.
+/// The sound half of ScreenCaptureKit (macOS 13+), on a stream of its own: the picture's stream
+/// restarts whenever the display or the size changes, which would leave gaps in the sound. Its own
+/// picture is 2×2 once a second, and nobody takes it.
+struct AudioIvars { tx: mpsc::SyncSender<Vec<i16>>, phase: Mutex<f64> }
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[ivars = AudioIvars]
+    struct AudioSink;
+
+    unsafe impl NSObjectProtocol for AudioSink {}
+
+    unsafe impl SCStreamOutput for AudioSink {
+        #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+        fn did_output(&self, _stream: &SCStream, sample: &CMSampleBuffer, ty: SCStreamOutputType) {
+            if ty != SCStreamOutputType::Audio { return; }
+            let pcm = audio_samples(sample, &mut self.ivars().phase.lock().unwrap());
+            if let Some(pcm) = pcm { let _ = self.ivars().tx.try_send(pcm); }
+        }
+    }
+);
+
+impl AudioSink {
+    fn new(tx: mpsc::SyncSender<Vec<i16>>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(AudioIvars { tx, phase: Mutex::new(0.0) });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Room for the two planes ScreenCaptureKit delivers: 32-bit float, one buffer per channel.
+#[repr(C)]
+struct StereoBufferList { n: u32, buffers: [AudioBuffer; 2] }
+
+fn audio_samples(sample: &CMSampleBuffer, phase: &mut f64) -> Option<Vec<i16>> {
+    let empty = || AudioBuffer { mNumberChannels: 0, mDataByteSize: 0, mData: std::ptr::null_mut() };
+    let mut list = StereoBufferList { n: 0, buffers: [empty(), empty()] };
+    let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
+    let status = unsafe {
+        sample.audio_buffer_list_with_retained_block_buffer(std::ptr::null_mut(), &mut list as *mut _ as *mut AudioBufferList,
+            std::mem::size_of::<StereoBufferList>(), None, None, 0, &mut block)
+    };
+    if status != 0 { return None; }
+    // Owns the memory the planes point into until they are copied out.
+    let _block = NonNull::new(block).map(|b| unsafe { CFRetained::from_raw(b) });
+    let n = (list.n as usize).min(2);
+    if n == 0 { return None; }
+    let planes: Vec<&[f32]> = list.buffers[..n].iter()
+        .map(|b| unsafe { std::slice::from_raw_parts(b.mData as *const f32, b.mDataByteSize as usize / 4) }).collect();
+    let channels = if n > 1 { n } else { list.buffers[0].mNumberChannels as usize };
+    let mut out = Vec::with_capacity(planes[0].len() * 2);
+    crate::audio::push_float(&mut out, &planes, channels, crate::audio::RATE, phase);
+    Some(out)
+}
+
+pub struct AudioCapture { stream: Retained<SCStream>, _sink: Retained<AudioSink>, rx: mpsc::Receiver<Vec<i16>> }
+
+impl AudioCapture {
+    pub fn open() -> Result<AudioCapture> {
+        let content = shareable()?;
+        let displays = unsafe { content.displays() };
+        let main = CGMainDisplayID();
+        let sc = displays.iter().find(|d| unsafe { d.displayID() } == main).or_else(|| displays.iter().next()).ok_or("no display")?;
+        let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &sc, &NSArray::new()) };
+        let config = unsafe { SCStreamConfiguration::new() };
+        unsafe {
+            config.setWidth(2);
+            config.setHeight(2);
+            config.setMinimumFrameInterval(CMTime { value: 1, timescale: 1, flags: CMTimeFlags::Valid, epoch: 0 });
+            config.setCapturesAudio(true);
+            config.setSampleRate(crate::audio::RATE as isize);
+            config.setChannelCount(2);
+            config.setExcludesCurrentProcessAudio(true);
+        }
+        let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None) };
+        // Half a second of 10 ms buffers; a stalled reader loses the oldest sound, not the newest.
+        let (tx, rx) = mpsc::sync_channel(50);
+        let sink = AudioSink::new(tx);
+        unsafe {
+            stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*sink), SCStreamOutputType::Audio, None)
+                .map_err(|e| e.localizedDescription().to_string())?;
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        let done = RcBlock::new(move |e: *mut NSError| {
+            let _ = done_tx.send(unsafe { e.as_ref() }.map(|e| e.localizedDescription().to_string()));
+        });
+        unsafe { stream.startCaptureWithCompletionHandler(Some(&done)) };
+        if let Some(e) = done_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "audio capture did not start".to_string())? {
+            return Err(e);
+        }
+        Ok(AudioCapture { stream, _sink: sink, rx })
+    }
+}
+
+impl crate::audio::Source for AudioCapture {
+    fn read(&mut self, out: &mut Vec<i16>) -> Result<()> {
+        match self.rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(pcm) => out.extend_from_slice(&pcm),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("audio stream ended".into()),
+        }
+        while let Ok(pcm) = self.rx.try_recv() { out.extend_from_slice(&pcm); }
+        Ok(())
+    }
+}
+
+impl Drop for AudioCapture {
+    fn drop(&mut self) { unsafe { self.stream.stopCaptureWithCompletionHandler(None) }; }
+}
+
 pub struct VtEncoder {
     session: Option<CFRetained<objc2_video_toolbox::VTCompressionSession>>,
     w: usize,
