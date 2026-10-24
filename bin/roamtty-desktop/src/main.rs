@@ -1,6 +1,7 @@
 //! roamtty-desktop: the host side of Roamtty's remote desktop. The app starts `serve` over SSH;
 //! the other subcommands install, diagnose and remove it.
 
+mod audio;
 mod backend;
 mod encode;
 mod keymap;
@@ -100,6 +101,7 @@ fn main() {
             args.iter().any(|a| a == "--cpu")),
         #[cfg(windows)]
         Some("capture-test") => win::capture_test(flag(&args, "--out"), flag(&args, "--h264")),
+        Some("audio-test") => audio::self_test(flag(&args, "--seconds").and_then(|n| n.parse().ok()).unwrap_or(5)),
         Some("doctor") => doctor(),
         Some("install") => install(&args[1..]),
         Some("uninstall") => uninstall(),

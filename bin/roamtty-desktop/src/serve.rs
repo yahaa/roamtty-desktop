@@ -62,6 +62,8 @@ pub struct Args {
 /// Not a protocol type: the message a backend's [on_frame](Backend::on_frame) puts in the input
 /// queue to say a new frame is waiting. A phone that sent type 0 would only cause an extra look.
 const FRAME_READY: u8 = 0x00;
+/// Likewise from the audio thread: packets wait in the queue.
+const AUDIO_READY: u8 = 0xFE;
 
 /// Monotonic microseconds since the process started (never 0, which means "none" on the wire).
 pub fn now_us() -> u64 {
@@ -208,6 +210,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         session: sess.session.clone(), resume_token: sess.resume_token.clone(), displays: displays.clone(),
         enc: vec!["h264".into()], hw: enc.name().into(), needs: x.needs(), os: crate::OS.into(),
         udp: link.as_ref().map(|l| proto::Udp { port: l.port, key: session::b64(&l.key) }),
+        audio: vec!["opus".into()],
     };
     let mut ssh = BufWriter::with_capacity(1 << 20, output);
     if writeln!(ssh, "{}", serde_json::to_string(&hello).unwrap()).and_then(|_| ssh.flush()).is_err() { return 1; }
@@ -219,6 +222,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
 
     let (tx, rx) = mpsc::channel::<Option<ClientMsg>>();
     if let Some(l) = &link { l.start(tx.clone()); }
+    let audio_wake = tx.clone();
     let wake = tx.clone();
     x.on_frame(Arc::new(move || { let _ = wake.send(Some(ClientMsg::Unknown(FRAME_READY))); }));
     let mut out = Out { ssh, ssh_open: true, link: link.clone() };
@@ -274,6 +278,11 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     // too soon and left it waiting up to a whole tick (6.5 ms on average on a Mac).
     let mut last_encode = Instant::now();
     let mut interval = Duration::from_micros(1_000_000 / 60);
+    // The host's sound: captured while the app asks for it and the picture is not paused.
+    let mut audio_on = false;
+    let mut audio: Option<crate::audio::Audio> = None;
+    let mut audio_failed: Option<String> = None;
+    let audio_queue: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>> = Default::default();
 
     while !ended {
         let flag = session::RETIRED.load(Ordering::SeqCst).max(args.retired.load(Ordering::SeqCst));
@@ -294,6 +303,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     if let Some(q) = c.quality { quality = q; rc.step = 0; want_key = true; }
                     if let Some(b) = c.max_bitrate { max_bitrate = Some(b); }
                     if let Some(l) = c.lock_on_close { lock_on_close = l; }
+                    if let Some(a) = c.audio { audio_on = a; audio_failed = None; }
                     if let (Some(on), Some(l)) = (c.udp, &out.link) { l.enabled.store(on, Ordering::Relaxed); }
                     if let (Some(port), Some(l)) = (c.udp_client_port, &out.link) {
                         // The phone's address as sshd saw it: punch a hole towards its UDP port.
@@ -357,6 +367,11 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     out.flush();
                 }
                 ClientMsg::Unknown(FRAME_READY) => frame_ready = true,
+                ClientMsg::Unknown(AUDIO_READY) => {
+                    let packets: Vec<Vec<u8>> = audio_queue.lock().unwrap().drain(..).collect();
+                    for p in &packets { out.emit(ty::AUDIO, p); }
+                    out.flush();
+                }
                 ClientMsg::Pong { .. } | ClientMsg::Unknown(_) => {}
             }
             Some(false)
@@ -373,6 +388,28 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     }
                 }
                 if dirty_input { x.flush(); }
+                let want_audio = audio_on && !paused;
+                if want_audio && audio.is_none() && audio_failed.is_none() {
+                    let (q, wake) = (audio_queue.clone(), audio_wake.clone());
+                    match crate::audio::start(move |seq, t, opus| {
+                        let mut q = q.lock().unwrap();
+                        // A stalled main loop keeps only the last second: older sound is no use.
+                        if q.len() >= 50 { q.pop_front(); }
+                        q.push_back(proto::audio_payload(seq, t, &opus));
+                        let _ = wake.send(Some(ClientMsg::Unknown(AUDIO_READY)));
+                    }) {
+                        Ok(a) => { crate::log!("audio start"); audio = Some(a); }
+                        Err(e) => {
+                            crate::log!("audio failed: {e}");
+                            out.emit(ty::STATE, serde_json::json!({ "audio": "unavailable", "detail": e }).to_string().as_bytes());
+                            out.flush();
+                            audio_failed = Some(e);
+                        }
+                    }
+                } else if !want_audio && audio.is_some() {
+                    audio = None;
+                    audio_queue.lock().unwrap().clear();
+                }
                 if Instant::now() < next_tick && !(frame_ready && last_encode.elapsed() >= interval * 3 / 4) { continue; }
             }
             // The SSH channel closed. With UDP alive the desktop carries on (plan §7.3); without

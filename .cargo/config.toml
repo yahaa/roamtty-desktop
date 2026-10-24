@@ -2,3 +2,7 @@
 # plugin would not even start (STATUS_DLL_NOT_FOUND).
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# libopus (audiopus_sys) still declares cmake_minimum_required 3.1, which CMake 4 refuses.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
