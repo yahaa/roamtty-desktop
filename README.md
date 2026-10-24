@@ -12,6 +12,7 @@ H.264 and injects input, all over the SSH channel that started it. It listens on
 | macOS 13+ | ScreenCaptureKit, VideoToolbox, CGEvent; a notarized LaunchAgent app |
 | Windows 10/11 | DXGI, Media Foundation hardware H.264 (else OpenH264), SendInput; a logon task, or the service (below) |
 | GNOME / KDE Wayland | planned (see roamtty issue #184) |
+| Sound | Opus 48 kHz stereo: PulseAudio/PipeWire monitor (Linux), WASAPI loopback (Windows), ScreenCaptureKit (macOS) |
 
 ## Commands
 
