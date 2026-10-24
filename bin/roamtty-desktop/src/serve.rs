@@ -272,12 +272,19 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     let mut last_capture_err = String::new();
     let mut locked = false;
     let mut timing = Timing::default();
-    // When the last frame sent was taken, and the gap the frame rate asks for: a frame that wakes us
-    // sooner than three quarters of it waits for the tick. Counted from the take, not from when its
-    // encode finished: a 60 Hz screen's next frame arrives ~7 ms after a 9 ms encode, which read as
-    // too soon and left it waiting up to a whole tick (6.5 ms on average on a Mac).
-    let mut last_encode = Instant::now();
-    let mut interval = Duration::from_micros(1_000_000 / 60);
+    // The frame rate's slots: a frame that wakes us (or that a poll finds) is taken once its slot
+    // came, and the next slot is a frame interval on. A frame may come up to a quarter interval
+    // early without waiting for the next one (a 60 Hz screen's jitter around a 60 fps limit), but
+    // over time no more than the limit go out, whatever the screen's own rate (144 Hz, or X11
+    // damage from every bit of drawing). Counted from the take, not from when its encode finished:
+    // a 60 Hz screen's next frame arrives ~7 ms after a 9 ms encode, which read as too soon and
+    // left it waiting up to a whole tick (6.5 ms on average on a Mac).
+    let mut next_slot = Instant::now();
+    // A frame said it was ready before its slot: wait for the slot, not the next tick.
+    let mut frame_waiting = false;
+    // A change the encoder returned nothing for: it goes again at the next look.
+    let mut unsent_change = false;
+    let poll = x.poll_every();
     // The host's sound: captured while the app asks for it and the picture is not paused.
     let mut audio_on = false;
     let mut audio: Option<crate::audio::Audio> = None;
@@ -291,8 +298,11 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
             2 => break,
             _ => {}
         }
-        let wait = next_tick.saturating_duration_since(Instant::now());
-        let msg = rx.recv_timeout(wait);
+        let now = Instant::now();
+        let mut until = next_tick;
+        if frame_waiting { until = until.min(next_slot); }
+        if let Some(p) = poll { until = until.min(now + p); }
+        let msg = rx.recv_timeout(until.saturating_duration_since(now));
         let mut dirty_input = false;
         let mut frame_ready = false;
         let mut handle = |m: ClientMsg, x: &mut Box<dyn Backend>, out: &mut Out<_>| -> Option<bool> {
@@ -410,13 +420,18 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     audio = None;
                     audio_queue.lock().unwrap().clear();
                 }
-                if Instant::now() < next_tick && !(frame_ready && last_encode.elapsed() >= interval * 3 / 4) { continue; }
+                frame_waiting |= frame_ready;
+                if Instant::now() < next_tick && !(frame_waiting && Instant::now() >= next_slot) { continue; }
             }
             // The SSH channel closed. With UDP alive the desktop carries on (plan §7.3); without
             // it, or after 30 s of UDP silence, this is the end.
             Ok(None) => { out.ssh_open = false; ssh_closed.get_or_insert_with(Instant::now); }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // Before the tick, a timeout is a frame's slot or a poll: a poll before the slot is no use.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                if now < next_tick && now < next_slot { continue; }
+            }
         }
         if ended { break; }
         if ssh_closed.is_some() && out.link.as_ref().is_none_or(|l| l.silent_us() > 30_000_000) { break; }
@@ -433,7 +448,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         let auto = quality == "auto";
         let (ladder_long, ladder_fps) = if auto { LADDER[rc.step] } else { (u32::MAX, u32::MAX) };
         let fps = fps_limit.min(ladder_fps).max(1);
-        interval = Duration::from_micros(1_000_000 / fps as u64);
+        let interval = Duration::from_micros(1_000_000 / fps as u64);
         next_tick = Instant::now() + interval;
         if paused { continue; }
         if udp {
@@ -484,6 +499,14 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         }
         // At most one keyframe a second; a request inside that waits for it.
         let key_due = want_key && (frame_no == 0 || last_key.elapsed() >= Duration::from_secs(1));
+        frame_waiting = false;
+        // Nothing drawn since the last look (X11 DAMAGE): no grab, no compare, unless a keyframe or
+        // the sharper copy of a still picture is due.
+        let refine_due = !refined && last_change.elapsed() >= Duration::from_millis(300);
+        if !key_due && !refine_due && !unsent_change && x.idle() {
+            out.flush();
+            continue;
+        }
         let capture_us = now_us();
         let taken = Instant::now();
         let frame = match x.capture(&d, &mut scratch) {
@@ -505,6 +528,8 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     last_needs = needs;
                 }
                 next_tick = Instant::now() + Duration::from_millis(500);
+                // Nor a poll before then: a lock screen would be asked for a frame every 2 ms.
+                next_slot = next_tick;
                 continue;
             }
         };
@@ -514,7 +539,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
             want_key = true;
             out.emit(ty::STATE, serde_json::json!({ "locked": false }).to_string().as_bytes());
         }
-        let changed = frame.changed.unwrap_or_else(|| frame.bgra != last_sent.as_slice());
+        let changed = frame.changed.unwrap_or_else(|| frame.bgra != last_sent.as_slice()) || unsent_change;
         let captured_us = now_us();
         // A frame that came by itself was on the screen before we looked: its wait counts as capture.
         let capture_us = frame.shown_us.map_or(capture_us, |t| t.min(capture_us));
@@ -541,12 +566,13 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
             Ok(r) => r,
             Err(e) => { crate::log!("encode failed: {e}"); continue; }
         };
+        unsent_change = changed && data.is_empty();
         if data.is_empty() { continue; }
         let convert_us = enc.convert_us().min(encode_us);
         timing.add(captured_us - capture_us, convert_us, encode_us - convert_us);
         if let Some(t) = timing.take(enc.name()) { out.emit(ty::STATE, t.as_bytes()); }
         if refine { refined = true; }
-        last_encode = taken;
+        next_slot = next_slot.max(taken - interval / 4) + interval;
         if key { last_key = Instant::now(); want_key = false; }
         if key_due { want_key = false; }
         frame_no = frame_no.wrapping_add(1);

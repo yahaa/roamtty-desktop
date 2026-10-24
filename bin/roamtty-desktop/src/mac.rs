@@ -607,6 +607,9 @@ impl Drop for AudioCapture {
     fn drop(&mut self) { unsafe { self.stream.stopCaptureWithCompletionHandler(None) }; }
 }
 
+/// The encoder callback's last output: Annex-B and whether it is a keyframe.
+type Encoded = Arc<Mutex<Option<(Vec<u8>, bool)>>>;
+
 pub struct VtEncoder {
     session: Option<CFRetained<objc2_video_toolbox::VTCompressionSession>>,
     w: usize,
@@ -614,7 +617,7 @@ pub struct VtEncoder {
     bitrate: u32,
     fps: f32,
     key: bool,
-    out: Arc<Mutex<Option<(Vec<u8>, bool)>>>,
+    out: Encoded,
     yuv: Vec<u8>,
     /// Presentation times: the rate control paces by them, and drops frames that all claim 0.
     start: std::time::Instant,
@@ -702,7 +705,7 @@ impl VtEncoder {
     }
 
     /// BGRA scaled and converted on the CPU into an NV12 buffer (what the hardware encoder takes).
-    fn from_bgra(&mut self, bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize) -> std::result::Result<PixelBuffer, String> {
+    fn buffer_of_bgra(&mut self, bgra: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize) -> std::result::Result<PixelBuffer, String> {
         to_i420(bgra, sw, sh, stride, w, h, &mut self.yuv);
         let pb = Self::new_buffer(w, h)?;
         unsafe {
@@ -774,7 +777,7 @@ impl VideoEncoder for VtEncoder {
             *slot.want.lock().unwrap() = Some((w, h));
             if frame.size() == (w, h) { frame } else { self.scale(&frame, w, h)? }
         } else {
-            self.from_bgra(bgra, sw, sh, stride, w, h)?
+            self.buffer_of_bgra(bgra, sw, sh, stride, w, h)?
         };
         self.convert_us = t.elapsed().as_micros() as u64;
         self.compress(&pb.0)
@@ -788,7 +791,7 @@ fn annex_b(s: &CMSampleBuffer) -> Option<(Vec<u8>, bool)> {
     use objc2_core_media::*;
     let mut out = Vec::new();
     let attachments = unsafe { s.sample_attachments_array(false) };
-    let key = attachments.map_or(true, |a| unsafe {
+    let key = attachments.is_none_or(|a| unsafe {
         let a: &objc2_core_foundation::CFArray = &a;
         if a.count() == 0 { return true; }
         let d = a.value_at_index(0) as *const CFDictionary;

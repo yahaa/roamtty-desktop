@@ -111,9 +111,8 @@ fn cursor_image(cursor: HCURSOR) -> Option<(u64, u16, u16, u16, u16, Vec<u8>)> {
         let mut b = BITMAP::default();
         if unsafe { GetObjectW(bm.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut b as *mut _ as *mut _)) } == 0 { return None; }
         let (w, h) = (b.bmWidth as usize, b.bmHeight as usize);
-        let mut bi = BITMAPINFO::default();
-        bi.bmiHeader = BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w as i32, biHeight: -(h as i32),
-            biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() };
+        let mut bi = BITMAPINFO { bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w as i32, biHeight: -(h as i32),
+            biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() }, ..Default::default() };
         let mut out = vec![0u8; w * h * 4];
         let dc = unsafe { GetDC(None) };
         let n = unsafe { GetDIBits(dc, bm, 0, h as u32, Some(out.as_mut_ptr() as *mut _), &mut bi, DIB_RGB_COLORS) };
@@ -253,7 +252,7 @@ impl Win {
     }
 
     /// An HDR output's frame drawn as SDR BGRA; an SDR output's as it is.
-    fn to_sdr(&mut self, i: usize, tex: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+    fn sdr_texture(&mut self, i: usize, tex: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
         let Some((gdi, white, at)) = &mut self.dups[i].hdr else { return Ok(tex.clone()) };
         if at.elapsed() > std::time::Duration::from_secs(2) {
             *white = crate::win_hdr::sdr_white(gdi);
@@ -270,6 +269,10 @@ impl Backend for Win {
     fn kind(&self) -> &'static str { "windows" }
 
     fn displays(&self) -> Vec<Display> { self.displays.iter().map(|(d, _)| d.clone()).collect() }
+
+    /// A new frame shows up in AcquireNextFrame(0) a moment after the screen changed; polled once a
+    /// frame interval, it waited up to that long (16 ms at 60 fps). Asking costs microseconds.
+    fn poll_every(&self) -> Option<std::time::Duration> { Some(std::time::Duration::from_millis(2)) }
 
     fn hw_encoder(&mut self) -> Option<Box<dyn crate::encode::VideoEncoder>> {
         // ROAMTTY_DESKTOP_ENCODER=openh264 keeps the CPU path, to compare or to work around a driver.
@@ -293,8 +296,8 @@ impl Backend for Win {
         let (w, h) = (self.dups[i].w, self.dups[i].h);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        // No waiting: serve polls once per frame interval and handles input in between. A 50 ms wait
-        // here held back keys typed into a still screen by up to 50 ms.
+        // No waiting: serve polls every couple of ms ([Backend::poll_every]) and handles input in
+        // between. A 50 ms wait here held back keys typed into a still screen by up to 50 ms.
         let got = match unsafe { self.dups[i].dup.AcquireNextFrame(0, &mut info, &mut resource) } {
             Ok(()) => true,
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => false,
@@ -318,10 +321,10 @@ impl Backend for Win {
                 return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(false), shown_us: None });
             }
             if buf.is_empty() { return Err("no frame yet".into()); }
-            return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None, shown_us: None });
+            return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: Some(false), shown_us: None });
         }
         let tex: ID3D11Texture2D = resource.ok_or("no frame resource")?.cast().map_err(err)?;
-        let tex = match self.to_sdr(i, &tex) {
+        let tex = match self.sdr_texture(i, &tex) {
             Ok(t) => t,
             Err(e) => { unsafe { let _ = self.dups[i].dup.ReleaseFrame(); } return Err(e); }
         };
@@ -332,6 +335,11 @@ impl Backend for Win {
             unsafe { let _ = self.dups[i].dup.ReleaseFrame(); }
             r?;
             return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(changed), shown_us: None });
+        }
+        // A pointer-only update: the picture in `buf` stands, with no copy and no compare.
+        if info.AccumulatedFrames == 0 && !buf.is_empty() {
+            unsafe { let _ = self.dups[i].dup.ReleaseFrame(); }
+            return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: Some(false), shown_us: None });
         }
         if self.dups[i].staging.is_none() {
             let mut desc = D3D11_TEXTURE2D_DESC::default();

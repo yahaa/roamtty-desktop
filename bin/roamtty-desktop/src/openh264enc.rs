@@ -3,7 +3,7 @@
 
 use crate::encode::{to_i420, VideoEncoder};
 use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, SpsPpsStrategy, UsageType};
-use openh264::formats::YUVBuffer;
+use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
 use openh264_sys2::{SBitrateInfo, ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE, SPATIAL_LAYER_ALL};
 use std::path::{Path, PathBuf};
@@ -32,6 +32,8 @@ pub struct H264 {
     bitrate: u32,
     fps: f32,
     convert_us: u64,
+    /// The I420 picture, kept from frame to frame.
+    yuv: Vec<u8>,
 }
 
 impl H264 {
@@ -39,7 +41,7 @@ impl H264 {
     pub fn new(lib: &Path) -> Result<H264, String> {
         // Checked against the hashes of Cisco's releases before it is ever loaded.
         OpenH264API::from_blob_path(lib).map_err(|e| format!("openh264: {e}"))?;
-        Ok(H264 { enc: None, api: lib.to_path_buf(), w: 0, h: 0, bitrate: 4_000_000, fps: 30.0, convert_us: 0 })
+        Ok(H264 { enc: None, api: lib.to_path_buf(), w: 0, h: 0, bitrate: 4_000_000, fps: 30.0, convert_us: 0, yuv: Vec::new() })
     }
 
     fn make(&self) -> Result<Encoder, String> {
@@ -49,7 +51,10 @@ impl H264 {
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(self.bitrate))
             .max_frame_rate(FrameRate::from_hz(self.fps))
-            .skip_frames(true)
+            // A skipped frame is a change the phone never sees: after the 3× bitrate refine of a
+            // still picture, the rate control skipped the next change, which then waited ~330 ms for
+            // the following refine. Over budget, a frame should get coarser, not go missing.
+            .skip_frames(false)
             .complexity(Complexity::Low)
             .scene_change_detect(true)
             .background_detection(false)
@@ -95,10 +100,11 @@ impl VideoEncoder for H264 {
             self.h = h;
         }
         let t = std::time::Instant::now();
-        let mut yuv = Vec::new();
-        to_i420(bgra, sw, sh, stride, w, h, &mut yuv);
+        to_i420(bgra, sw, sh, stride, w, h, &mut self.yuv);
         self.convert_us = t.elapsed().as_micros() as u64;
-        let src = YUVBuffer::from_vec(yuv, w, h);
+        let (y, uv) = self.yuv.split_at(w * h);
+        let (u, v) = uv.split_at(w * h / 4);
+        let src = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
         let enc = self.enc.as_mut().unwrap();
         let out = enc.encode(&src).map_err(|e| e.to_string())?;
         let key = matches!(out.frame_type(), openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I);

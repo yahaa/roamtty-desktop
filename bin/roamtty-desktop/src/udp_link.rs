@@ -3,7 +3,7 @@
 //! GCC that turns the client's arrival reports into a bitrate. The client may roam: any packet that
 //! opens with the key moves the peer address there.
 
-use proto::udp::{self, Crypto, Frag, Packet, Reassembler, ReplayWindow, Report, DIR_C2S, DIR_S2C, FLAG_RELIABLE, FLAG_VIDEO};
+use proto::udp::{self, Crypto, Packet, Reassembler, ReplayWindow, Report, DIR_C2S, DIR_S2C, FLAG_RELIABLE, FLAG_VIDEO};
 use proto::ClientMsg;
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
@@ -50,6 +50,26 @@ fn now_us() -> u64 { crate::serve::now_us() }
 /// `data`: the message's data shards. The phone stamps `last_us` when they are all in (it is whole
 /// then), so they, not the parity that keeps arriving, span first_us..last_us.
 struct Sent { frame_bytes: usize, last_us: u64, data: usize }
+
+/// A reliable message's packets, when they last went out and how many times they were resent.
+type Unacked = (Vec<Vec<u8>>, Instant, u32);
+
+/// The last [History::KEEP] shards sent, by (msg, block, index), for NACKs to find at once.
+#[derive(Default)]
+struct History { packets: HashMap<(u32, u8, u16), Vec<u8>>, order: VecDeque<(u32, u8, u16)> }
+
+impl History {
+    const KEEP: usize = 3000;
+
+    fn insert(&mut self, key: (u32, u8, u16), packet: Vec<u8>) {
+        if self.packets.insert(key, packet).is_none() { self.order.push_back(key); }
+        while self.order.len() > Self::KEEP {
+            if let Some(old) = self.order.pop_front() { self.packets.remove(&old); }
+        }
+    }
+
+    fn get(&self, key: &(u32, u8, u16)) -> Option<&Vec<u8>> { self.packets.get(key) }
+}
 
 /// Datagrams the pacer lets out back to back. Most frames of a desktop (a cursor's worth of change,
 /// typing) fit, so they leave at once instead of trickling out at the target bitrate; and their
@@ -169,10 +189,11 @@ pub struct UdpLink {
     last_rx: AtomicU64,
     seq: AtomicU64,
     msg: AtomicU32,
-    /// Recent shards by (msg, block, index), for NACKs.
-    history: Mutex<VecDeque<((u32, u8, u16), Vec<u8>)>>,
+    /// Recent shards' packets, for NACKs.
+    history: Mutex<History>,
     sent: Mutex<HashMap<u32, Sent>>,
-    reliable: Mutex<HashMap<u32, (Vec<Frag>, Instant, u32)>>,
+    /// Reliable messages' packets until acknowledged, with when they were last sent and how often.
+    reliable: Mutex<HashMap<u32, Unacked>>,
     gcc: Mutex<Gcc>,
     pace: Mutex<Option<Sender<Vec<u8>>>>,
     pace_rate: AtomicU64,
@@ -214,7 +235,7 @@ impl UdpLink {
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok()?;
         let link = Arc::new(UdpLink {
             port, key, crypto: Crypto::new(&key), sock, peer: Mutex::new(None), last_rx: AtomicU64::new(0),
-            seq: AtomicU64::new(1), msg: AtomicU32::new(1), history: Mutex::new(VecDeque::new()),
+            seq: AtomicU64::new(1), msg: AtomicU32::new(1), history: Mutex::new(History::default()),
             sent: Mutex::new(HashMap::new()), reliable: Mutex::new(HashMap::new()), gcc: Mutex::new(Gcc::new(start_rate)),
             pace: Mutex::new(None), pace_rate: AtomicU64::new((start_rate * 2.5 / 8.0) as u64), rtt_us: AtomicU64::new(0),
             drop_ppm: AtomicU32::new(0), enabled: AtomicBool::new(true), stats: Mutex::new(LinkStats::default()),
@@ -310,27 +331,30 @@ impl UdpLink {
             proto::ty::AUDIO => (0, 1.0),
             _ => (0, 0.0),
         };
-        let frags = udp::fragment(msg, flags, &bytes, ratio);
         let video = flags & FLAG_VIDEO != 0;
+        let reliable = flags & FLAG_RELIABLE != 0;
         let start = now_us();
-        {
-            let mut h = self.history.lock().unwrap();
-            for f in &frags {
-                h.push_back(((f.msg, f.block, f.index), Packet::Frag(f.clone()).encode()));
-            }
-            while h.len() > 3000 { h.pop_front(); }
-        }
-        for f in &frags { self.raw_send(&Packet::Frag(f.clone()).encode(), video); }
+        // Each shard leaves as soon as it is cut, encoded once: the data shards are on their way
+        // while the parity is still being computed (~0.7 ms for a keyframe).
+        let (mut packets, mut count, mut data) = (Vec::new(), 0usize, 0usize);
+        udp::fragment_each(msg, flags, &bytes, ratio, |f| {
+            let p = f.packet();
+            self.raw_send(&p, video);
+            count += 1;
+            if f.index < f.k { data += 1; }
+            packets.push(((f.msg, f.block, f.index), p));
+        });
         if video {
             let mut s = self.sent.lock().unwrap();
             // The pacer spreads out what does not fit its burst; the last shard leaves about that / rate later.
             let rate = self.pace_rate.load(Ordering::Relaxed).max(1);
-            let spread = (frags.len().saturating_sub(BURST) * DATAGRAM) as u64 * 1_000_000 / rate;
-            let data = frags.iter().filter(|f| f.index < f.k).count();
+            let spread = (count.saturating_sub(BURST) * DATAGRAM) as u64 * 1_000_000 / rate;
             s.insert(msg, Sent { frame_bytes: bytes.len(), last_us: start + spread, data });
             if s.len() > 600 { let min = *s.keys().min().unwrap(); s.remove(&min); }
         }
-        if flags & FLAG_RELIABLE != 0 { self.reliable.lock().unwrap().insert(msg, (frags, Instant::now(), 0)); }
+        if reliable { self.reliable.lock().unwrap().insert(msg, (packets.iter().map(|p| p.1.clone()).collect(), Instant::now(), 0)); }
+        let mut h = self.history.lock().unwrap();
+        for (key, p) in packets { h.insert(key, p); }
     }
 
     /// Resends reliable frames nobody acknowledged: every max(2×RTT, 80 ms), five times at most.
@@ -344,16 +368,16 @@ impl UdpLink {
         let mut again = Vec::new();
         {
             let mut r = self.reliable.lock().unwrap();
-            r.retain(|_, (frags, at, tries)| {
+            r.retain(|_, (packets, at, tries)| {
                 if at.elapsed() < wait { return true; }
                 if *tries >= 5 { return false; }
                 *tries += 1;
                 *at = Instant::now();
-                again.extend(frags.iter().cloned());
+                again.extend(packets.iter().cloned());
                 true
             });
         }
-        for f in again { self.raw_send(&Packet::Frag(f).encode(), false); self.stats.lock().unwrap().resent += 1; }
+        for p in again { self.raw_send(&p, false); self.stats.lock().unwrap().resent += 1; }
     }
 
     /// Starts the receiver and the pacer; client messages go to `tx` like the SSH reader's.
@@ -435,7 +459,7 @@ impl UdpLink {
                 Packet::Nack { msg, block, indices } => {
                     let shards: Vec<Vec<u8>> = {
                         let h = self.history.lock().unwrap();
-                        indices.iter().filter_map(|i| h.iter().find(|(k, _)| *k == (msg, block, *i)).map(|(_, p)| p.clone())).collect()
+                        indices.iter().filter_map(|i| h.get(&(msg, block, *i)).cloned()).collect()
                     };
                     for s in shards { self.raw_send(&s, false); self.stats.lock().unwrap().resent += 1; }
                 }
@@ -533,6 +557,18 @@ mod tests {
             g.on_report(&report(i as u32, 50_000 + i * 22_000, 2, 2), &s, i * 16_000);
         }
         assert!(g.target < 8_000_000.0 && g.target > 2_000_000.0, "target {}", g.target);
+    }
+
+    #[test]
+    fn history_finds_recent_shards_and_forgets_old_ones() {
+        let mut h = History::default();
+        for i in 0..History::KEEP as u32 + 10 { h.insert((i, 0, 0), vec![i as u8]); }
+        assert_eq!(h.get(&(9, 0, 0)), None, "the oldest went");
+        assert_eq!(h.get(&(10, 0, 0)), Some(&vec![10]));
+        assert_eq!(h.packets.len(), History::KEEP);
+        // Sent again under the same key (a resend): one entry, the new packet.
+        h.insert((10, 0, 0), vec![99]);
+        assert_eq!((h.get(&(10, 0, 0)), h.order.len()), (Some(&vec![99]), History::KEEP));
     }
 
     #[test]

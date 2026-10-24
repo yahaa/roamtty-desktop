@@ -100,6 +100,20 @@ pub struct Frag {
     pub shard: Vec<u8>,
 }
 
+impl Frag {
+    /// This shard as a FRAG packet: what `Packet::Frag(f).encode()` gives, without giving up `f`.
+    pub fn packet(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(18 + self.shard.len());
+        v.push(kind::FRAG);
+        v.extend(self.msg.to_be_bytes());
+        v.push(self.flags); v.push(self.block); v.push(self.blocks);
+        v.extend(self.index.to_be_bytes()); v.extend(self.k.to_be_bytes()); v.extend(self.m.to_be_bytes());
+        v.extend(self.len.to_be_bytes());
+        v.extend_from_slice(&self.shard);
+        v
+    }
+}
+
 /// What a video message did on the way, reported by the receiver for rate control.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
@@ -126,14 +140,7 @@ impl Packet {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::new();
         match self {
-            Packet::Frag(f) => {
-                v.push(kind::FRAG);
-                v.extend(f.msg.to_be_bytes());
-                v.push(f.flags); v.push(f.block); v.push(f.blocks);
-                v.extend(f.index.to_be_bytes()); v.extend(f.k.to_be_bytes()); v.extend(f.m.to_be_bytes());
-                v.extend(f.len.to_be_bytes());
-                v.extend_from_slice(&f.shard);
-            }
+            Packet::Frag(f) => return f.packet(),
             Packet::Rack(ids) => {
                 v.push(kind::RACK);
                 v.extend((ids.len() as u16).to_be_bytes());
@@ -199,28 +206,38 @@ pub fn parity_for(k: usize, ratio: f32) -> usize {
 
 /// Cuts one message (a whole protocol frame) into FEC blocks of shards.
 pub fn fragment(msg: u32, flags: u8, bytes: &[u8], ratio: f32) -> Vec<Frag> {
+    let mut out = Vec::new();
+    fragment_each(msg, flags, bytes, ratio, |f| out.push(f.clone()));
+    out
+}
+
+/// [fragment], handing each shard to `emit` as soon as it exists: a block's data shards before its
+/// parity is computed, so they can be on the wire while the Reed-Solomon work goes on.
+pub fn fragment_each(msg: u32, flags: u8, bytes: &[u8], ratio: f32, mut emit: impl FnMut(&Frag)) {
     let per_block = SHARD * MAX_K;
     let blocks = bytes.len().div_ceil(per_block).max(1);
     assert!(blocks <= 255, "message too large for UDP");
-    let mut out = Vec::new();
     for b in 0..blocks {
         let chunk = &bytes[b * per_block..((b + 1) * per_block).min(bytes.len())];
         let k = chunk.len().div_ceil(SHARD).max(1);
         // Equal shards: the block's size spread evenly, so the last one is not mostly padding.
         let size = chunk.len().div_ceil(k).max(1);
-        let data: Vec<Vec<u8>> = (0..k).map(|i| {
+        let m = parity_for(k, ratio);
+        let frag = |i: usize, shard: Vec<u8>| Frag { msg, flags, block: b as u8, blocks: blocks as u8, index: i as u16, k: k as u16, m: m as u16,
+            len: chunk.len() as u32, shard };
+        let data: Vec<Frag> = (0..k).map(|i| {
             let mut s = chunk[(i * size).min(chunk.len())..((i + 1) * size).min(chunk.len())].to_vec();
             s.resize(size, 0);
-            s
+            let f = frag(i, s);
+            emit(&f);
+            f
         }).collect();
-        let m = parity_for(k, ratio);
-        let parity = if m > 0 { fec::encode(&data.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), m) } else { vec![] };
-        for (i, shard) in data.into_iter().chain(parity).enumerate() {
-            out.push(Frag { msg, flags, block: b as u8, blocks: blocks as u8, index: i as u16, k: k as u16, m: m as u16,
-                len: chunk.len() as u32, shard });
+        if m > 0 {
+            for (i, shard) in fec::encode(&data.iter().map(|f| f.shard.as_slice()).collect::<Vec<_>>(), m).into_iter().enumerate() {
+                emit(&frag(k + i, shard));
+            }
         }
     }
-    out
 }
 
 struct Block { k: usize, len: usize, shards: Vec<Option<Vec<u8>>>, data: Option<Vec<u8>>, parity_used: bool }
@@ -361,6 +378,22 @@ mod tests {
         assert!(w.accept(2000));
         assert!(!w.accept(900));
         assert!(w.accept(1999));
+    }
+
+    #[test]
+    fn shards_come_out_data_first_and_encode_alike() {
+        let bytes: Vec<u8> = (0..SHARD * (MAX_K + 5)).map(|i| i as u8).collect();
+        let mut seen = Vec::new();
+        fragment_each(4, FLAG_VIDEO, &bytes, 0.3, |f| {
+            assert_eq!(f.packet(), Packet::Frag(f.clone()).encode());
+            seen.push((f.block, f.index, f.k));
+        });
+        assert_eq!(seen.len(), fragment(4, FLAG_VIDEO, &bytes, 0.3).len());
+        // Within a block every data shard precedes every parity shard, and blocks go in order.
+        let firsts: Vec<_> = seen.iter().map(|s| (s.0, s.1 >= s.2)).collect();
+        let mut sorted = firsts.clone();
+        sorted.sort();
+        assert_eq!(firsts, sorted);
     }
 
     #[test]

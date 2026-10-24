@@ -1,5 +1,5 @@
 //! Linux X11 backend: finds the user's display, grabs it over MIT-SHM, reads the cursor through
-//! XFIXES and injects input with XTEST.
+//! XFIXES, injects input with XTEST and hears of screen changes through DAMAGE.
 
 use crate::backend::{fnv, Backend, Cursor, Frame};
 use crate::keymap;
@@ -7,6 +7,9 @@ use proto::Display;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use x11rb::connection::Connection;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
@@ -86,6 +89,70 @@ pub struct X11 {
     clip: Option<Clipboard>,
     /// X keycode per HID usage on this server.
     keycodes: Vec<u8>,
+    damage: Option<Damage>,
+}
+
+type Wake = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+/// What has been drawn on the screen since the last capture, from the DAMAGE extension: a thread
+/// on a second connection hears that something was (once per capture: the level is NonEmpty and
+/// each capture empties it) and wakes `serve`, which used to see a change only at its next tick,
+/// up to a frame interval later. The capture takes the region itself, so a still screen is neither
+/// grabbed nor compared (8 MB a tick at 1080p), and a change on another monitor is not this one's.
+struct Damage {
+    id: damage::Damage,
+    parts: u32,
+    dirty: Arc<AtomicBool>,
+    wake: Wake,
+    /// Set by the thread when its connection broke: from then on every tick captures and compares.
+    lost: Arc<AtomicBool>,
+    /// The first capture has nothing to be unchanged from.
+    fresh: bool,
+    /// Every 8th row of the last capture, and when a still screen was last captured anyway to check
+    /// it against them: an X server that draws without reporting it (a driver bug) gets caught.
+    rows: Vec<u8>,
+    checked: std::time::Instant,
+    /// Checks in a row that found pixels changed where DAMAGE said nothing was.
+    misses: u8,
+}
+
+impl Damage {
+    fn start(display: &str, root: Window) -> Result<Damage> {
+        let (conn, _) = x11rb::connect(Some(display)).map_err(err)?;
+        conn.damage_query_version(1, 1).map_err(err)?.reply().map_err(err)?;
+        conn.xfixes_query_version(5, 0).map_err(err)?.reply().map_err(err)?;
+        let id = conn.generate_id().map_err(err)?;
+        conn.damage_create(id, root, damage::ReportLevel::NON_EMPTY).map_err(err)?.check().map_err(err)?;
+        let parts = conn.generate_id().map_err(err)?;
+        conn.xfixes_create_region(parts, &[]).map_err(err)?.check().map_err(err)?;
+        let dirty = Arc::new(AtomicBool::new(true));
+        let lost = Arc::new(AtomicBool::new(false));
+        let wake: Wake = Arc::default();
+        let (d, l, w) = (dirty.clone(), lost.clone(), wake.clone());
+        std::thread::spawn(move || {
+            // The damage and the region belong to this connection; it lives as long as the process.
+            loop {
+                match conn.wait_for_event() {
+                    Ok(x11rb::protocol::Event::DamageNotify(_)) => {
+                        if !d.swap(true, Ordering::SeqCst) {
+                            if let Some(f) = w.lock().unwrap().as_ref() { f(); }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => { crate::log!("damage watch ended: {e}"); l.store(true, Ordering::SeqCst); return; }
+                }
+            }
+        });
+        Ok(Damage { id, parts, dirty, wake, lost, fresh: true, rows: Vec::new(), checked: std::time::Instant::now(), misses: 0 })
+    }
+
+    fn check_due(&self) -> bool { self.checked.elapsed() >= std::time::Duration::from_secs(2) }
+
+    /// Every 8th row of a frame, for [Damage::rows].
+    fn sample(bgra: &[u8], stride: usize, h: usize, out: &mut Vec<u8>) {
+        out.clear();
+        for r in (0..h).step_by(8) { out.extend_from_slice(&bgra[r * stride..(r + 1) * stride]); }
+    }
 }
 
 impl X11 {
@@ -108,10 +175,16 @@ impl X11 {
             let i = (*k - min_keycode) as usize * per as usize;
             map.keysyms[i..i + per as usize].iter().all(|s| *s == 0)
         }).take(8).collect();
-        let mut x = X11 { conn, root, width, height, shm: None, keymap: map.keysyms, min_keycode, per_keycode: per, spare, wheel: (0, 0), cursor_serial: 0, clip: None, keycodes: Vec::new() };
+        let mut x = X11 { conn, root, width, height, shm: None, keymap: map.keysyms, min_keycode, per_keycode: per, spare, wheel: (0, 0), cursor_serial: 0, clip: None, keycodes: Vec::new(), damage: None };
         x.keycodes = (0..=0xFFu16).map(|hid| x.resolve(hid)).collect();
         x.shm = x.make_shm().ok();
         x.clip = Clipboard::start().ok();
+        // Subtracting from the watch's damage on this connection needs the version said here too.
+        let damage = x.conn.damage_query_version(1, 1).map_err(err).and_then(|c| c.reply().map_err(err)).and_then(|_| Damage::start(&display, root));
+        match damage {
+            Ok(d) => x.damage = Some(d),
+            Err(e) => crate::log!("no DAMAGE, comparing pixels: {e}"),
+        }
         Ok(x)
     }
 
@@ -144,20 +217,43 @@ impl X11 {
         out
     }
 
+    /// True when nothing was drawn since the last capture, so `serve` need not grab the screen.
+    pub fn idle(&self) -> bool {
+        self.damage.as_ref().is_some_and(|d| !d.fresh && !d.check_due() && !d.lost.load(Ordering::SeqCst) && !d.dirty.load(Ordering::SeqCst))
+    }
+
+    /// Whether DAMAGE saw anything drawn on `d` since the last call, emptying what it holds. Sent
+    /// before the image is taken: drawing after it starts the next round (and wakes `serve` again).
+    fn damaged(&mut self, d: &Display) -> Option<bool> {
+        let dm = self.damage.as_mut().filter(|dm| !dm.lost.load(Ordering::SeqCst))?;
+        dm.dirty.store(false, Ordering::SeqCst);
+        let r = self.conn.damage_subtract(dm.id, x11rb::NONE, dm.parts).map_err(err)
+            .and_then(|_| self.conn.xfixes_fetch_region(dm.parts).map_err(err)).and_then(|c| c.reply().map_err(err));
+        let region = match r {
+            Ok(r) => r,
+            Err(e) => { crate::log!("damage failed, comparing pixels: {e}"); self.damage = None; return None; }
+        };
+        let fresh = std::mem::take(&mut dm.fresh);
+        let (x0, y0, x1, y1) = (d.x, d.y, d.x + d.w as i32, d.y + d.h as i32);
+        let hit = region.rectangles.iter().any(|r| {
+            let (rx, ry) = (r.x as i32, r.y as i32);
+            rx < x1 && ry < y1 && rx + r.width as i32 > x0 && ry + r.height as i32 > y0
+        });
+        Some(fresh || hit)
+    }
+
     /// Grabs one display region; `buf` keeps the copy when MIT-SHM is missing or refused.
     pub fn capture<'a>(&'a mut self, d: &Display, buf: &'a mut Vec<u8>) -> Result<Frame<'a>> {
+        let changed = self.damaged(d);
         let (w, h) = (d.w as u16, d.h as u16);
         let n = w as usize * h as usize * 4;
+        let mut shm_ok = false;
         if self.shm.as_ref().is_some_and(|s| n <= s.size) {
             let shm = self.shm.as_ref().unwrap();
             let r = self.conn.shm_get_image(self.root, d.x as i16, d.y as i16, w, h, !0, ImageFormat::Z_PIXMAP.into(), shm.seg, 0)
                 .map_err(err).and_then(|c| c.reply().map_err(err));
             match r {
-                Ok(_) => {
-                    let shm = self.shm.as_ref().unwrap();
-                    let bgra = unsafe { std::slice::from_raw_parts(shm.ptr, n) };
-                    return Ok(Frame { bgra, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None, shown_us: None });
-                }
+                Ok(_) => shm_ok = true,
                 Err(e) => {
                     // A remote or sandboxed server can refuse shared memory: plain GetImage from now on.
                     crate::log!("MIT-SHM refused, falling back: {e}");
@@ -165,9 +261,35 @@ impl X11 {
                 }
             }
         }
-        let r = self.conn.get_image(ImageFormat::Z_PIXMAP, self.root, d.x as i16, d.y as i16, w, h, !0).map_err(err)?.reply().map_err(err)?;
-        *buf = r.data;
-        Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None, shown_us: None })
+        if !shm_ok {
+            let r = self.conn.get_image(ImageFormat::Z_PIXMAP, self.root, d.x as i16, d.y as i16, w, h, !0).map_err(err)?.reply().map_err(err)?;
+            *buf = r.data;
+        }
+        let bgra: &[u8] = if shm_ok { unsafe { std::slice::from_raw_parts(self.shm.as_ref().unwrap().ptr, n) } } else { buf };
+        let stride = w as usize * 4;
+        let changed = match (changed, self.damage.as_mut()) {
+            (Some(c), Some(dm)) => {
+                if c {
+                    Damage::sample(bgra, stride, h as usize, &mut dm.rows);
+                    dm.misses = 0;
+                } else if dm.check_due() {
+                    let mut now = Vec::new();
+                    Damage::sample(bgra, stride, h as usize, &mut now);
+                    dm.misses = if now != dm.rows { dm.misses + 1 } else { 0 };
+                    dm.rows = now;
+                }
+                dm.checked = std::time::Instant::now();
+                if dm.misses >= 2 {
+                    crate::log!("DAMAGE missed changes twice, comparing pixels from now on");
+                    self.damage = None;
+                    None
+                } else {
+                    Some(c || dm.misses > 0)
+                }
+            }
+            _ => None,
+        };
+        Ok(Frame { bgra, w: w as usize, h: h as usize, stride, changed, shown_us: None })
     }
 
     pub fn cursor(&mut self) -> Result<Cursor> {
@@ -412,6 +534,10 @@ impl Backend for X11 {
     fn kind(&self) -> &'static str { "x11" }
     fn displays(&self) -> Vec<Display> { X11::displays(self) }
     fn capture<'a>(&'a mut self, d: &Display, buf: &'a mut Vec<u8>) -> Result<Frame<'a>> { X11::capture(self, d, buf) }
+    fn idle(&mut self) -> bool { X11::idle(self) }
+    fn on_frame(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        if let Some(d) = &self.damage { *d.wake.lock().unwrap() = Some(wake); }
+    }
     fn cursor(&mut self) -> Option<Cursor> { X11::cursor(self).ok() }
     fn move_abs(&mut self, x: i32, y: i32) -> Result<()> { X11::move_abs(self, x, y) }
     fn move_rel(&mut self, dx: i16, dy: i16) -> Result<()> { X11::move_rel(self, dx, dy) }
