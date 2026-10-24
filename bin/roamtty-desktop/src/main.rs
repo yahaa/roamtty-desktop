@@ -16,6 +16,8 @@ mod win;
 #[cfg(windows)]
 mod win_mf;
 #[cfg(windows)]
+mod win_hdr;
+#[cfg(windows)]
 mod win_service;
 #[cfg(target_os = "linux")]
 mod wl;
@@ -96,6 +98,8 @@ fn main() {
         #[cfg(windows)]
         Some("encode-test") => win_mf::self_test(flag(&args, "--out"), flag(&args, "--frames").and_then(|n| n.parse().ok()).unwrap_or(300),
             args.iter().any(|a| a == "--cpu")),
+        #[cfg(windows)]
+        Some("capture-test") => win::capture_test(flag(&args, "--out"), flag(&args, "--h264")),
         Some("doctor") => doctor(),
         Some("install") => install(&args[1..]),
         Some("uninstall") => uninstall(),

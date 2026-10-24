@@ -13,9 +13,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_OUTDUPL_FRAME_INFO, DXGI_ERROR_WAIT_TIMEOUT};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource, DXGI_OUTDUPL_FRAME_INFO, DXGI_ERROR_WAIT_TIMEOUT};
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+    DeleteObject, EnumDisplayMonitors, RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HMONITOR, MONITORINFOEXW, MONITORINFO,
 };
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
@@ -36,7 +37,19 @@ fn err(e: impl std::fmt::Display) -> String { e.to_string() }
 
 const CF_UNICODETEXT: u32 = 13;
 
-struct Dup { name: String, dup: IDXGIOutputDuplication, staging: Option<ID3D11Texture2D>, w: u32, h: u32 }
+struct Dup {
+    name: String,
+    dup: IDXGIOutputDuplication,
+    staging: Option<ID3D11Texture2D>,
+    w: u32,
+    h: u32,
+    /// HDR on: frames come as FP16 scRGB, with SDR white at `white` (read again now and then: the
+    /// user may move the slider), and are drawn back to SDR first.
+    hdr: Option<(String, f32, std::time::Instant)>,
+    /// No picture presented yet (HDR only), and when the windows were last asked to redraw.
+    blank: bool,
+    redrawn: Option<std::time::Instant>,
+}
 
 pub struct Win {
     device: ID3D11Device,
@@ -50,6 +63,7 @@ pub struct Win {
     /// The service's helper (SYSTEM) moves to whichever desktop has the input: the sign-in screen,
     /// the lock screen, the user's. The desktop this thread is on, and its name.
     follow: Option<(HDESK, String)>,
+    to_sdr: Option<crate::win_hdr::ToSdr>,
 }
 
 /// A desktop's name: "Default" for the user's, "Winlogon" for sign-in and lock screens.
@@ -183,7 +197,7 @@ impl Win {
             primary: *primary, name: name.trim_start_matches("\\\\.\\").to_string(),
         }, *h)).collect();
         let follow = crate::agent::system_mode().then(|| (HDESK::default(), String::new()));
-        let mut w = Win { device, context, displays, dups: Vec::new(), last_cursor: None, gpu: None, follow };
+        let mut w = Win { device, context, displays, dups: Vec::new(), last_cursor: None, gpu: None, follow, to_sdr: None };
         w.follow_input();
         Ok(w)
     }
@@ -219,13 +233,36 @@ impl Win {
             let desc = unsafe { output.GetDesc() }.map_err(err)?;
             let dev = String::from_utf16_lossy(&desc.DeviceName).trim_end_matches('\0').to_string();
             if !dev.ends_with(name) { continue; }
-            let o1: IDXGIOutput1 = output.cast().map_err(err)?;
-            let dup = unsafe { o1.DuplicateOutput(&self.device) }.map_err(err)?;
+            // HDR switched on or off ends the duplication (access lost), so this is asked again.
+            let (dup, hdr) = if crate::win_hdr::is_hdr(&output) {
+                let o5: IDXGIOutput5 = output.cast().map_err(err)?;
+                let dup = unsafe { o5.DuplicateOutput1(&self.device, 0, &[DXGI_FORMAT_R16G16B16A16_FLOAT]) }.map_err(err)?;
+                let white = crate::win_hdr::sdr_white(&dev);
+                crate::log!("{name}: HDR, SDR white {:.0} nits", white * 80.0);
+                (dup, Some((dev, white, std::time::Instant::now())))
+            } else {
+                let o1: IDXGIOutput1 = output.cast().map_err(err)?;
+                (unsafe { o1.DuplicateOutput(&self.device) }.map_err(err)?, None)
+            };
             let r = desc.DesktopCoordinates;
-            self.dups.push(Dup { name: name.to_string(), dup, staging: None, w: (r.right - r.left) as u32, h: (r.bottom - r.top) as u32 });
+            self.dups.push(Dup { name: name.to_string(), dup, staging: None, w: (r.right - r.left) as u32, h: (r.bottom - r.top) as u32,
+                blank: hdr.is_some(), hdr, redrawn: None });
             return Ok(self.dups.len() - 1);
         }
         Err(format!("no DXGI output for {name}"))
+    }
+
+    /// An HDR output's frame drawn as SDR BGRA; an SDR output's as it is.
+    fn to_sdr(&mut self, i: usize, tex: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+        let Some((gdi, white, at)) = &mut self.dups[i].hdr else { return Ok(tex.clone()) };
+        if at.elapsed() > std::time::Duration::from_secs(2) {
+            *white = crate::win_hdr::sdr_white(gdi);
+            *at = std::time::Instant::now();
+        }
+        let white = *white;
+        if self.to_sdr.is_none() { self.to_sdr = Some(crate::win_hdr::ToSdr::new(&self.device)?); }
+        let (w, h) = (self.dups[i].w, self.dups[i].h);
+        self.to_sdr.as_mut().unwrap().convert(&self.device, &self.context, tex, w, h, white)
     }
 }
 
@@ -258,21 +295,36 @@ impl Backend for Win {
         let mut resource: Option<IDXGIResource> = None;
         // No waiting: serve polls once per frame interval and handles input in between. A 50 ms wait
         // here held back keys typed into a still screen by up to 50 ms.
-        match unsafe { self.dups[i].dup.AcquireNextFrame(0, &mut info, &mut resource) } {
-            Ok(()) => {}
-            // Nothing changed: the last frame stands.
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                if let Some(g) = &self.gpu {
-                    if g.texture.borrow().is_none() { return Err("no frame yet".into()); }
-                    return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(false), shown_us: None });
-                }
-                if buf.is_empty() { return Err("no frame yet".into()); }
-                return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None, shown_us: None });
-            }
+        let got = match unsafe { self.dups[i].dup.AcquireNextFrame(0, &mut info, &mut resource) } {
+            Ok(()) => true,
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => false,
             // Access lost (secure desktop, mode change): start over next time.
             Err(e) => { self.dups.remove(i); return Err(err(e)); }
+        };
+        // An HDR duplication starts with a frame that has no picture (all zero): wait for a real
+        // one, and have the windows redraw (once a second at most) so a still desktop shows one.
+        let dup = &mut self.dups[i];
+        let blank = got && dup.blank && info.LastPresentTime == 0;
+        if blank { unsafe { let _ = dup.dup.ReleaseFrame(); } }
+        if got && info.LastPresentTime != 0 { dup.blank = false; }
+        if dup.blank && dup.redrawn.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(1)) {
+            unsafe { let _ = RedrawWindow(None, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE); }
+            dup.redrawn = Some(std::time::Instant::now());
+        }
+        // Nothing changed: the last frame stands.
+        if !got || blank {
+            if let Some(g) = &self.gpu {
+                if g.texture.borrow().is_none() { return Err("no frame yet".into()); }
+                return Ok(Frame { bgra: &[], w: w as usize, h: h as usize, stride: 0, changed: Some(false), shown_us: None });
+            }
+            if buf.is_empty() { return Err("no frame yet".into()); }
+            return Ok(Frame { bgra: buf, w: w as usize, h: h as usize, stride: w as usize * 4, changed: None, shown_us: None });
         }
         let tex: ID3D11Texture2D = resource.ok_or("no frame resource")?.cast().map_err(err)?;
+        let tex = match self.to_sdr(i, &tex) {
+            Ok(t) => t,
+            Err(e) => { unsafe { let _ = self.dups[i].dup.ReleaseFrame(); } return Err(e); }
+        };
         if let Some(g) = self.gpu.clone() {
             // A pointer-only update (no new picture) leaves the texture as it is.
             let changed = info.AccumulatedFrames > 0 || g.texture.borrow().is_none();
@@ -442,3 +494,57 @@ impl Backend for Win {
         }
     }
 }
+
+/// `capture-test [--out FILE] [--h264 FILE]`: one frame of the primary display through the real
+/// capture path, as raw BGRA in FILE, and through the hardware encoder into an H.264 file. Run it
+/// in the user's session (Session 0 has no desktop). Prints the size and the display's colour mode.
+pub fn capture_test(out: Option<&str>, h264: Option<&str>) -> i32 {
+    let run = || -> Result<serde_json::Value> {
+        let mut win = Win::open()?;
+        let d = win.displays.iter().map(|(d, _)| d.clone()).find(|d| d.primary).ok_or("no primary display")?;
+        let mut buf = Vec::new();
+        let mut frame = || -> Result<(usize, usize)> {
+            let mut last = String::new();
+            for _ in 0..500 {
+                match win.capture(&d, &mut buf) {
+                    Ok(f) => return Ok((f.w, f.h)),
+                    Err(e) => { last = e; std::thread::sleep(std::time::Duration::from_millis(20)) }
+                }
+            }
+            Err(format!("no frame in 10 s: {last}"))
+        };
+        let (w, h) = frame()?;
+        if let Some(p) = out { std::fs::write(p, &buf).map_err(err)?; }
+        // A black first frame was the HDR path's first bug.
+        let lit = buf.chunks(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+        let hdr = win.dups.iter().find(|x| x.name == d.name).and_then(|x| x.hdr.as_ref()).map(|(_, white, _)| white * 80.0);
+        // One duplication of an output per process.
+        drop(win);
+        let mut encoder = None;
+        if let Some(p) = h264 {
+            let mut win = Win::open()?;
+            let mut enc = win.hw_encoder().ok_or("no hardware encoder")?;
+            encoder = Some(enc.name());
+            let (ew, eh) = crate::encode::fit(w as u32, h as u32, 2400);
+            let mut buf = Vec::new();
+            let mut data = Vec::new();
+            let mut last = String::new();
+            enc.force_key();
+            for _ in 0..200 {
+                match win.capture(&d, &mut buf) {
+                    Ok(_) => data.extend(enc.encode(&[], w, h, 0, ew, eh)?.0),
+                    Err(e) => { last = e; std::thread::sleep(std::time::Duration::from_millis(20)); }
+                }
+                if !data.is_empty() { break; }
+            }
+            if data.is_empty() { return Err(format!("nothing encoded: {last}")); }
+            std::fs::write(p, &data).map_err(err)?;
+        }
+        Ok(serde_json::json!({ "display": d.name, "w": w, "h": h, "hdr": hdr.is_some(), "sdr_white_nits": hdr, "encoder": encoder, "lit_pixels": lit }))
+    };
+    match run() {
+        Ok(v) => { println!("{v}"); 0 }
+        Err(e) => { println!("{}", serde_json::json!({ "error": e })); 1 }
+    }
+}
+
