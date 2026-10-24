@@ -145,9 +145,13 @@ most 160 shards; a block of `len` bytes has `k = ceil(len / 1150)` equal shards 
   unreliably with full parity (each packet twice): a resend would come too late to play.
 - Congestion control (a simplified GCC): the host compares the reported arrival spread with its send
   spread, keeps a trend of the accumulated delay over the last 20 messages, and on overuse sets the rate
-  to 85% of what arrived; with over 10% loss it lowers the rate by half the loss rate per second;
-  otherwise it raises the rate by 8% a second. The encoder hears of a new rate at most once a second, and
-  only for a change of 10% or more. Datagrams are paced at 1.5× the rate, in bursts of up to 8.
+  to 85% of what arrived (or of the rate, when under half of it arrived); with over 10% loss it lowers
+  the rate by half the loss rate per second; otherwise it raises the rate by 8% a second. The encoder
+  hears of a new rate at most once a second, and only for a change of 10% or more. Video datagrams leave
+  in bursts of up to 16, then paced at max(90% of the measured bottleneck rate, 2.5 × the rate); the
+  bottleneck rate is the 75th percentile, over the last 3 s, of how fast unpaced bursts arrived. A
+  message's data shards are sent before its parity is computed. Reliable, AUDIO and control datagrams
+  are not paced.
 
 `CONFIG` adds `udp` (false turns UDP off) and `udp_client_port`: the host then sends three heartbeats
 to that port at the address in `SSH_CLIENT`, so a stateful host firewall lets the client's datagrams in.

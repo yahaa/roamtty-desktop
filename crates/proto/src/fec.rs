@@ -12,8 +12,8 @@ fn tables() -> &'static Tables {
         let mut exp = [0u8; 512];
         let mut log = [0u8; 256];
         let mut x: u16 = 1;
-        for i in 0..255 {
-            exp[i] = x as u8;
+        for (i, e) in exp.iter_mut().take(255).enumerate() {
+            *e = x as u8;
             log[x as usize] = i as u8;
             x <<= 1;
             if x & 0x100 != 0 { x ^= POLY; }

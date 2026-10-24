@@ -37,7 +37,14 @@ pub trait Backend {
     fn hw_encoder(&mut self) -> Option<Box<dyn crate::encode::VideoEncoder>> { None }
     /// Called once: `wake` is for a backend whose frames arrive by themselves (ScreenCaptureKit), so
     /// `serve` encodes each as it comes instead of at its next tick, up to a frame interval later.
+    /// `wake` is also how a backend that watches the screen for changes (X11's DAMAGE) says one
+    /// happened; it is called at most once per [capture](Backend::capture).
     fn on_frame(&mut self, _wake: std::sync::Arc<dyn Fn() + Send + Sync>) {}
+    /// True when the backend knows nothing changed since its last capture, so `serve` skips it.
+    fn idle(&mut self) -> bool { false }
+    /// For a backend that can only be asked whether a new frame is there (Windows' Desktop
+    /// Duplication, cheaply and without waiting): how often `serve` asks between its ticks.
+    fn poll_every(&self) -> Option<std::time::Duration> { None }
     /// None when the backend draws the cursor into the frames instead.
     fn cursor(&mut self) -> Option<Cursor>;
     fn move_abs(&mut self, x: i32, y: i32) -> Result<()>;
