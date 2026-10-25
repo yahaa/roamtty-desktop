@@ -220,6 +220,17 @@ fn full_ack_window(polling: bool) {
 #[test]
 #[ignore]
 fn active_frame_pacing_benchmark() {
+    // Measure 8 ms frame slots with a finer wait timer on headless Windows runners. Keep this
+    // scoped to the pacing benchmark: CPU/input regressions and the application use normal timers.
+    #[cfg(windows)]
+    let _timer = {
+        struct Timer;
+        impl Drop for Timer {
+            fn drop(&mut self) { unsafe { windows::Win32::Media::timeEndPeriod(1); } }
+        }
+        assert_eq!(unsafe { windows::Win32::Media::timeBeginPeriod(1) }, 0);
+        Timer
+    };
     for fps in [30, 60, 120] {
         let mut h = Harness::start();
         let mut frame = h.video();
