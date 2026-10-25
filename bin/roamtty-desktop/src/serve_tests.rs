@@ -2,8 +2,7 @@
 use super::*;
 use crate::backend::{Cursor, Frame};
 use std::io::{BufRead, BufReader};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
 use std::sync::Mutex;
 
@@ -62,15 +61,26 @@ impl VideoEncoder for Encoder {
     }
 }
 
+#[cfg(unix)]
 fn thread_cpu() -> Duration {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) }, 0);
     Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
 }
 
+#[cfg(windows)]
+fn thread_cpu() -> Duration {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let (mut created, mut exited, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user).unwrap(); }
+    let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+    Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+}
+
 struct Harness {
-    client: UnixStream,
-    read: BufReader<UnixStream>,
+    client: TcpStream,
+    read: BufReader<TcpStream>,
     screen: Arc<Screen>,
     retired: Arc<AtomicU8>,
     worker: Option<std::thread::JoinHandle<Duration>>,
@@ -82,7 +92,11 @@ impl Harness {
     }
 
     fn with_polling(polling: bool) -> Self {
-        let (client, server) = UnixStream::pair().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client.set_nodelay(true).unwrap();
+        server.set_nodelay(true).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let screen = Arc::new(Screen::default());
         screen.dirty.store(true, Ordering::SeqCst);
