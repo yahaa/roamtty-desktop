@@ -117,6 +117,30 @@ impl Timing {
     }
 }
 
+/// What the encoder actually made, against the bitrate it was asked for. Encoders hold their average
+/// only between keyframes: VideoToolbox made 24 Mbps of a 12 Mbps target with a keyframe a second
+/// (requests after loss, a still picture's refine), OpenH264 overshoots on a busy screen, and on a
+/// phone's mobile link the excess only queued. While the frames sent took more than the bitrate
+/// gave, the next one waits; the budget keeps half a second, so a change after a quiet spell goes
+/// at once.
+struct Budget { bytes: f64, at: Instant }
+
+impl Budget {
+    const KEEP_S: f64 = 0.5;
+
+    fn new(now: Instant) -> Budget { Budget { bytes: f64::INFINITY, at: now } }
+
+    /// Refills at `bitrate`; false while in debt.
+    fn ready(&mut self, now: Instant, bitrate: u32) -> bool {
+        let rate = bitrate as f64 / 8.0;
+        self.bytes = (self.bytes + now.saturating_duration_since(self.at).as_secs_f64() * rate).min(rate * Self::KEEP_S);
+        self.at = now;
+        self.bytes >= 0.0
+    }
+
+    fn spend(&mut self, bytes: usize) { self.bytes -= bytes as f64; }
+}
+
 const LADDER: [(u32, u32); 5] = [(1920, 60), (1920, 30), (1280, 30), (960, 15), (960, 5)];
 
 pub struct RateControl {
@@ -255,6 +279,7 @@ fn run_with(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dy
     let mut want_key = true;
     let mut rc = RateControl::new(4_000_000);
     enc.set_bitrate(rc.bitrate);
+    let mut budget = Budget::new(Instant::now());
     let mut last_sent: Vec<u8> = Vec::new();
     let mut last_change = Instant::now();
     let mut refined = true;
@@ -309,7 +334,7 @@ fn run_with(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dy
         // A pending frame cannot advance while paused or waiting for ACKs. Its slot may already
         // be past: using it then would turn recv_timeout into a busy loop. Keep the pending flag
         // so RESUME/an ACK can send it immediately, but wait for messages or the regular tick.
-        let can_capture = !paused && (in_flight.len() < 4 || want_key);
+        let can_capture = !paused && (in_flight.len() < 4 || want_key) && budget.ready(now, rc.bitrate);
         if can_capture && frame_waiting { until = until.min(next_slot); }
         if let Some(p) = poll { until = until.min(now + p); }
         let msg = rx.recv_timeout(until.saturating_duration_since(now));
@@ -432,7 +457,7 @@ fn run_with(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dy
                 }
                 frame_waiting |= frame_ready;
                 // The messages just handled may have resumed capture or opened the ACK window.
-                let can_capture = !paused && (in_flight.len() < 4 || want_key);
+                let can_capture = !paused && (in_flight.len() < 4 || want_key) && budget.ready(Instant::now(), rc.bitrate);
                 if Instant::now() < next_tick && !(can_capture && frame_waiting && Instant::now() >= next_slot) { continue; }
             }
             // The SSH channel closed. With UDP alive the desktop carries on (plan §7.3); without
@@ -506,6 +531,11 @@ fn run_with(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dy
         // SSH to ~32 fps on a 12 Mbps link. On UDP, ACKs can be lost and expire after 500 ms.
         if udp { while in_flight.front().is_some_and(|f| now_us() - f.1 > 500_000) { in_flight.pop_front(); } }
         if in_flight.len() >= 4 && !want_key {
+            out.flush();
+            continue;
+        }
+        // The encoder made more than its bitrate: the change waits (a tick at a time) until that is paid.
+        if frame_no != 0 && !budget.ready(Instant::now(), rc.bitrate) {
             out.flush();
             continue;
         }
@@ -593,6 +623,7 @@ fn run_with(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dy
             frame: frame_no, flags, capture_us, encoded_us: now_us(), w: w as u16, h: h as u16, data: &data,
         });
         sent_total += payload.len() as u64;
+        budget.spend(payload.len());
         out.emit(ty::VIDEO, &payload);
         out.flush();
         if !out.ssh_open && !out.udp() && ssh_closed.is_none() { break; }

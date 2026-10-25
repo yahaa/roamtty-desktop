@@ -916,4 +916,34 @@ mod tests {
         assert_eq!(hid_to_vk(0x28), Some(0x24)); // Return
         assert_eq!(hid_to_vk(0xE3), Some(0x37)); // Command
     }
+
+    /// What VideoToolbox makes of a busy screen (scrolling noise, the worst a desktop gets) with a
+    /// keyframe a second, as serve may ask for one (after loss, a still picture's refine). It holds
+    /// its average only between keyframes: a 12 Mbps target came out at 24 Mbps, which is why serve
+    /// keeps its own budget. Measures on a Mac: cargo test --release vt_bitrate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn vt_bitrate_with_a_keyframe_a_second() {
+        let (w, h, fps, target) = (2772usize, 1800usize, 30u32, 12_000_000u32);
+        let mut noise = vec![0u8; w * 4 * h * 2];
+        let mut x = 0x2545F491u32;
+        for b in noise.iter_mut() { x ^= x << 13; x ^= x >> 17; x ^= x << 5; *b = x as u8; }
+        let mut enc = VtEncoder::new();
+        enc.set_bitrate(target);
+        enc.set_fps(fps as f32);
+        let (mut bytes, mut keys, mut key_bytes) = (0usize, 0usize, 0usize);
+        let frames = fps as usize * 6;
+        for i in 0..frames {
+            // Scrolls 12 px a frame: motion the encoder can follow, new detail coming in at the edge.
+            let off = (i * 12 % h) * w * 4;
+            if i % fps as usize == 0 { enc.force_key(); }
+            let (data, key) = enc.encode(&noise[off..off + w * 4 * h], w, h, w * 4, w, h).unwrap();
+            bytes += data.len();
+            if key { keys += 1; key_bytes += data.len(); }
+        }
+        let seconds = frames as f64 / fps as f64;
+        println!("videotoolbox {w}x{h}@{fps}, target {} Mbps: {:.1} Mbps, {keys} keyframes of {} KB on average, other frames {:.1} Mbps",
+            target / 1_000_000, bytes as f64 * 8.0 / seconds / 1e6, key_bytes / keys.max(1) / 1000, (bytes - key_bytes) as f64 * 8.0 / seconds / 1e6);
+    }
 }
+

@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "roamtty-desktop"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "audiopus_sys",
  "block2",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "roamtty-desktop-proto"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "aes-gcm",
  "serde",
