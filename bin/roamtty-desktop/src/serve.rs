@@ -184,14 +184,20 @@ pub fn run(args: Args) -> i32 {
 }
 
 /// Serves one controller over `input` / `output`; returns the exit code.
-pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dyn Write>) -> i32 {
+pub fn run_on(args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dyn Write>) -> i32 {
+    run_with(args, input, output, crate::open_desktop, UdpLink::bind)
+}
+
+fn run_with(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dyn Write>,
+    open: impl FnOnce() -> Result<Box<dyn Backend>, (&'static str, String)>,
+    bind: impl FnOnce(f64) -> Option<Arc<UdpLink>>) -> i32 {
     let mut output = output;
     if args.proto != proto::PROTO {
         let e = StartError { error: "proto_unsupported".into(), detail: None, min: Some(proto::PROTO), max: Some(proto::PROTO) };
         let _ = writeln!(output, "{}", serde_json::to_string(&e).unwrap());
         return 1;
     }
-    let mut x: Box<dyn Backend> = match crate::open_desktop() {
+    let mut x: Box<dyn Backend> = match open() {
         Ok(x) => x,
         Err((code, e)) => return fail_on(&mut output, code, e),
     };
@@ -204,7 +210,7 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
     let agent_claimed = args.claimed.is_some();
     let sess = match args.claimed.take() { Some(s) => s, None => session::claim(args.resume.as_deref(), args.token.as_deref()) };
     // The UDP port and a fresh key ride in the hello; the key never touches the disk.
-    let link = UdpLink::bind(4_000_000.0);
+    let link = bind(4_000_000.0);
     let hello = Hello {
         proto: proto::PROTO, ver: env!("CARGO_PKG_VERSION").into(),
         session: sess.session.clone(), resume_token: sess.resume_token.clone(), displays: displays.clone(),
@@ -300,7 +306,11 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
         }
         let now = Instant::now();
         let mut until = next_tick;
-        if frame_waiting { until = until.min(next_slot); }
+        // A pending frame cannot advance while paused or waiting for ACKs. Its slot may already
+        // be past: using it then would turn recv_timeout into a busy loop. Keep the pending flag
+        // so RESUME/an ACK can send it immediately, but wait for messages or the regular tick.
+        let can_capture = !paused && (in_flight.len() < 4 || want_key);
+        if can_capture && frame_waiting { until = until.min(next_slot); }
         if let Some(p) = poll { until = until.min(now + p); }
         let msg = rx.recv_timeout(until.saturating_duration_since(now));
         let mut dirty_input = false;
@@ -421,7 +431,9 @@ pub fn run_on(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<
                     audio_queue.lock().unwrap().clear();
                 }
                 frame_waiting |= frame_ready;
-                if Instant::now() < next_tick && !(frame_waiting && Instant::now() >= next_slot) { continue; }
+                // The messages just handled may have resumed capture or opened the ACK window.
+                let can_capture = !paused && (in_flight.len() < 4 || want_key);
+                if Instant::now() < next_tick && !(can_capture && frame_waiting && Instant::now() >= next_slot) { continue; }
             }
             // The SSH channel closed. With UDP alive the desktop carries on (plan §7.3); without
             // it, or after 30 s of UDP silence, this is the end.
@@ -669,3 +681,7 @@ mod tests {
         assert_eq!((rc.bitrate, rc.step), (1_000_000, 0));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "serve_tests.rs"]
+mod loop_tests;
