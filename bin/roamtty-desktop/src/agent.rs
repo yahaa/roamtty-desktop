@@ -41,6 +41,9 @@ fn open() -> Option<(String, Box<dyn Conn>)> {
 /// One connection to the agent, both ways.
 pub trait Conn: Read + Write + Send {
     fn split(&self) -> std::io::Result<Box<dyn Conn>>;
+    /// Ends the connection for every half at once: a read waiting in another thread returns and the
+    /// other side sees the end. Dropping one half does neither while another half is still open.
+    fn close(&self);
 }
 
 /// The connection being served, with the flag that retires it: 1 kicked, 2 replaced.
@@ -113,7 +116,7 @@ fn handle(conn: Box<dyn Conn>, token: &str) {
         client_long: a["client_long"].as_u64().unwrap_or(1920) as u32,
         resume: None, token: None, retired: retired.clone(), claimed: Some(claimed),
     };
-    serve::run_on(args, Box::new(reader), Box::new(out));
+    serve_then_close(reader, out, |input, output| { serve::run_on(args, input, output); });
     {
         let mut cur = CURRENT.lock().unwrap();
         if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, &retired)) { *cur = None; }
@@ -123,6 +126,15 @@ fn handle(conn: Box<dyn Conn>, token: &str) {
         std::thread::sleep(std::time::Duration::from_secs(30));
         if CURRENT.lock().unwrap().is_none() { crate::log!("agent: locking after disconnect"); plat::lock(); }
     }
+}
+
+/// Runs `serve` on a connection, then closes it. serve's reader thread outlives it, blocked on the
+/// connection: without the close, neither it nor the `serve` bridge at the other end ever ended.
+fn serve_then_close(reader: BufReader<Box<dyn Conn>>, out: Box<dyn Conn>,
+    serve: impl FnOnce(Box<dyn Read + Send>, Box<dyn Write>)) {
+    let closer = out.split();
+    serve(Box::new(reader), Box::new(out));
+    if let Ok(c) = closer { c.close(); }
 }
 
 /// One controller per desktop: the right resume token replaces the old connection quietly,
@@ -152,21 +164,32 @@ pub fn bridge(a: &serve::Args) -> i32 {
     };
     let args = serde_json::json!({ "proto": a.proto, "client_long": a.client_long, "resume": a.resume, "token": a.token });
     if writeln!(conn, "{} {}", token.trim(), args).is_err() { return fail("internal", "agent closed"); }
-    let Ok(mut back) = conn.split() else { return fail("internal", "agent closed") };
-    std::thread::spawn(move || {
-        let _ = std::io::copy(&mut std::io::stdin(), &mut conn);
-        // The SSH channel closed: so does the agent's side, which may carry on over UDP.
-        drop(conn);
-    });
-    let mut stdout = std::io::stdout();
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        match back.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => { if stdout.write_all(&buf[..n]).and_then(|_| stdout.flush()).is_err() { break; } }
-        }
-    }
+    if relay(conn, std::io::stdin(), std::io::stdout()).is_err() { return fail("internal", "agent closed"); }
     0
+}
+
+/// Copies `input` to the agent and the agent's bytes to `output` until either side ends, then
+/// closes the connection. The agent then learns the SSH channel closed and carries on over UDP or
+/// stops; a bridge that kept waiting for it outlived both (and the agent never knew).
+fn relay(mut conn: Box<dyn Conn>, mut input: impl Read + Send + 'static, mut output: impl Write + Send + 'static) -> std::io::Result<()> {
+    let mut back = conn.split()?;
+    let closer = conn.split()?;
+    let (done, ended) = std::sync::mpsc::channel();
+    let up = done.clone();
+    std::thread::spawn(move || { let _ = std::io::copy(&mut input, &mut conn); let _ = up.send(()); });
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            match back.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => { if output.write_all(&buf[..n]).and_then(|_| output.flush()).is_err() { break; } }
+            }
+        }
+        let _ = done.send(());
+    });
+    let _ = ended.recv();
+    closer.close();
+    Ok(())
 }
 
 /// The agent's answer to `doctor`, or None when it is not running.
@@ -190,6 +213,7 @@ mod plat {
 
     impl Conn for UnixStream {
         fn split(&self) -> std::io::Result<Box<dyn Conn>> { Ok(Box::new(self.try_clone()?)) }
+        fn close(&self) { let _ = self.shutdown(std::net::Shutdown::Both); }
     }
 
     pub fn needs() -> Vec<String> { crate::mac::needs() }
@@ -209,6 +233,13 @@ mod plat {
     }
 
     pub fn connect() -> std::io::Result<Box<dyn Conn>> { Ok(Box::new(UnixStream::connect(socket())?)) }
+
+    /// The agent's end and the bridge's end of one connection.
+    #[cfg(test)]
+    pub fn test_pair() -> (Box<dyn Conn>, Box<dyn Conn>) {
+        let (agent, bridge) = UnixStream::pair().unwrap();
+        (Box::new(agent), Box::new(bridge))
+    }
 
     fn run_quiet(cmd: &str, args: &[&str]) -> bool {
         std::process::Command::new(cmd).args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
@@ -310,13 +341,13 @@ mod plat {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE};
     use windows::Win32::Storage::FileSystem::{CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING};
-    use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows::Win32::System::Console::FreeConsole;
     use windows::Win32::System::Threading::CreateEventW;
     use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
     use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
-    use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT};
+    use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT};
 
     const TASK: &str = "Roamtty Desktop";
 
@@ -329,22 +360,30 @@ mod plat {
     /// A pipe end opened for overlapped I/O, shared by its reading and writing halves. Synchronous
     /// I/O on one file object is serialized: with a read waiting for the phone's next message, the
     /// other half's write (the picture) waited behind it, and serve stalled right after the hello.
-    struct Pipe(Arc<OwnedHandle>);
+    struct Pipe(Arc<PipeEnd>);
+
+    struct PipeEnd { handle: OwnedHandle, closed: std::sync::atomic::AtomicBool }
 
     fn os_err(e: windows::core::Error) -> std::io::Error { std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF) }
 
     impl Pipe {
-        fn new(h: HANDLE) -> Pipe { Pipe(Arc::new(unsafe { OwnedHandle::from_raw_handle(h.0 as RawHandle) })) }
+        fn new(h: HANDLE) -> Pipe {
+            Pipe(Arc::new(PipeEnd { handle: unsafe { OwnedHandle::from_raw_handle(h.0 as RawHandle) }, closed: Default::default() }))
+        }
+
+        fn raw(&self) -> HANDLE { HANDLE(self.0.handle.as_raw_handle() as _) }
 
         /// Starts one operation with its own event and waits for it.
         fn io(&self, f: impl FnOnce(HANDLE, *mut OVERLAPPED) -> windows::core::Result<()>) -> std::io::Result<usize> {
-            let h = HANDLE(self.0.as_raw_handle() as _);
+            let h = self.raw();
             let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(os_err)?;
             let event = unsafe { OwnedHandle::from_raw_handle(event.0 as RawHandle) };
             let mut ov = OVERLAPPED { hEvent: HANDLE(event.as_raw_handle() as _), ..Default::default() };
             if let Err(e) = f(h, &mut ov) {
                 if e.code() != ERROR_IO_PENDING.to_hresult() { return Err(os_err(e)); }
             }
+            // Started before close() set the flag: its cancel finds this one. After: cancel it here.
+            if self.0.closed.load(Ordering::SeqCst) { unsafe { let _ = CancelIoEx(h, Some(&ov)); } }
             let mut n = 0u32;
             unsafe { GetOverlappedResult(h, &ov, &mut n, true) }.map_err(os_err)?;
             Ok(n as usize)
@@ -367,6 +406,16 @@ mod plat {
 
     impl Conn for Pipe {
         fn split(&self) -> std::io::Result<Box<dyn Conn>> { Ok(Box::new(Pipe(self.0.clone()))) }
+        /// The agent's end disconnects (the client's next read fails, and so does every later one
+        /// here); either end then cancels what is pending, a read waiting in the other half too.
+        fn close(&self) {
+            self.0.closed.store(true, Ordering::SeqCst);
+            let h = self.raw();
+            unsafe {
+                let _ = DisconnectNamedPipe(h);
+                let _ = CancelIoEx(h, None);
+            }
+        }
     }
 
     pub fn needs() -> Vec<String> { Vec::new() }
@@ -425,6 +474,27 @@ mod plat {
     }
 
     pub fn connect() -> std::io::Result<Box<dyn Conn>> { connect_to(&pipe_name()) }
+
+    /// The agent's end and the bridge's end of one connection.
+    #[cfg(test)]
+    pub fn test_pair() -> (Box<dyn Conn>, Box<dyn Conn>) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let name = format!(r"\\.\pipe\roamtty-desktop-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst));
+        let wname = wide(&name);
+        let h = unsafe {
+            CreateNamedPipeW(PCWSTR(wname.as_ptr()), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1, 1 << 16, 1 << 16, 0, None)
+        };
+        assert!(!h.is_invalid(), "{}", std::io::Error::last_os_error());
+        let agent = Pipe::new(h);
+        let bridge = connect_to(&name).unwrap();
+        match agent.io(|h, ov| unsafe { ConnectNamedPipe(h, Some(ov)) }) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_CONNECTED.0 as i32) => {}
+            Err(e) => panic!("{e}"),
+        }
+        (Box::new(agent), bridge)
+    }
 
     pub fn connect_to(pipe: &str) -> std::io::Result<Box<dyn Conn>> {
         let name = wide(pipe);
@@ -496,5 +566,63 @@ mod plat {
         let _ = schtasks(&["/End", "/TN", TASK]);
         let _ = schtasks(&["/Delete", "/F", "/TN", TASK]);
         if crate::win_service::elevated() { crate::win_service::uninstall(); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(3);
+
+    /// What a read on `c` gives within WAIT: Some(n) bytes (0 = the end, an error counts as one too).
+    fn read_within(mut c: Box<dyn Conn>) -> Option<usize> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || { let mut b = [0u8; 64]; let _ = tx.send(c.read(&mut b).unwrap_or(0)); });
+        rx.recv_timeout(WAIT).ok()
+    }
+
+    /// A reader that never ends, like an SSH channel nobody closes.
+    struct Silent;
+    impl Read for Silent {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { std::thread::sleep(Duration::from_secs(3600)); Ok(0) }
+    }
+
+    fn relay_in_thread(bridge: Box<dyn Conn>, input: impl Read + Send + 'static) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || { relay(bridge, input, std::io::sink()).unwrap(); let _ = tx.send(()); });
+        rx
+    }
+
+    #[test]
+    fn bridge_ends_and_agent_sees_it_when_ssh_closes() {
+        // The stream had ended (or ran over UDP): the agent sends nothing more down the channel.
+        let (agent, bridge) = plat::test_pair();
+        let done = relay_in_thread(bridge, std::io::empty());
+        assert!(done.recv_timeout(WAIT).is_ok(), "the bridge outlived its SSH channel");
+        assert_eq!(read_within(agent), Some(0), "the agent never learned the SSH channel closed");
+    }
+
+    #[test]
+    fn bridge_ends_when_the_agent_closes() {
+        let (agent, bridge) = plat::test_pair();
+        let done = relay_in_thread(bridge, Silent);
+        agent.close();
+        assert!(done.recv_timeout(WAIT).is_ok(), "the bridge kept waiting after the agent closed");
+    }
+
+    #[test]
+    fn serve_end_releases_its_reader_and_the_bridge() {
+        let (agent, bridge) = plat::test_pair();
+        let reader = BufReader::new(agent.split().unwrap());
+        let (tx, reader_done) = mpsc::channel();
+        // Like serve::run_on: a reader thread that ends only with the connection, then serve returns.
+        serve_then_close(reader, agent, move |mut input, _| {
+            std::thread::spawn(move || { let mut b = [0u8; 64]; while matches!(input.read(&mut b), Ok(n) if n > 0) {} let _ = tx.send(()); });
+        });
+        assert!(reader_done.recv_timeout(WAIT).is_ok(), "serve's reader thread outlived the stream");
+        assert_eq!(read_within(bridge), Some(0), "the bridge never saw the stream end");
     }
 }
