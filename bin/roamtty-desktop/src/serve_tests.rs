@@ -12,6 +12,8 @@ struct Screen {
     wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     cursors: AtomicU64,
     texts: AtomicU64,
+    /// What each frame encodes to, in bytes (0: a few).
+    frame_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl Screen {
@@ -31,7 +33,7 @@ impl Backend for Desktop {
         Ok(Frame { bgra: &[], w: 1920, h: 1080, stride: 7680,
             changed: Some(self.0.dirty.swap(false, Ordering::SeqCst)), shown_us: None })
     }
-    fn hw_encoder(&mut self) -> Option<Box<dyn VideoEncoder>> { Some(Box::new(Encoder)) }
+    fn hw_encoder(&mut self) -> Option<Box<dyn VideoEncoder>> { Some(Box::new(Encoder(self.0.clone()))) }
     fn on_frame(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
         if !self.1 { *self.0.wake.lock().unwrap() = Some(wake); }
     }
@@ -50,14 +52,16 @@ impl Backend for Desktop {
     fn clip_get(&mut self) -> Option<String> { None }
 }
 
-struct Encoder;
+struct Encoder(Arc<Screen>);
 impl VideoEncoder for Encoder {
     fn name(&self) -> &'static str { "test" }
     fn set_bitrate(&mut self, _: u32) {}
     fn set_fps(&mut self, _: f32) {}
     fn force_key(&mut self) {}
     fn encode(&mut self, _: &[u8], _: usize, _: usize, _: usize, _: usize, _: usize) -> Result<(Vec<u8>, bool), String> {
-        Ok((vec![0, 0, 0, 1, 0x61], false))
+        let mut data = vec![0, 0, 0, 1, 0x61];
+        data.resize(data.len().max(self.0.frame_bytes.load(Ordering::SeqCst)), 0);
+        Ok((data, false))
     }
 }
 
@@ -214,6 +218,109 @@ fn full_ack_window(polling: bool) {
     assert!(loops < if polling { 500 } else { 100 }, "blocked loop spun {loops} times in 250 ms");
     assert!(cpu < Duration::from_millis(75), "blocked loop burned {cpu:?} CPU in 250 ms");
     assert!(latency < Duration::from_millis(100), "ACK unnecessarily waited {latency:?}");
+}
+
+/// An encoder that makes about five times its bitrate (VideoToolbox with a keyframe a second, OpenH264
+/// on a busy screen): what goes out is held to the bitrate, and frames keep coming.
+#[test]
+fn an_overshooting_encoder_is_held_to_its_bitrate() {
+    let mut h = Harness::start();
+    let first = h.video();
+    // 流畅: 1 Mbps at most; the rate control settles there within a second.
+    proto::write_frame(&mut h.client, ty::CONFIG, br#"{"quality":"smooth"}"#).unwrap();
+    h.screen.frame_bytes.store(20_000, Ordering::SeqCst);
+    h.ack(first);
+    let run = |h: &mut Harness, d: Duration| {
+        let (start, mut bytes, mut frames) = (Instant::now(), 0usize, 0usize);
+        while start.elapsed() < d {
+            h.screen.draw();
+            let p = h.receive(ty::VIDEO);
+            h.ack(u32::from_be_bytes(p[..4].try_into().unwrap()));
+            bytes += p.len();
+            frames += 1;
+        }
+        (bytes as f64 * 8.0 / start.elapsed().as_secs_f64(), frames as f64 / start.elapsed().as_secs_f64())
+    };
+    run(&mut h, Duration::from_millis(1500));
+    let (bps, fps) = run(&mut h, Duration::from_secs(3));
+    h.stop();
+    println!("overshooting encoder: {:.2} Mbps at {fps:.1} fps for a 1 Mbps budget", bps / 1e6);
+    assert!(bps <= 1_250_000.0, "{:.2} Mbps went out for a 1 Mbps budget", bps / 1e6);
+    assert!(fps >= 3.0, "frames stopped: {fps:.1} fps");
+}
+
+/// The real VideoToolbox through the real loop: scrolling noise at 2772×1800 (原画 on this Mac), a
+/// keyframe asked for every second. Alone it made 24 Mbps of a 12 Mbps target. On a Mac:
+/// cargo test --release vt_through_serve -- --ignored --nocapture
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn vt_through_serve_holds_original_to_its_bitrate() {
+    const W: usize = 2772;
+    const H: usize = 1800;
+    struct Noisy { noise: Vec<u8>, i: usize }
+    impl Backend for Noisy {
+        fn kind(&self) -> &'static str { "test" }
+        fn displays(&self) -> Vec<proto::Display> {
+            vec![proto::Display { id: 0, w: W as u32, h: H as u32, scale: 1.0, x: 0, y: 0, primary: true, name: "test".into() }]
+        }
+        fn capture<'a>(&'a mut self, _: &proto::Display, _: &'a mut Vec<u8>) -> crate::backend::Result<Frame<'a>> {
+            self.i += 1;
+            let off = (self.i * 12 % H) * W * 4;
+            Ok(Frame { bgra: &self.noise[off..off + W * 4 * H], w: W, h: H, stride: W * 4, changed: Some(true), shown_us: None })
+        }
+        fn hw_encoder(&mut self) -> Option<Box<dyn VideoEncoder>> { Some(Box::new(crate::mac::VtEncoder::new())) }
+        fn cursor(&mut self) -> Option<Cursor> { None }
+        fn move_abs(&mut self, _: i32, _: i32) -> crate::backend::Result<()> { Ok(()) }
+        fn move_rel(&mut self, _: i16, _: i16) -> crate::backend::Result<()> { Ok(()) }
+        fn button(&mut self, _: u8, _: bool) -> crate::backend::Result<()> { Ok(()) }
+        fn wheel(&mut self, _: i16, _: i16) -> crate::backend::Result<()> { Ok(()) }
+        fn key(&mut self, _: u16, _: bool) -> crate::backend::Result<()> { Ok(()) }
+        fn text(&mut self, _: &str) -> crate::backend::Result<()> { Ok(()) }
+        fn tap(&mut self, _: &[u16]) -> crate::backend::Result<()> { Ok(()) }
+        fn flush(&mut self) {}
+        fn clip_set(&mut self, _: String) {}
+        fn clip_get(&mut self) -> Option<String> { None }
+    }
+    let mut noise = vec![0u8; W * 4 * H * 2];
+    let mut x = 0x2545F491u32;
+    for b in noise.iter_mut() { x ^= x << 13; x ^= x >> 17; x ^= x << 5; *b = x as u8; }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let args = Args { proto: proto::PROTO, client_long: W as u32, resume: None, token: None,
+        retired: Arc::new(AtomicU8::new(0)), claimed: Some(session::Session { session: "test".into(), resume_token: "test".into() }) };
+    let retired = args.retired.clone();
+    let worker = std::thread::spawn(move || run_with(args, Box::new(server.try_clone().unwrap()), Box::new(server),
+        move || Ok(Box::new(Noisy { noise, i: 0 })), |_| None));
+    let mut read = BufReader::new(client.try_clone().unwrap());
+    let mut hello = String::new();
+    read.read_line(&mut hello).unwrap();
+    proto::write_frame(&mut client, ty::CONFIG, br#"{"quality":"original","fps":30}"#).unwrap();
+    let mut run = |d: Duration| {
+        let (start, mut bytes, mut frames, mut asked) = (Instant::now(), 0usize, 0usize, Instant::now());
+        while start.elapsed() < d {
+            if asked.elapsed() >= Duration::from_secs(1) {
+                let (t, p) = proto::encode_client(&ClientMsg::Req(proto::req::KEYFRAME));
+                proto::write_frame(&mut client, t, &p).unwrap();
+                asked = Instant::now();
+            }
+            let (t, p) = proto::read_frame(&mut read).unwrap().expect("serve closed");
+            if t != ty::VIDEO { continue; }
+            let (at, ap) = proto::encode_client(&ClientMsg::Ack { frame: u32::from_be_bytes(p[..4].try_into().unwrap()), recv_us: 0, decoded_us: 0 });
+            proto::write_frame(&mut client, at, &ap).unwrap();
+            bytes += p.len();
+            frames += 1;
+        }
+        (bytes as f64 * 8.0 / start.elapsed().as_secs_f64(), frames as f64 / start.elapsed().as_secs_f64())
+    };
+    run(Duration::from_millis(1500));
+    let (bps, fps) = run(Duration::from_secs(6));
+    retired.store(2, Ordering::SeqCst);
+    let _ = client.shutdown(Shutdown::Both);
+    let _ = worker.join();
+    println!("videotoolbox through serve, 原画: {:.1} Mbps at {fps:.1} fps (budget 12 Mbps)", bps / 1e6);
+    assert!(bps <= 12_000_000.0 * 1.25, "{:.1} Mbps went out", bps / 1e6);
 }
 
 /// Compare before/after with identical synthetic frames and real protocol/pacing.
