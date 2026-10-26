@@ -7,7 +7,7 @@ use crate::backend::{Backend, Cursor, Frame, Result};
 use crate::encode::{to_i420, VideoEncoder};
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint};
 use objc2_core_graphics::{
@@ -22,7 +22,7 @@ use objc2_core_video::{
     CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
-use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
 };
@@ -34,7 +34,29 @@ use std::time::Duration;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    /// Private (HIServices): asks the Dock for one of its gestures by name.
+    fn CoreDockSendNotification(name: *const std::ffi::c_void, unknown: *const std::ffi::c_void) -> i32;
 }
+
+// Private (SkyLight, through CoreGraphics): the Spaces, which one is showing, and the user's keys
+// for System Settings' Mission Control shortcuts.
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGSMainConnectionID() -> i32;
+    fn CGSGetActiveSpace(cid: i32) -> u64;
+    fn CGSSpaceGetType(cid: i32, space: u64) -> i32;
+    fn CGSCopyManagedDisplaySpaces(cid: i32) -> *mut NSArray<NSDictionary<NSString, AnyObject>>;
+    fn CGSIsSymbolicHotKeyEnabled(hotkey: i32) -> bool;
+    fn CGSGetSymbolicHotKeyValue(hotkey: i32, character: *mut u16, key: *mut u16, flags: *mut u64) -> i32;
+}
+
+/// CGSSpaceGetType of an app's own full-screen Space (a desktop is 0).
+const SPACE_FULLSCREEN: i32 = 4;
+/// Symbolic hot keys "Move left a space" and "Move right a space" (Control+← and Control+→).
+const HOTKEY_SPACE_LEFT: i32 = 79;
+const HOTKEY_SPACE_RIGHT: i32 = 81;
+/// How long the Dock's slide to another Space takes, with a margin.
+const SPACE_SLIDE: Duration = Duration::from_millis(900);
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
@@ -321,6 +343,17 @@ fn hid_to_vk(hid: u16) -> Option<u16> {
     })
 }
 
+/// The flags a Mac keyboard sets on its own for a key: macOS matches its shortcuts (Control+← to
+/// move a Space, F11) with them, and without them a posted key reached only the app.
+fn key_flags(vk: u16) -> CGEventFlags {
+    match vk {
+        0x7B..=0x7E => CGEventFlags::MaskNumericPad | CGEventFlags::MaskSecondaryFn,
+        // Help, Home, Page Up, Forward Delete, End, Page Down; F1 to F12.
+        0x72..=0x75 | 0x77 | 0x79 | 0x7A | 0x78 | 0x63 | 0x76 | 0x60..=0x62 | 0x64 | 0x65 | 0x6D | 0x67 | 0x6F => CGEventFlags::MaskSecondaryFn,
+        _ => CGEventFlags::empty(),
+    }
+}
+
 fn modifier_flag(hid: u16) -> Option<CGEventFlags> {
     Some(match hid {
         0xE0 | 0xE4 => CGEventFlags::MaskControl,
@@ -427,7 +460,7 @@ impl Backend for Mac {
         if let Some(f) = modifier_flag(hid) { if down { self.flags |= f } else { self.flags &= !f } }
         let Some(vk) = hid_to_vk(hid) else { return Ok(()) };
         let e = CGEvent::new_keyboard_event(self.source.as_deref(), vk, down);
-        if let Some(e) = &e { CGEvent::set_flags(Some(e), self.flags); }
+        if let Some(e) = &e { CGEvent::set_flags(Some(e), self.flags | key_flags(vk)); }
         self.post(e);
         Ok(())
     }
@@ -477,22 +510,84 @@ impl Backend for Mac {
         unsafe { NSPasteboard::generalPasteboard().stringForType(NSPasteboardTypeString).map(|s| s.to_string()) }
     }
 
-    /// Through Mission Control, opened by Launch Services (argument 1 = show the desktop, none = all
-    /// windows; a second call closes it again): a posted F11 or Control+Up never reached the Dock's hot
-    /// keys, which also differ per user and keyboard, and on macOS 26 the app's binary run directly
-    /// does nothing.
+    /// Through the Dock's own notifications rather than its hot keys, which differ per user and
+    /// keyboard; `open -a "Mission Control" --args 1` lost its argument when Mission Control was
+    /// still running, so a second tap brought all windows instead. A full-screen app's Space has no
+    /// desktop to show (the Dock ignores the request there), so that goes to the nearest desktop
+    /// Space first.
     fn action(&mut self, action: u8) -> Result<()> {
-        let mut args = vec!["-a", "Mission Control"];
-        match action {
-            proto::action::SHOW_DESKTOP => args.extend(["--args", "1"]),
-            proto::action::ALL_WINDOWS => {}
+        let name = match action {
+            proto::action::SHOW_DESKTOP => {
+                if active_space_type() == SPACE_FULLSCREEN { self.to_desktop_space(); }
+                "com.apple.showdesktop.awake"
+            }
+            proto::action::ALL_WINDOWS => "com.apple.expose.awake",
             _ => return Ok(()),
-        }
-        // `open` returns at once; reap it on a thread so no zombie is left behind.
-        let mut child = std::process::Command::new("/usr/bin/open").args(&args).spawn().map_err(|e| e.to_string())?;
-        std::thread::spawn(move || { let _ = child.wait(); });
+        };
+        let name = CFString::from_str(name);
+        let r = unsafe { CoreDockSendNotification(CFRetained::as_ptr(&name).as_ptr() as *const _, std::ptr::null()) };
+        if r != 0 { return Err(format!("dock notification {r}")); }
         Ok(())
     }
+}
+
+impl Mac {
+    /// Moves a Space at a time with the user's own "Move left/right a space" keys. The Space shown
+    /// changes as the slide starts; a key or a show-desktop request sent before it ends (0.45 s was
+    /// too soon, 0.75 s enough) is lost, so each step waits for the change and then [`SPACE_SLIDE`].
+    /// Activating an app with a window on a desktop does not do: a Finder with no window stays put,
+    /// and some apps' windows follow to the active Space instead.
+    fn to_desktop_space(&self) {
+        let Some(steps) = steps_to_desktop() else { return };
+        let hotkey = if steps < 0 { HOTKEY_SPACE_LEFT } else { HOTKEY_SPACE_RIGHT };
+        let (mut key, mut flags) = (0u16, 0u64);
+        if !unsafe { CGSIsSymbolicHotKeyEnabled(hotkey) && CGSGetSymbolicHotKeyValue(hotkey, &mut 0, &mut key, &mut flags) == 0 } {
+            crate::log::line(&format!("show desktop: the Move a space shortcut ({hotkey}) is off"));
+            return;
+        }
+        let cid = unsafe { CGSMainConnectionID() };
+        for _ in 0..steps.abs() {
+            let from = unsafe { CGSGetActiveSpace(cid) };
+            for down in [true, false] {
+                let e = CGEvent::new_keyboard_event(self.source.as_deref(), key, down);
+                if let Some(e) = &e { CGEvent::set_flags(Some(e), CGEventFlags(flags)); }
+                self.post(e);
+            }
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(50));
+                if unsafe { CGSGetActiveSpace(cid) } != from { break; }
+            }
+            std::thread::sleep(SPACE_SLIDE);
+        }
+    }
+}
+
+fn active_space_type() -> i32 { unsafe { let cid = CGSMainConnectionID(); CGSSpaceGetType(cid, CGSGetActiveSpace(cid)) } }
+
+/// How many Spaces the nearest desktop is from the one showing, on its display: negative to the
+/// left (where a full-screen app's Space starts out, next to the desktop it came from).
+fn steps_to_desktop() -> Option<i32> {
+    let cid = unsafe { CGSMainConnectionID() };
+    let active = unsafe { CGSGetActiveSpace(cid) };
+    let displays = unsafe { Retained::from_raw(CGSCopyManagedDisplaySpaces(cid)) }?;
+    let number = |d: &NSDictionary<NSString, AnyObject>, k: &str| {
+        d.objectForKey(&NSString::from_str(k)).and_then(|v| v.downcast::<NSNumber>().ok()).map(|n| n.longLongValue())
+    };
+    for display in displays.iter() {
+        let Some(spaces) = display.objectForKey(&NSString::from_str("Spaces")).and_then(|v| v.downcast::<NSArray>().ok()) else { continue };
+        let spaces: Vec<(i64, i64)> = spaces.iter().filter_map(|s| s.downcast::<NSDictionary>().ok())
+            .map(|s| { let s: Retained<NSDictionary<NSString, AnyObject>> = unsafe { Retained::cast_unchecked(s) }; (number(&s, "id64").unwrap_or(-1), number(&s, "type").unwrap_or(-1)) })
+            .collect();
+        let Some(at) = spaces.iter().position(|&(id, _)| id == active as i64) else { continue };
+        return nearest_desktop(&spaces.iter().map(|&(_, ty)| ty).collect::<Vec<_>>(), at);
+    }
+    None
+}
+
+/// The offset from Space `at` to the nearest of the Spaces' types that is a desktop (0), the left
+/// one on a tie.
+fn nearest_desktop(types: &[i64], at: usize) -> Option<i32> {
+    (0..types.len() as i32).filter(|&i| types[i as usize] == 0).map(|i| i - at as i32).min_by_key(|d| (d.abs(), *d > 0))
 }
 
 /// H.264 through VideoToolbox: real time, no frame reordering, low-latency rate control, keyframes
@@ -945,5 +1040,13 @@ mod tests {
         println!("videotoolbox {w}x{h}@{fps}, target {} Mbps: {:.1} Mbps, {keys} keyframes of {} KB on average, other frames {:.1} Mbps",
             target / 1_000_000, bytes as f64 * 8.0 / seconds / 1e6, key_bytes / keys.max(1) / 1000, (bytes - key_bytes) as f64 * 8.0 / seconds / 1e6);
     }
-}
 
+    #[test]
+    fn nearest_desktop_space() {
+        // A desktop, then three full-screen apps.
+        assert_eq!(nearest_desktop(&[0, 4, 4, 4], 3), Some(-3));
+        assert_eq!(nearest_desktop(&[0, 4, 0, 4], 1), Some(-1));
+        assert_eq!(nearest_desktop(&[4, 0, 4, 4, 0], 3), Some(1));
+        assert_eq!(nearest_desktop(&[4, 4], 0), None);
+    }
+}
