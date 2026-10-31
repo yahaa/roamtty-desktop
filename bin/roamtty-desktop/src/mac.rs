@@ -48,6 +48,7 @@ extern "C" {
     fn CGSSpaceGetType(cid: i32, space: u64) -> i32;
     fn CGSCopyManagedDisplaySpaces(cid: i32) -> *mut NSArray<NSDictionary<NSString, AnyObject>>;
     fn CGSIsSymbolicHotKeyEnabled(hotkey: i32) -> bool;
+    fn CGSSetSymbolicHotKeyEnabled(hotkey: i32, enabled: bool) -> i32;
     fn CGSGetSymbolicHotKeyValue(hotkey: i32, character: *mut u16, key: *mut u16, flags: *mut u64) -> i32;
 }
 
@@ -56,6 +57,9 @@ const SPACE_FULLSCREEN: i32 = 4;
 /// Symbolic hot keys "Move left a space" and "Move right a space" (Control+← and Control+→).
 const HOTKEY_SPACE_LEFT: i32 = 79;
 const HOTKEY_SPACE_RIGHT: i32 = 81;
+/// Symbolic hot keys "Switch to Desktop 1" to "Switch to Desktop 16" (Control+1 and on, off by default).
+const HOTKEY_DESKTOP_1: i32 = 118;
+const HOTKEY_DESKTOP_LAST: i32 = 133;
 /// How long the Dock's slide to another Space takes, with a margin.
 const SPACE_SLIDE: Duration = Duration::from_millis(900);
 
@@ -577,40 +581,89 @@ fn dock(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Moves a Space at a time with the user's own "Move left/right a space" keys. The Space shown
-/// changes as the slide starts; a key or a show-desktop request sent before it ends (0.45 s was
-/// too soon, 0.75 s enough) is lost, so each step waits for the change and then [`SPACE_SLIDE`].
-/// Activating an app with a window on a desktop does not do: a Finder with no window stays put,
-/// and some apps' windows follow to the active Space instead.
+/// Goes to the nearest desktop Space. The Space shown changes as the slide starts; a key or a
+/// show-desktop request sent before it ends (0.45 s was too soon, 0.75 s enough) is lost, so each
+/// move waits for the change and then [`SPACE_SLIDE`].
+///
+/// One slide straight there with "Switch to Desktop N" (on for the moment it takes, if the user
+/// has it off): moving a Space at a time showed every full-screen app on the way, a couple of
+/// seconds each, as if switching windows. A Space at a time with the user's own "Move left/right
+/// a space" keys is what is left when that cannot be done. Activating an app with a window on a
+/// desktop does not do: a Finder with no window stays put, and some apps' windows follow to the
+/// active Space instead.
 fn to_desktop_space() {
-    let Some(steps) = steps_to_desktop() else { return };
+    let Some(target) = desktop_target() else { return };
+    if let Some(n) = target.number {
+        if jump_to_desktop(n) { return }
+    }
+    let steps = target.offset;
     let hotkey = if steps < 0 { HOTKEY_SPACE_LEFT } else { HOTKEY_SPACE_RIGHT };
-    let (mut key, mut flags) = (0u16, 0u64);
-    if !unsafe { CGSIsSymbolicHotKeyEnabled(hotkey) && CGSGetSymbolicHotKeyValue(hotkey, &mut 0, &mut key, &mut flags) == 0 } {
+    let Some((key, flags)) = hotkey_value(hotkey).filter(|_| unsafe { CGSIsSymbolicHotKeyEnabled(hotkey) }) else {
         crate::log::line(&format!("show desktop: the Move a space shortcut ({hotkey}) is off"));
         return;
-    }
+    };
+    for _ in 0..steps.abs() { press_and_slide(key, flags); }
+}
+
+/// "Switch to Desktop `n`", turned on just until the Space changes when it is off. False when it
+/// has no key or the Space did not change.
+fn jump_to_desktop(n: usize) -> bool {
+    let hotkey = HOTKEY_DESKTOP_1 + n as i32 - 1;
+    if hotkey > HOTKEY_DESKTOP_LAST { return false }
+    let Some((key, flags)) = hotkey_value(hotkey) else {
+        crate::log::line(&format!("show desktop: Switch to Desktop {n} has no key"));
+        return false;
+    };
+    let was_on = unsafe { CGSIsSymbolicHotKeyEnabled(hotkey) };
+    if !was_on { unsafe { CGSSetSymbolicHotKeyEnabled(hotkey, true) }; }
+    let moved = press_and_slide(key, flags);
+    if !was_on { unsafe { CGSSetSymbolicHotKeyEnabled(hotkey, false) }; }
+    if !moved { crate::log::line(&format!("show desktop: Switch to Desktop {n} did not move")); }
+    moved
+}
+
+/// The key and modifiers of a symbolic hot key, if it has a key (an unset one reads 0xFFFF).
+fn hotkey_value(hotkey: i32) -> Option<(u16, u64)> {
+    let (mut key, mut flags) = (0u16, 0u64);
+    let r = unsafe { CGSGetSymbolicHotKeyValue(hotkey, &mut 0, &mut key, &mut flags) };
+    (r == 0 && key != 0xFFFF).then_some((key, flags))
+}
+
+/// Posts a Spaces key, waits up to a second for the Space shown to change and then for the slide
+/// to end; true if it changed. The hot key is restored only after this, so it is still on when
+/// the Dock reads the key.
+fn press_and_slide(key: u16, flags: u64) -> bool {
     let cid = unsafe { CGSMainConnectionID() };
-    for _ in 0..steps.abs() {
-        let from = unsafe { CGSGetActiveSpace(cid) };
-        for down in [true, false] {
-            let e = CGEvent::new_keyboard_event(None, key, down);
-            if let Some(e) = &e { CGEvent::set_flags(Some(e), CGEventFlags(flags)); }
-            if let Some(e) = &e { CGEvent::post(CGEventTapLocation::HIDEventTap, Some(e)); }
-        }
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(50));
-            if unsafe { CGSGetActiveSpace(cid) } != from { break; }
-        }
-        std::thread::sleep(SPACE_SLIDE);
+    let from = unsafe { CGSGetActiveSpace(cid) };
+    for down in [true, false] {
+        let e = CGEvent::new_keyboard_event(None, key, down);
+        if let Some(e) = &e { CGEvent::set_flags(Some(e), CGEventFlags(flags)); }
+        if let Some(e) = &e { CGEvent::post(CGEventTapLocation::HIDEventTap, Some(e)); }
     }
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(50));
+        if unsafe { CGSGetActiveSpace(cid) } != from {
+            std::thread::sleep(SPACE_SLIDE);
+            return true;
+        }
+    }
+    false
 }
 
 fn active_space_type() -> i32 { unsafe { let cid = CGSMainConnectionID(); CGSSpaceGetType(cid, CGSGetActiveSpace(cid)) } }
 
-/// How many Spaces the nearest desktop is from the one showing, on its display: negative to the
-/// left (where a full-screen app's Space starts out, next to the desktop it came from).
-fn steps_to_desktop() -> Option<i32> {
+/// Where the nearest desktop Space is from the one showing, on its display.
+#[derive(Debug, PartialEq)]
+struct DesktopTarget {
+    /// In Spaces: negative to the left (where a full-screen app's Space starts out, next to the
+    /// desktop it came from).
+    offset: i32,
+    /// Its N in "Switch to Desktop N", with a single display only: with more, it is not certain
+    /// how the Dock numbers each display's desktops.
+    number: Option<usize>,
+}
+
+fn desktop_target() -> Option<DesktopTarget> {
     let cid = unsafe { CGSMainConnectionID() };
     let active = unsafe { CGSGetActiveSpace(cid) };
     let displays = unsafe { Retained::from_raw(CGSCopyManagedDisplaySpaces(cid)) }?;
@@ -623,9 +676,16 @@ fn steps_to_desktop() -> Option<i32> {
             .map(|s| { let s: Retained<NSDictionary<NSString, AnyObject>> = unsafe { Retained::cast_unchecked(s) }; (number(&s, "id64").unwrap_or(-1), number(&s, "type").unwrap_or(-1)) })
             .collect();
         let Some(at) = spaces.iter().position(|&(id, _)| id == active as i64) else { continue };
-        return nearest_desktop(&spaces.iter().map(|&(_, ty)| ty).collect::<Vec<_>>(), at);
+        return desktop_target_in(&spaces.iter().map(|&(_, ty)| ty).collect::<Vec<_>>(), at, displays.count() == 1);
     }
     None
+}
+
+fn desktop_target_in(types: &[i64], at: usize, single_display: bool) -> Option<DesktopTarget> {
+    let offset = nearest_desktop(types, at)?;
+    let index = (at as i32 + offset) as usize;
+    let number = single_display.then(|| types[..=index].iter().filter(|&&t| t == 0).count());
+    Some(DesktopTarget { offset, number })
 }
 
 /// The offset from Space `at` to the nearest of the Spaces' types that is a desktop (0), the left
@@ -1092,5 +1152,17 @@ mod tests {
         assert_eq!(nearest_desktop(&[0, 4, 0, 4], 1), Some(-1));
         assert_eq!(nearest_desktop(&[4, 0, 4, 4, 0], 3), Some(1));
         assert_eq!(nearest_desktop(&[4, 4], 0), None);
+    }
+
+    #[test]
+    fn desktop_target_numbers_the_desktop() {
+        // A desktop, then four full-screen apps: Desktop 1, however far along.
+        assert_eq!(desktop_target_in(&[0, 4, 4, 4, 4], 4, true), Some(DesktopTarget { offset: -4, number: Some(1) }));
+        // The second desktop is the nearer one: Desktop 2.
+        assert_eq!(desktop_target_in(&[0, 4, 0, 4, 4], 3, true), Some(DesktopTarget { offset: -1, number: Some(2) }));
+        assert_eq!(desktop_target_in(&[4, 0, 4, 4, 0], 3, true), Some(DesktopTarget { offset: 1, number: Some(2) }));
+        // More than one display: a Space at a time only.
+        assert_eq!(desktop_target_in(&[0, 4], 1, false), Some(DesktopTarget { offset: -1, number: None }));
+        assert_eq!(desktop_target_in(&[4, 4], 0, true), None);
     }
 }
