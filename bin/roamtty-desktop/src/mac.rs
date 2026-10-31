@@ -28,6 +28,7 @@ use objc2_screen_capture_kit::{
 };
 use proto::Display;
 use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -197,6 +198,8 @@ pub struct Mac {
     source: Option<CFRetained<CGEventSource>>,
     flags: CGEventFlags,
     buttons: [bool; 3],
+    /// A show-desktop is on its way (see `action`).
+    showing: Arc<std::sync::atomic::AtomicBool>,
     /// The last press (button, when, where, its click count): macOS counts clicks only if told.
     last_press: Option<(u8, std::time::Instant, CGPoint, i64)>,
     wheel: (i32, i32),
@@ -244,7 +247,7 @@ impl Mac {
         }).collect();
         if displays.is_empty() { return Err("no display".into()); }
         let source = CGEventSource::new(objc2_core_graphics::CGEventSourceStateID::HIDSystemState);
-        let mut m = Mac { _awake: awake, displays, capture: None, source, flags: CGEventFlags::empty(), buttons: [false; 3],
+        let mut m = Mac { _awake: awake, displays, capture: None, source, flags: CGEventFlags::empty(), buttons: [false; 3], showing: Arc::default(),
             last_press: None, wheel: (0, 0), last_cursor: None, denied: false, slot: Arc::new(GpuSlot::default()), wake: Wake::default(), taken: 0 };
         // Try the main display now, so the hello's `needs` says what ScreenCaptureKit really thinks.
         let main = m.displays.iter().map(|(_, d)| d.clone()).find(|d| d.primary).unwrap();
@@ -540,49 +543,66 @@ impl Backend for Mac {
     /// desktop to show (the Dock ignores the request there), so that goes to the nearest desktop
     /// Space first.
     fn action(&mut self, action: u8) -> Result<()> {
-        let name = match action {
+        match action {
             proto::action::SHOW_DESKTOP => {
-                if active_space_type() == SPACE_FULLSCREEN { self.to_desktop_space(); }
-                "com.apple.showdesktop.awake"
+                // From a full-screen app's Space it takes seconds (each Space's slide): off the serve thread,
+                // so the picture keeps coming, and once at a time: a tap while it runs would undo it.
+                if self.showing.swap(true, Ordering::AcqRel) {
+                    crate::log::line("show desktop: one is still on its way");
+                    return Ok(());
+                }
+                if active_space_type() != SPACE_FULLSCREEN {
+                    let r = dock("com.apple.showdesktop.awake");
+                    self.showing.store(false, Ordering::Release);
+                    return r;
+                }
+                let showing = self.showing.clone();
+                std::thread::spawn(move || {
+                    to_desktop_space();
+                    if let Err(e) = dock("com.apple.showdesktop.awake") { crate::log::line(&format!("show desktop: {e}")); }
+                    showing.store(false, Ordering::Release);
+                });
+                Ok(())
             }
-            proto::action::ALL_WINDOWS => "com.apple.expose.awake",
-            _ => return Ok(()),
-        };
-        let name = CFString::from_str(name);
-        let r = unsafe { CoreDockSendNotification(CFRetained::as_ptr(&name).as_ptr() as *const _, std::ptr::null()) };
-        if r != 0 { return Err(format!("dock notification {r}")); }
-        Ok(())
+            proto::action::ALL_WINDOWS => dock("com.apple.expose.awake"),
+            _ => Ok(()),
+        }
     }
 }
 
-impl Mac {
-    /// Moves a Space at a time with the user's own "Move left/right a space" keys. The Space shown
-    /// changes as the slide starts; a key or a show-desktop request sent before it ends (0.45 s was
-    /// too soon, 0.75 s enough) is lost, so each step waits for the change and then [`SPACE_SLIDE`].
-    /// Activating an app with a window on a desktop does not do: a Finder with no window stays put,
-    /// and some apps' windows follow to the active Space instead.
-    fn to_desktop_space(&self) {
-        let Some(steps) = steps_to_desktop() else { return };
-        let hotkey = if steps < 0 { HOTKEY_SPACE_LEFT } else { HOTKEY_SPACE_RIGHT };
-        let (mut key, mut flags) = (0u16, 0u64);
-        if !unsafe { CGSIsSymbolicHotKeyEnabled(hotkey) && CGSGetSymbolicHotKeyValue(hotkey, &mut 0, &mut key, &mut flags) == 0 } {
-            crate::log::line(&format!("show desktop: the Move a space shortcut ({hotkey}) is off"));
-            return;
+fn dock(name: &str) -> Result<()> {
+    let name = CFString::from_str(name);
+    let r = unsafe { CoreDockSendNotification(CFRetained::as_ptr(&name).as_ptr() as *const _, std::ptr::null()) };
+    if r != 0 { return Err(format!("dock notification {r}")); }
+    Ok(())
+}
+
+/// Moves a Space at a time with the user's own "Move left/right a space" keys. The Space shown
+/// changes as the slide starts; a key or a show-desktop request sent before it ends (0.45 s was
+/// too soon, 0.75 s enough) is lost, so each step waits for the change and then [`SPACE_SLIDE`].
+/// Activating an app with a window on a desktop does not do: a Finder with no window stays put,
+/// and some apps' windows follow to the active Space instead.
+fn to_desktop_space() {
+    let Some(steps) = steps_to_desktop() else { return };
+    let hotkey = if steps < 0 { HOTKEY_SPACE_LEFT } else { HOTKEY_SPACE_RIGHT };
+    let (mut key, mut flags) = (0u16, 0u64);
+    if !unsafe { CGSIsSymbolicHotKeyEnabled(hotkey) && CGSGetSymbolicHotKeyValue(hotkey, &mut 0, &mut key, &mut flags) == 0 } {
+        crate::log::line(&format!("show desktop: the Move a space shortcut ({hotkey}) is off"));
+        return;
+    }
+    let cid = unsafe { CGSMainConnectionID() };
+    for _ in 0..steps.abs() {
+        let from = unsafe { CGSGetActiveSpace(cid) };
+        for down in [true, false] {
+            let e = CGEvent::new_keyboard_event(None, key, down);
+            if let Some(e) = &e { CGEvent::set_flags(Some(e), CGEventFlags(flags)); }
+            if let Some(e) = &e { CGEvent::post(CGEventTapLocation::HIDEventTap, Some(e)); }
         }
-        let cid = unsafe { CGSMainConnectionID() };
-        for _ in 0..steps.abs() {
-            let from = unsafe { CGSGetActiveSpace(cid) };
-            for down in [true, false] {
-                let e = CGEvent::new_keyboard_event(self.source.as_deref(), key, down);
-                if let Some(e) = &e { CGEvent::set_flags(Some(e), CGEventFlags(flags)); }
-                self.post(e);
-            }
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(50));
-                if unsafe { CGSGetActiveSpace(cid) } != from { break; }
-            }
-            std::thread::sleep(SPACE_SLIDE);
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            if unsafe { CGSGetActiveSpace(cid) } != from { break; }
         }
+        std::thread::sleep(SPACE_SLIDE);
     }
 }
 
