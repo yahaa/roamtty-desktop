@@ -13,7 +13,7 @@ use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFStr
 use objc2_core_graphics::{
     CGDisplayBounds, CGDisplayPixelsWide, CGEvent, CGEventFlags, CGEventSource, CGEventTapLocation,
     CGEventType, CGGetActiveDisplayList, CGMainDisplayID, CGMouseButton, CGPreflightScreenCaptureAccess,
-    CGRequestScreenCaptureAccess, CGScrollEventUnit,
+    CGEventField, CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
 use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
 use objc2_core_media::{CMBlockBuffer, CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
@@ -200,6 +200,8 @@ pub struct Mac {
     buttons: [bool; 3],
     /// A show-desktop is on its way (see `action`).
     showing: Arc<std::sync::atomic::AtomicBool>,
+    /// The last press (button, when, where, its click count): macOS counts clicks only if told.
+    last_press: Option<(u8, std::time::Instant, CGPoint, i64)>,
     wheel: (i32, i32),
     last_cursor: Option<(i32, i32)>,
     /// ScreenCaptureKit refused (TCC): its answer beats CGPreflightScreenCaptureAccess, which can disagree.
@@ -246,7 +248,7 @@ impl Mac {
         if displays.is_empty() { return Err("no display".into()); }
         let source = CGEventSource::new(objc2_core_graphics::CGEventSourceStateID::HIDSystemState);
         let mut m = Mac { _awake: awake, displays, capture: None, source, flags: CGEventFlags::empty(), buttons: [false; 3], showing: Arc::default(),
-            wheel: (0, 0), last_cursor: None, denied: false, slot: Arc::new(GpuSlot::default()), wake: Wake::default(), taken: 0 };
+            last_press: None, wheel: (0, 0), last_cursor: None, denied: false, slot: Arc::new(GpuSlot::default()), wake: Wake::default(), taken: 0 };
         // Try the main display now, so the hello's `needs` says what ScreenCaptureKit really thinks.
         let main = m.displays.iter().map(|(_, d)| d.clone()).find(|d| d.primary).unwrap();
         if let Err(e) = m.start_capture(&main) { crate::log!("capture probe: {e}"); }
@@ -296,14 +298,35 @@ impl Mac {
         if let Some(e) = e { CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&e)); }
     }
 
-    fn mouse(&self, ty: CGEventType, at: CGPoint, button: CGMouseButton) {
+    fn mouse(&self, ty: CGEventType, at: CGPoint, button: CGMouseButton) { self.mouse_clicks(ty, at, button, 0) }
+
+    /// `clicks`: the click count of a press or release (kCGMouseEventClickState). Left at 0, apps see
+    /// no double click at all, and some controls (window buttons) ignore the click.
+    fn mouse_clicks(&self, ty: CGEventType, at: CGPoint, button: CGMouseButton, clicks: i64) {
         let e = CGEvent::new_mouse_event(self.source.as_deref(), ty, at, button);
-        if let Some(e) = &e { CGEvent::set_flags(Some(e), self.flags); }
+        if let Some(e) = &e {
+            CGEvent::set_flags(Some(e), self.flags);
+            if clicks > 0 { CGEvent::set_integer_value_field(Some(e), CGEventField::MouseEventClickState, clicks); }
+        }
         self.post(e);
     }
 
     fn location(&self) -> CGPoint {
         CGEvent::new(None).map(|e| CGEvent::location(Some(&e))).unwrap_or(CGPoint { x: 0.0, y: 0.0 })
+    }
+
+    /// A press soon after and close to the last one of the same button counts one more, as macOS's own
+    /// mouse does (within its double-click time, about half a second); its release carries the same count.
+    fn click_count(&mut self, button: u8, down: bool, at: CGPoint) -> i64 {
+        let last = self.last_press.filter(|l| l.0 == button);
+        if !down { return last.map_or(1, |l| l.3); }
+        let clicks = match last {
+            Some((_, when, p, n)) if when.elapsed() < Duration::from_millis(500)
+                && (p.x - at.x).abs() <= 4.0 && (p.y - at.y).abs() <= 4.0 => n + 1,
+            _ => 1,
+        };
+        self.last_press = Some((button, std::time::Instant::now(), at, clicks));
+        clicks
     }
 }
 
@@ -446,7 +469,8 @@ impl Backend for Mac {
             _ => return Ok(()),
         };
         if (1..=3).contains(&button) { self.buttons[button as usize - 1] = down; }
-        self.mouse(ty, at, b);
+        let clicks = self.click_count(button, down, at);
+        self.mouse_clicks(ty, at, b, clicks);
         Ok(())
     }
 
