@@ -1112,6 +1112,18 @@ fn spawn_mic_accept_loop(
     });
 }
 
+fn write_spk_err_and_close(stream: &mut TcpStream, reason: &str) {
+    let _ = stream.set_write_timeout(Some(MIC_WRITE_TIMEOUT));
+    let _ = stream.write_all(&format_spk_err(reason));
+    let _ = stream.flush();
+    // Half-close write and drain any unread bytes (such as peeked invalid headers) before drop
+    // so peers (especially Winsock) receive the ERR line followed by clean FIN instead of RST.
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut drain = [0u8; 512];
+    while matches!(stream.read(&mut drain), Ok(n) if n > 0) {}
+}
+
 fn handle_agy_conn(
     mut stream: TcpStream,
     next_stream_id: &AtomicU32,
@@ -1123,10 +1135,7 @@ fn handle_agy_conn(
             let _ = stream.shutdown(Shutdown::Both);
         }
         ConnKind::Invalid => {
-            let _ = stream.set_write_timeout(Some(MIC_WRITE_TIMEOUT));
-            let _ = stream.write_all(&format_spk_err("invalid header"));
-            let _ = stream.flush();
-            let _ = stream.shutdown(Shutdown::Both);
+            write_spk_err_and_close(&mut stream, "invalid header");
         }
         ConnKind::Speaker => handle_speaker_conn(stream, next_stream_id, ev_tx, shutdown),
         ConnKind::Mic => handle_mic_conn(stream, next_stream_id, ev_tx, shutdown),
@@ -1148,9 +1157,7 @@ fn handle_speaker_conn(
     let sample_rate = match read_speaker_header(&mut reader, &shutdown) {
         Ok(rate) => rate,
         Err(reason) => {
-            let _ = write_half.write_all(&format_spk_err(reason));
-            let _ = write_half.flush();
-            let _ = write_half.shutdown(Shutdown::Both);
+            write_spk_err_and_close(&mut write_half, reason);
             return;
         }
     };
@@ -1168,9 +1175,7 @@ fn handle_speaker_conn(
         })
         .is_err()
     {
-        let _ = write_half.write_all(&format_spk_err("bridge unavailable"));
-        let _ = write_half.flush();
-        let _ = write_half.shutdown(Shutdown::Both);
+        write_spk_err_and_close(&mut write_half, "bridge unavailable");
         return;
     }
 
@@ -1183,16 +1188,12 @@ fn handle_speaker_conn(
             }
         }
         Ok((false, err)) => {
-            let _ = write_half.write_all(&format_spk_err(&err));
-            let _ = write_half.flush();
-            let _ = write_half.shutdown(Shutdown::Both);
+            write_spk_err_and_close(&mut write_half, &err);
             let _ = ev_tx.send(Event::AgySpkClosed { stream_id, notify_client: false });
             return;
         }
         Err(_) => {
-            let _ = write_half.write_all(&format_spk_err("speaker ack timeout"));
-            let _ = write_half.flush();
-            let _ = write_half.shutdown(Shutdown::Both);
+            write_spk_err_and_close(&mut write_half, "speaker ack timeout");
             let _ = ev_tx.send(Event::AgySpkClosed { stream_id, notify_client: true });
             return;
         }
