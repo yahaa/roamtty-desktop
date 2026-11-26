@@ -257,6 +257,7 @@ impl UdpLink {
             && now_us().saturating_sub(self.last_rx.load(Ordering::Relaxed)) < ALIVE_US
     }
 
+    pub fn ever_received(&self) -> bool { self.last_rx.load(Ordering::Relaxed) != 0 }
     pub fn silent_us(&self) -> u64 { now_us().saturating_sub(self.last_rx.load(Ordering::Relaxed)) }
     pub fn rtt_ms(&self) -> u64 { self.rtt_us.load(Ordering::Relaxed) / 1000 }
     pub fn stats(&self) -> LinkStats { self.stats.lock().unwrap().clone() }
@@ -326,9 +327,15 @@ impl UdpLink {
         let (flags, ratio) = match ty {
             proto::ty::VIDEO if keyframe => (FLAG_VIDEO, self.gcc.lock().unwrap().fec.max(0.30)),
             proto::ty::VIDEO => (FLAG_VIDEO, self.gcc.lock().unwrap().fec),
-            proto::ty::STATE | proto::ty::CURSOR_SHAPE => (FLAG_RELIABLE, 1.0),
+            proto::ty::STATE
+            | proto::ty::CURSOR_SHAPE
+            | proto::ty::MIC_START
+            | proto::ty::MIC_STOP
+            | proto::ty::SPK_START
+            | proto::ty::SPK_CLEAR
+            | proto::ty::SPK_STOP => (FLAG_RELIABLE, 1.0),
             // A packet is one datagram and a resend would come too late to play: send it twice.
-            proto::ty::AUDIO => (0, 1.0),
+            proto::ty::AUDIO | proto::ty::SPK_AUDIO => (0, 1.0),
             _ => (0, 0.0),
         };
         let video = flags & FLAG_VIDEO != 0;

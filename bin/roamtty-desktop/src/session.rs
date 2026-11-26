@@ -41,7 +41,7 @@ pub fn b64(b: &[u8]) -> String {
     s
 }
 
-fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+pub fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 
 #[cfg(unix)]
 fn is_serve(pid: i32) -> bool {

@@ -21,11 +21,19 @@ pub mod ty {
     pub const CLIP_SET: u8 = 0x06;
     pub const PING: u8 = 0x07;
     pub const PONG: u8 = 0x08;
+    pub const MIC_AUDIO: u8 = 0x10;
+    pub const SPK_ACK: u8 = 0x11;
     pub const VIDEO: u8 = 0x81;
     pub const CURSOR_POS: u8 = 0x82;
     pub const CURSOR_SHAPE: u8 = 0x83;
     pub const STATE: u8 = 0x84;
     pub const AUDIO: u8 = 0x85;
+    pub const MIC_START: u8 = 0x90;
+    pub const MIC_STOP: u8 = 0x91;
+    pub const SPK_START: u8 = 0x92;
+    pub const SPK_AUDIO: u8 = 0x93;
+    pub const SPK_CLEAR: u8 = 0x94;
+    pub const SPK_STOP: u8 = 0x95;
 }
 
 pub mod req {
@@ -79,6 +87,21 @@ pub struct Hello {
     /// The host's sound, when it can capture it: `["opus"]`. Absent on plugins without audio.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub audio: Vec<String>,
+}
+
+/// First stdout line of `roamtty-desktop voice`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceHello {
+    pub proto: u32,
+    pub ver: String,
+    pub os: String,
+    pub mode: String,
+    pub mic_port: u16,
+    pub session: String,
+    pub resume_token: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub udp: Option<Udp>,
+    pub codecs: Vec<String>,
 }
 
 /// The first stdout line when `serve` cannot start.
@@ -138,6 +161,8 @@ pub enum ClientMsg {
     ClipSet(String),
     Ping(u64),
     Pong { t1: u64, t2: u64, t3: u64 },
+    MicAudio { stream_id: u32, pcm: Vec<u8> },
+    SpkAck { stream_id: u32, ok: bool, error: String },
     Unknown(u8),
 }
 
@@ -190,6 +215,7 @@ impl Cur<'_> {
     fn u16(&mut self) -> io::Result<u16> { Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap())) }
     fn i16(&mut self) -> io::Result<i16> { Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap())) }
     fn u32(&mut self) -> io::Result<u32> { Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap())) }
+    fn u32_le(&mut self) -> io::Result<u32> { Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap())) }
     fn u64(&mut self) -> io::Result<u64> { Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap())) }
 }
 
@@ -220,6 +246,13 @@ pub fn decode_client(ty: u8, p: &[u8]) -> io::Result<ClientMsg> {
         ty::CLIP_SET => ClientMsg::ClipSet(text(p)?),
         ty::PING => ClientMsg::Ping(c.u64()?),
         ty::PONG => ClientMsg::Pong { t1: c.u64()?, t2: c.u64()?, t3: c.u64()? },
+        ty::MIC_AUDIO => ClientMsg::MicAudio { stream_id: c.u32_le()?, pcm: c.0.to_vec() },
+        ty::SPK_ACK => {
+            let stream_id = c.u32_le()?;
+            let ok = c.u8()? != 0;
+            let error = text(c.0)?;
+            ClientMsg::SpkAck { stream_id, ok, error }
+        }
         other => ClientMsg::Unknown(other),
     })
 }
@@ -248,6 +281,12 @@ pub fn encode_client(m: &ClientMsg) -> (u8, Vec<u8>) {
         ClientMsg::ClipSet(s) => { v.extend(s.as_bytes()); ty::CLIP_SET }
         ClientMsg::Ping(t1) => { v.extend(t1.to_be_bytes()); ty::PING }
         ClientMsg::Pong { t1, t2, t3 } => { v.extend(t1.to_be_bytes()); v.extend(t2.to_be_bytes()); v.extend(t3.to_be_bytes()); ty::PONG }
+        ClientMsg::MicAudio { stream_id, pcm } => {
+            v.extend(stream_id.to_le_bytes()); v.extend_from_slice(pcm); ty::MIC_AUDIO
+        }
+        ClientMsg::SpkAck { stream_id, ok, error } => {
+            v.extend(stream_id.to_le_bytes()); v.push(*ok as u8); v.extend_from_slice(error.as_bytes()); ty::SPK_ACK
+        }
         ClientMsg::Unknown(t) => *t,
     };
     (t, v)
@@ -300,6 +339,41 @@ pub fn pong_payload(t1: u64, t2: u64, t3: u64) -> Vec<u8> {
         p.extend(n.to_be_bytes());
     }
     p
+}
+
+pub fn mic_start_payload(stream_id: u32, sample_rate: u32, channels: u8) -> Vec<u8> {
+    let mut p = Vec::with_capacity(9);
+    p.extend(stream_id.to_le_bytes());
+    p.extend(sample_rate.to_le_bytes());
+    p.push(channels);
+    p
+}
+
+pub fn mic_stop_payload(stream_id: u32) -> Vec<u8> {
+    stream_id.to_le_bytes().to_vec()
+}
+
+pub fn spk_start_payload(stream_id: u32, sample_rate: u32, channels: u8) -> Vec<u8> {
+    let mut p = Vec::with_capacity(9);
+    p.extend(stream_id.to_le_bytes());
+    p.extend(sample_rate.to_le_bytes());
+    p.push(channels);
+    p
+}
+
+pub fn spk_audio_payload(stream_id: u32, pcm: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(4 + pcm.len());
+    p.extend(stream_id.to_le_bytes());
+    p.extend_from_slice(pcm);
+    p
+}
+
+pub fn spk_clear_payload(stream_id: u32) -> Vec<u8> {
+    stream_id.to_le_bytes().to_vec()
+}
+
+pub fn spk_stop_payload(stream_id: u32) -> Vec<u8> {
+    stream_id.to_le_bytes().to_vec()
 }
 
 #[cfg(test)]
@@ -398,5 +472,53 @@ mod tests {
     #[test]
     fn end_of_stream_is_none() {
         assert!(read_frame(&mut [].as_slice()).unwrap().is_none());
+    }
+
+    #[test]
+    fn voice_frames_layout_and_roundtrip() {
+        // C->S MIC_AUDIO (0x10): stream_id u32 LE + raw PCM
+        let pcm = vec![0x01, 0x02, 0xFE, 0xFF];
+        let msg = ClientMsg::MicAudio { stream_id: 0x0102_0304, pcm: pcm.clone() };
+        let (t, p) = encode_client(&msg);
+        assert_eq!(t, ty::MIC_AUDIO);
+        assert_eq!(t, 0x10);
+        assert_eq!(p, vec![0x04, 0x03, 0x02, 0x01, 0x01, 0x02, 0xFE, 0xFF]);
+        assert_eq!(decode_client(t, &p).unwrap(), msg);
+
+        // C->S SPK_ACK (0x11): stream_id u32 LE + ok u8 + utf8 err
+        let ok_ack = ClientMsg::SpkAck { stream_id: 7, ok: true, error: String::new() };
+        let (t, p) = encode_client(&ok_ack);
+        assert_eq!(t, ty::SPK_ACK);
+        assert_eq!(t, 0x11);
+        assert_eq!(p, vec![7, 0, 0, 0, 1]);
+        assert_eq!(decode_client(t, &p).unwrap(), ok_ack);
+
+        let err_ack = ClientMsg::SpkAck { stream_id: 9, ok: false, error: "busy".into() };
+        let (t, p) = encode_client(&err_ack);
+        assert_eq!(p, vec![9, 0, 0, 0, 0, b'b', b'u', b's', b'y']);
+        assert_eq!(decode_client(t, &p).unwrap(), err_ack);
+
+        // S->C payloads: all u32 LE
+        assert_eq!(mic_start_payload(1, 16000, 1), vec![1, 0, 0, 0, 0x80, 0x3E, 0, 0, 1]);
+        assert_eq!(mic_stop_payload(1), vec![1, 0, 0, 0]);
+        assert_eq!(spk_start_payload(2, 24000, 1), vec![2, 0, 0, 0, 0xC0, 0x5D, 0, 0, 1]);
+        assert_eq!(spk_audio_payload(2, &[0x11, 0x22]), vec![2, 0, 0, 0, 0x11, 0x22]);
+        assert_eq!(spk_clear_payload(2), vec![2, 0, 0, 0]);
+        assert_eq!(spk_stop_payload(2), vec![2, 0, 0, 0]);
+
+        // VoiceHello JSON roundtrip
+        let vh = VoiceHello {
+            proto: 1,
+            ver: "0.9.7".into(),
+            os: "macos".into(),
+            mode: "voice".into(),
+            mic_port: 24713,
+            session: "abcd1234".into(),
+            resume_token: "AAAAAAAAAAAAAAAAAAAAAA==".into(),
+            udp: Some(Udp { port: 60123, key: "AAAAAAAAAAAAAAAAAAAAAA==".into() }),
+            codecs: vec!["pcm16".into()],
+        };
+        let s = serde_json::to_string(&vh).unwrap();
+        assert_eq!(serde_json::from_str::<VoiceHello>(&s).unwrap(), vh);
     }
 }

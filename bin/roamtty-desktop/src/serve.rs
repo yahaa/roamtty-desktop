@@ -417,7 +417,10 @@ fn run_with(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dy
                     for p in &packets { out.emit(ty::AUDIO, p); }
                     out.flush();
                 }
-                ClientMsg::Pong { .. } | ClientMsg::Unknown(_) => {}
+                ClientMsg::Pong { .. }
+                | ClientMsg::MicAudio { .. }
+                | ClientMsg::SpkAck { .. }
+                | ClientMsg::Unknown(_) => {}
             }
             Some(false)
         };

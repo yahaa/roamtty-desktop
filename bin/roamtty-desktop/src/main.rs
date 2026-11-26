@@ -10,6 +10,7 @@ mod paths;
 mod serve;
 mod session;
 mod udp_link;
+mod voice;
 #[cfg(any(target_os = "linux", windows))]
 mod openh264enc;
 #[cfg(windows)]
@@ -78,7 +79,7 @@ pub fn open_desktop() -> Result<Box<dyn backend::Backend>, (&'static str, String
 const OPENH264_URL: &str = "https://ciscobinary.openh264.org";
 
 fn usage() -> i32 {
-    eprintln!("usage: roamtty-desktop serve --proto N --client WxH@DPI [--resume S --token T]\n       roamtty-desktop doctor [--json] | install [--openh264 FILE.bz2] | uninstall | --version");
+    eprintln!("usage: roamtty-desktop serve --proto N --client WxH@DPI [--resume S --token T]\n       roamtty-desktop voice --proto N [--port P] [--resume S --token T] [--idle-timeout SEC]\n       roamtty-desktop doctor [--json] | install [--openh264 FILE.bz2] | uninstall | --version");
     2
 }
 
@@ -90,6 +91,8 @@ fn main() {
             0
         }
         Some("serve") => serve_cmd(&args[1..]),
+        Some("voice") => voice::cmd(&args[1..]),
+        Some("voice-daemon") => voice::daemon_cmd(&args[1..]),
         #[cfg(any(target_os = "macos", windows))]
         Some("agent") => agent::run(&args[1..]),
         #[cfg(windows)]
