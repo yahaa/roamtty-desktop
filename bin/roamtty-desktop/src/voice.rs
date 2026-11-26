@@ -143,7 +143,15 @@ fn evict_idle_daemons_on_port(port: u16) {
         let mut conn = match ipc::connect(&sess) {
             Ok(c) => c,
             Err(e) => {
-                if matches!(e.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound) {
+                // On Windows, connecting to an unused loopback TCP port takes ~1s to return WSAECONNREFUSED,
+                // so our 300ms loopback connect_timeout surfaces TimedOut for dead IPC ports.
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::InvalidData
+                ) {
                     ipc::cleanup(&sess);
                 }
                 continue;
