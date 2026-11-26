@@ -172,7 +172,7 @@ ssh exec ~/.roamtty/bin/roamtty-desktop voice --proto 1 [--port 24713] [--resume
 First stdout line (UTF-8 JSON + `\n`):
 
 ```json
-{"proto":1,"ver":"0.9.7","os":"macos","mode":"voice","mic_port":24713,"session":"9f2c…","resume_token":"base64(16 bytes)","udp":{"port":60123,"key":"base64(16 bytes)"},"codecs":["pcm16"]}
+{"proto":1,"ver":"0.9.8","os":"macos","mode":"voice","mic_port":24713,"session":"9f2c…","resume_token":"base64(16 bytes)","udp":{"port":60123,"key":"base64(16 bytes)"},"codecs":["pcm16"]}
 ```
 
 - Listens on `127.0.0.1:<mic_port>` (prefers `--port`, defaults to `24713`, falls back to ephemeral port `0` if busy).
