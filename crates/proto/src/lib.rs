@@ -512,7 +512,7 @@ mod tests {
         // VoiceHello JSON roundtrip
         let vh = VoiceHello {
             proto: 1,
-            ver: "0.9.9".into(),
+            ver: "0.9.10".into(),
             os: "macos".into(),
             mode: "voice".into(),
             mic_port: 24713,

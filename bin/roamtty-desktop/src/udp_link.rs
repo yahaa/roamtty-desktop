@@ -8,8 +8,8 @@ use proto::ClientMsg;
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub const PORTS: std::ops::Range<u16> = 60000..61000;
@@ -51,8 +51,57 @@ fn now_us() -> u64 { crate::serve::now_us() }
 /// then), so they, not the parity that keeps arriving, span first_us..last_us.
 struct Sent { frame_bytes: usize, last_us: u64, data: usize }
 
-/// A reliable message's packets, when they last went out and how many times they were resent.
-type Unacked = (Vec<Vec<u8>>, Instant, u32);
+/// A reliable message awaiting RACK: its original protocol frame (type, payload) for SSH fallback
+/// if retries exhaust, its encoded UDP shard packets, when they last went out, and resend count.
+struct Unacked {
+    ty: u8,
+    payload: Vec<u8>,
+    packets: Vec<Vec<u8>>,
+    at: Instant,
+    tries: u32,
+}
+
+/// Cap on queued `SPK_AUDIO` datagrams inside the UDP pacer (enough for a full 1 MiB burst at
+/// FEC 1.0 without overflowing memory under sustained floods).
+const MAX_PACED_SPK_PACKETS: usize = 2560;
+/// Overhead added when sealing a plaintext packet (9-byte header + 16-byte AES-GCM tag).
+const SEAL_OVERHEAD: usize = 25;
+
+struct Pacer {
+    state: Mutex<PacerState>,
+    cvar: Condvar,
+}
+
+struct PacerState {
+    queue: VecDeque<(bool, Vec<u8>)>, // (is_spk_audio, plaintext packet)
+    spk_queued: usize,
+    tokens: f64,
+    last: Instant,
+    closed: bool,
+}
+
+impl Pacer {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PacerState {
+                queue: VecDeque::new(),
+                spk_queued: 0,
+                tokens: (BURST * DATAGRAM) as f64,
+                last: Instant::now(),
+                closed: false,
+            }),
+            cvar: Condvar::new(),
+        })
+    }
+
+    fn clear_spk_audio(&self) {
+        let mut s = self.state.lock().unwrap();
+        if s.spk_queued > 0 {
+            s.queue.retain(|(is_spk, _)| !*is_spk);
+            s.spk_queued = 0;
+        }
+    }
+}
 
 /// The last [History::KEEP] shards sent, by (msg, block, index), for NACKs to find at once.
 #[derive(Default)]
@@ -195,7 +244,7 @@ pub struct UdpLink {
     /// Reliable messages' packets until acknowledged, with when they were last sent and how often.
     reliable: Mutex<HashMap<u32, Unacked>>,
     gcc: Mutex<Gcc>,
-    pace: Mutex<Option<Sender<Vec<u8>>>>,
+    pace: Mutex<Option<Arc<Pacer>>>,
     pace_rate: AtomicU64,
     rtt_us: AtomicU64,
     /// Test hook (ROAMTTY_DESKTOP_TEST=1 only): drop this share of datagrams both ways, ×1e6.
@@ -208,6 +257,8 @@ pub struct UdpLink {
     /// trip: the phone echoes other heartbeats in its own next one, up to 250 ms later, which read as
     /// a 265 ms round trip on a 15 ms link and slowed every resend to match.
     probe_t: AtomicU64,
+    #[cfg(test)]
+    time_offset_us: AtomicU64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -252,6 +303,8 @@ impl UdpLink {
             pace: Mutex::new(None), pace_rate: AtomicU64::new((start_rate * 2.5 / 8.0) as u64), rtt_us: AtomicU64::new(0),
             drop_ppm: AtomicU32::new(0), enabled: AtomicBool::new(true), stats: Mutex::new(LinkStats::default()),
             closed: AtomicBool::new(false), probe_t: AtomicU64::new(0),
+            #[cfg(test)]
+            time_offset_us: AtomicU64::new(0),
         });
         Some(link)
     }
@@ -261,16 +314,30 @@ impl UdpLink {
     /// land on the port never heard from the phone.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        self.pace.lock().unwrap().take();
+        if let Some(pacer) = self.pace.lock().unwrap().take() {
+            pacer.state.lock().unwrap().closed = true;
+            pacer.cvar.notify_all();
+        }
+    }
+
+    fn link_now_us(&self) -> u64 {
+        #[cfg(test)]
+        { now_us().saturating_add(self.time_offset_us.load(Ordering::Relaxed)) }
+        #[cfg(not(test))]
+        { now_us() }
     }
 
     pub fn alive(&self) -> bool {
         self.enabled.load(Ordering::Relaxed) && self.peer.lock().unwrap().is_some()
-            && now_us().saturating_sub(self.last_rx.load(Ordering::Relaxed)) < ALIVE_US
+            && self.link_now_us().saturating_sub(self.last_rx.load(Ordering::Relaxed)) < ALIVE_US
     }
 
     pub fn ever_received(&self) -> bool { self.last_rx.load(Ordering::Relaxed) != 0 }
-    pub fn silent_us(&self) -> u64 { now_us().saturating_sub(self.last_rx.load(Ordering::Relaxed)) }
+    pub fn silent_us(&self) -> u64 { self.link_now_us().saturating_sub(self.last_rx.load(Ordering::Relaxed)) }
+    #[cfg(test)]
+    pub fn advance_clock_us(&self, delta_us: u64) {
+        self.time_offset_us.fetch_add(delta_us, Ordering::Relaxed);
+    }
     pub fn rtt_ms(&self) -> u64 { self.rtt_us.load(Ordering::Relaxed) / 1000 }
     pub fn stats(&self) -> LinkStats { self.stats.lock().unwrap().clone() }
 
@@ -303,16 +370,56 @@ impl UdpLink {
         u32::from_le_bytes(b) % 1_000_000 < ppm
     }
 
-    fn raw_send(&self, plain: &[u8], paced: bool) {
-        let Some(peer) = *self.peer.lock().unwrap() else { return };
+    fn seal_and_send(&self, plain: &[u8], peer: SocketAddr) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let packet = self.crypto.seal(DIR_S2C, seq, plain);
         self.stats.lock().unwrap().sent_packets += 1;
         if self.dropped() { return; }
-        if paced {
-            if let Some(tx) = self.pace.lock().unwrap().as_ref() { let _ = tx.send(packet); return; }
-        }
         let _ = self.sock.send_to(&packet, peer);
+    }
+
+    fn raw_send(&self, plain: &[u8], paced: bool, is_spk_audio: bool) {
+        let Some(peer) = *self.peer.lock().unwrap() else { return };
+        if paced {
+            if let Some(pacer) = self.pace.lock().unwrap().clone() {
+                if is_spk_audio {
+                    // Normal 20ms voice chunks fit inside the token bucket burst and go straight
+                    // to the socket with zero extra thread hop; giant bursts trickle through pacing.
+                    let burst = (BURST * DATAGRAM) as f64;
+                    let wire_len = (plain.len() + SEAL_OVERHEAD) as f64;
+                    let rate = self.pace_rate.load(Ordering::Relaxed) as f64;
+                    let mut s = pacer.state.lock().unwrap();
+                    if s.closed { return; }
+                    s.tokens = (s.tokens + s.last.elapsed().as_secs_f64() * rate).min(burst);
+                    s.last = Instant::now();
+                    if s.queue.is_empty() && s.tokens >= wire_len {
+                        s.tokens -= wire_len;
+                        drop(s);
+                        self.seal_and_send(plain, peer);
+                        return;
+                    }
+                    while s.spk_queued >= MAX_PACED_SPK_PACKETS {
+                        if let Some(pos) = s.queue.iter().position(|(is_spk, _)| *is_spk) {
+                            s.queue.remove(pos);
+                            s.spk_queued -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    s.queue.push_back((true, plain.to_vec()));
+                    s.spk_queued += 1;
+                    pacer.cvar.notify_one();
+                    return;
+                }
+                let mut s = pacer.state.lock().unwrap();
+                if !s.closed {
+                    s.queue.push_back((false, plain.to_vec()));
+                    pacer.cvar.notify_one();
+                }
+                return;
+            }
+        }
+        self.seal_and_send(plain, peer);
     }
 
     /// Sends a heartbeat to `addr` before the client has spoken, so a stateful firewall on the
@@ -328,6 +435,11 @@ impl UdpLink {
     /// Sends one protocol frame (type + length + payload). Video gets FEC at the current ratio and
     /// is paced; reliable frames get full parity and are resent until acknowledged.
     pub fn send_frame(&self, ty: u8, payload: &[u8]) {
+        if ty == proto::ty::SPK_CLEAR {
+            if let Some(pacer) = self.pace.lock().unwrap().as_ref() {
+                pacer.clear_spk_audio();
+            }
+        }
         let mut bytes = Vec::with_capacity(4 + payload.len());
         let n = payload.len() as u32;
         bytes.extend([ty, (n >> 16) as u8, (n >> 8) as u8, n as u8]);
@@ -351,6 +463,8 @@ impl UdpLink {
             _ => (0, 0.0),
         };
         let video = flags & FLAG_VIDEO != 0;
+        let is_spk_audio = ty == proto::ty::SPK_AUDIO;
+        let paced = video || is_spk_audio;
         let reliable = flags & FLAG_RELIABLE != 0;
         let start = now_us();
         // Each shard leaves as soon as it is cut, encoded once: the data shards are on their way
@@ -358,7 +472,7 @@ impl UdpLink {
         let (mut packets, mut count, mut data) = (Vec::new(), 0usize, 0usize);
         udp::fragment_each(msg, flags, &bytes, ratio, |f| {
             let p = f.packet();
-            self.raw_send(&p, video);
+            self.raw_send(&p, paced, is_spk_audio);
             count += 1;
             if f.index < f.k { data += 1; }
             packets.push(((f.msg, f.block, f.index), p));
@@ -371,55 +485,93 @@ impl UdpLink {
             s.insert(msg, Sent { frame_bytes: bytes.len(), last_us: start + spread, data });
             if s.len() > 600 { let min = *s.keys().min().unwrap(); s.remove(&min); }
         }
-        if reliable { self.reliable.lock().unwrap().insert(msg, (packets.iter().map(|p| p.1.clone()).collect(), Instant::now(), 0)); }
+        if reliable {
+            self.reliable.lock().unwrap().insert(
+                msg,
+                Unacked {
+                    ty,
+                    payload: payload.to_vec(),
+                    packets: packets.iter().map(|p| p.1.clone()).collect(),
+                    at: Instant::now(),
+                    tries: 0,
+                },
+            );
+        }
         let mut h = self.history.lock().unwrap();
         for (key, p) in packets { h.insert(key, p); }
     }
 
     /// Resends reliable frames nobody acknowledged: every max(2×RTT, 80 ms), five times at most.
-    pub fn tick(&self) {
+    /// Returns `(ty, payload)` for frames that exhausted all retries (in original send order) so
+    /// the caller can fall back to the SSH channel.
+    pub fn tick(&self) -> Vec<(u8, Vec<u8>)> {
         let t = now_us();
         if self.peer.lock().unwrap().is_some() && t.saturating_sub(self.probe_t.load(Ordering::Relaxed)) > 500_000 {
             self.probe_t.store(t, Ordering::Relaxed);
-            self.raw_send(&Packet::Heartbeat { t, echo: 0 }.encode(), false);
+            self.raw_send(&Packet::Heartbeat { t, echo: 0 }.encode(), false, false);
         }
         let wait = Duration::from_micros((self.rtt_us.load(Ordering::Relaxed) * 2).max(80_000));
         let mut again = Vec::new();
+        let mut expired_ids = Vec::new();
+        let mut expired = Vec::new();
         {
             let mut r = self.reliable.lock().unwrap();
-            r.retain(|_, (packets, at, tries)| {
-                if at.elapsed() < wait { return true; }
-                if *tries >= 5 { return false; }
-                *tries += 1;
-                *at = Instant::now();
-                again.extend(packets.iter().cloned());
-                true
-            });
+            for (&id, u) in r.iter_mut() {
+                if u.at.elapsed() < wait { continue; }
+                if u.tries >= 5 {
+                    expired_ids.push(id);
+                    continue;
+                }
+                u.tries += 1;
+                u.at = Instant::now();
+                again.extend(u.packets.iter().cloned());
+            }
+            expired_ids.sort_unstable();
+            for id in expired_ids {
+                if let Some(u) = r.remove(&id) {
+                    expired.push((u.ty, u.payload));
+                }
+            }
         }
-        for p in again { self.raw_send(&p, false); self.stats.lock().unwrap().resent += 1; }
+        for p in again { self.raw_send(&p, false, false); self.stats.lock().unwrap().resent += 1; }
+        expired
     }
 
     /// Starts the receiver and the pacer; client messages go to `tx` like the SSH reader's.
     pub fn start(self: &Arc<Self>, tx: Sender<Option<ClientMsg>>) {
-        let (ptx, prx) = mpsc::channel::<Vec<u8>>();
-        *self.pace.lock().unwrap() = Some(ptx);
+        let pacer = Pacer::new();
+        *self.pace.lock().unwrap() = Some(pacer.clone());
         let me = self.clone();
         std::thread::spawn(move || {
             // Token bucket at [Gcc::pace_rate], bursts of up to BURST datagrams.
             let burst = (BURST * DATAGRAM) as f64;
-            let mut tokens = burst;
-            let mut last = Instant::now();
-            while let Ok(p) = prx.recv() {
-                if me.closed.load(Ordering::Relaxed) { break; }
-                loop {
-                    let rate = me.pace_rate.load(Ordering::Relaxed) as f64;
-                    tokens = (tokens + last.elapsed().as_secs_f64() * rate).min(burst);
-                    last = Instant::now();
-                    if tokens >= p.len() as f64 { tokens -= p.len() as f64; break; }
-                    let need = (p.len() as f64 - tokens) / rate.max(1.0);
-                    std::thread::sleep(Duration::from_secs_f64(need.min(0.005)));
+            loop {
+                let plain = {
+                    let mut s = pacer.state.lock().unwrap();
+                    loop {
+                        if me.closed.load(Ordering::Relaxed) || s.closed { return; }
+                        let Some((_, front)) = s.queue.front() else {
+                            s = pacer.cvar.wait(s).unwrap();
+                            continue;
+                        };
+                        let need_bytes = (front.len() + SEAL_OVERHEAD) as f64;
+                        let rate = me.pace_rate.load(Ordering::Relaxed) as f64;
+                        s.tokens = (s.tokens + s.last.elapsed().as_secs_f64() * rate).min(burst);
+                        s.last = Instant::now();
+                        if s.tokens >= need_bytes {
+                            s.tokens -= need_bytes;
+                            let (is_spk, p) = s.queue.pop_front().unwrap();
+                            if is_spk { s.spk_queued = s.spk_queued.saturating_sub(1); }
+                            break p;
+                        }
+                        let wait_s = ((need_bytes - s.tokens) / rate.max(1.0)).min(0.005);
+                        let (guard, _) = pacer.cvar.wait_timeout(s, Duration::from_secs_f64(wait_s)).unwrap();
+                        s = guard;
+                    }
+                };
+                if let Some(peer) = *me.peer.lock().unwrap() {
+                    me.seal_and_send(&plain, peer);
                 }
-                if let Some(peer) = *me.peer.lock().unwrap() { let _ = me.sock.send_to(&p, peer); }
             }
         });
         let me = self.clone();
@@ -432,9 +584,14 @@ impl UdpLink {
         let mut reasm = Reassembler::default();
         let mut order = InOrder::default();
         while !self.closed.load(Ordering::Relaxed) {
-            let Ok((n, from)) = self.sock.recv_from(&mut buf) else {
-                reasm.expire(now_us(), 2_000_000);
-                continue;
+            for bytes in order.overdue() { self.deliver(&bytes, &tx); }
+            let (n, from) = match self.sock.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(_) => {
+                    reasm.expire(now_us(), 2_000_000);
+                    for bytes in order.overdue() { self.deliver(&bytes, &tx); }
+                    continue;
+                }
             };
             if self.dropped() { continue; }
             let Some((dir, seq, plain)) = self.crypto.open(&buf[..n]) else { continue };
@@ -447,7 +604,7 @@ impl UdpLink {
                     *p = Some(from);
                 }
             }
-            self.last_rx.store(now_us(), Ordering::Relaxed);
+            self.last_rx.store(self.link_now_us(), Ordering::Relaxed);
             self.stats.lock().unwrap().received_packets += 1;
             let Some(packet) = Packet::decode(&plain) else { continue };
             match packet {
@@ -455,20 +612,20 @@ impl UdpLink {
                     if echo != 0 && echo == self.probe_t.load(Ordering::Relaxed) {
                         self.rtt_us.store(now_us().saturating_sub(echo), Ordering::Relaxed);
                     }
-                    self.raw_send(&Packet::Heartbeat { t: now_us(), echo: t }.encode(), false);
+                    self.raw_send(&Packet::Heartbeat { t: now_us(), echo: t }.encode(), false, false);
                 }
                 Packet::Frag(f) => {
                     let reliable = f.flags & FLAG_RELIABLE != 0;
                     let msg = f.msg;
                     match reasm.push(f, now_us()) {
                         Some(d) => {
-                            if reliable { self.raw_send(&Packet::Rack(vec![msg]).encode(), false); }
+                            if reliable { self.raw_send(&Packet::Rack(vec![msg]).encode(), false, false); }
                             let ready = if reliable { order.push(msg, d.bytes) } else { vec![d.bytes] };
                             for bytes in ready { self.deliver(&bytes, &tx); }
                         }
                         // A resend of something already delivered: the RACK was lost, say it again.
                         // Not for a shard of a message still being assembled: that RACK would stop its resends.
-                        None if reliable && reasm.is_done(msg) => self.raw_send(&Packet::Rack(vec![msg]).encode(), false),
+                        None if reliable && reasm.is_done(msg) => self.raw_send(&Packet::Rack(vec![msg]).encode(), false, false),
                         None => {}
                     }
                     reasm.expire(now_us(), 2_000_000);
@@ -480,7 +637,7 @@ impl UdpLink {
                         let h = self.history.lock().unwrap();
                         indices.iter().filter_map(|i| h.get(&(msg, block, *i)).cloned()).collect()
                     };
-                    for s in shards { self.raw_send(&s, false); self.stats.lock().unwrap().resent += 1; }
+                    for s in shards { self.raw_send(&s, false, false); self.stats.lock().unwrap().resent += 1; }
                 }
                 Packet::Feedback(reports) => {
                     let now = now_us();
@@ -499,6 +656,7 @@ impl UdpLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     /// One process serving session after session (the macOS and Windows agents): a closed link frees
     /// its port, and while a link is open the next one takes another port instead of an IPv6 twin.
@@ -610,5 +768,138 @@ mod tests {
         assert!((g.fec - 0.25).abs() < 0.01, "fec {}", g.fec);
         g.on_report(&report(2, 2000, 1000, 1000), &s, 1);
         assert!(g.fec < 0.25);
+    }
+
+    #[test]
+    fn reliable_tick_returns_expired_frames_in_order() {
+        let (tx, _rx) = mpsc::channel();
+        let link = UdpLink::bind_ephemeral(1_000_000.0).unwrap();
+        link.start(tx);
+        let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let peer: SocketAddr = ([127, 0, 0, 1], link.port).into();
+        let crypto = Crypto::new(&link.key);
+
+        // Establish peer address with a heartbeat and wait for echo.
+        let hb = crypto.seal(DIR_C2S, 1, &Packet::Heartbeat { t: 42, echo: 0 }.encode());
+        client.send_to(&hb, peer).unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = client.recv_from(&mut buf).unwrap();
+
+        // Send three reliable frames: acknowledge the first one via RACK, let the other two expire.
+        let p0 = proto::spk_start_payload(1, 24_000, 1);
+        let p1 = proto::spk_start_payload(2, 24_000, 1);
+        let p2 = proto::spk_clear_payload(2);
+        link.send_frame(proto::ty::SPK_START, &p0);
+        // Acknowledge msg=1 so it is removed from `reliable`.
+        let rack = crypto.seal(DIR_C2S, 2, &Packet::Rack(vec![1]).encode());
+        client.send_to(&rack, peer).unwrap();
+        // Wait briefly for receive loop to process the RACK.
+        std::thread::sleep(Duration::from_millis(40));
+
+        link.send_frame(proto::ty::SPK_START, &p1);
+        link.send_frame(proto::ty::SPK_CLEAR, &p2);
+
+        let mut expired = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while expired.len() < 2 && Instant::now() < deadline {
+            expired.extend(link.tick());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        link.close();
+        assert_eq!(expired, vec![(proto::ty::SPK_START, p1), (proto::ty::SPK_CLEAR, p2)]);
+    }
+
+    #[test]
+    fn receive_delivers_overdue_in_order_message_on_timeout() {
+        let (tx, rx) = mpsc::channel();
+        let link = UdpLink::bind_ephemeral(1_000_000.0).unwrap();
+        link.start(tx);
+        let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let peer: SocketAddr = ([127, 0, 0, 1], link.port).into();
+        let crypto = Crypto::new(&link.key);
+
+        let hb = crypto.seal(DIR_C2S, 1, &Packet::Heartbeat { t: 99, echo: 0 }.encode());
+        client.send_to(&hb, peer).unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = client.recv_from(&mut buf).unwrap();
+
+        // Send reliable msg=3 (skipping msg=1!), then go completely silent so only the
+        // `recv_from` timeout path can trigger `InOrder::overdue()`.
+        let mut frame = Vec::new();
+        let (t, p) = proto::encode_client(&ClientMsg::SpkAck { stream_id: 7, ok: true, error: String::new() });
+        proto::write_frame(&mut frame, t, &p).unwrap();
+        let mut seq = 2u64;
+        for f in udp::fragment(3, FLAG_RELIABLE, &frame, 0.0) {
+            let pkt = crypto.seal(DIR_C2S, seq, &Packet::Frag(f).encode());
+            seq += 1;
+            client.send_to(&pkt, peer).unwrap();
+        }
+
+        // Must NOT be delivered immediately (still waiting on gap msg=1), then delivered after ~1s timeout.
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        let got = rx.recv_timeout(Duration::from_secs(2)).expect("overdue message must deliver on recv timeout");
+        link.close();
+        match got {
+            Some(ClientMsg::SpkAck { stream_id, ok, .. }) => {
+                assert_eq!(stream_id, 7);
+                assert!(ok);
+            }
+            other => panic!("unexpected delivered message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spk_audio_burst_pacing_and_spk_clear_flushes_queue() {
+        let (tx, _rx) = mpsc::channel();
+        let link = UdpLink::bind_ephemeral(200_000.0).unwrap();
+        link.start(tx);
+        let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let peer: SocketAddr = ([127, 0, 0, 1], link.port).into();
+        let crypto = Crypto::new(&link.key);
+
+        let hb = crypto.seal(DIR_C2S, 1, &Packet::Heartbeat { t: 7, echo: 0 }.encode());
+        client.send_to(&hb, peer).unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = client.recv_from(&mut buf).unwrap();
+
+        // Send a 60-chunk burst (120 datagrams > BURST=16) followed immediately by SPK_CLEAR.
+        // SPK_CLEAR must flush the queued SPK_AUDIO packets in the pacer and arrive promptly.
+        let chunk = proto::spk_audio_payload(1, &[0xABu8; 960]);
+        for _ in 0..60 {
+            link.send_frame(proto::ty::SPK_AUDIO, &chunk);
+        }
+        link.send_frame(proto::ty::SPK_CLEAR, &proto::spk_clear_payload(1));
+
+        let mut reasm = Reassembler::default();
+        let mut saw_clear = false;
+        let mut audio_after_clear = 0usize;
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            match client.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    let Some((DIR_S2C, _, plain)) = crypto.open(&buf[..n]) else { continue };
+                    if let Some(Packet::Frag(f)) = Packet::decode(&plain) {
+                        if let Some(d) = reasm.push(f, now_us()) {
+                            if let Ok(Some((ty, _))) = proto::read_frame(&mut d.bytes.as_slice()) {
+                                if ty == proto::ty::SPK_CLEAR {
+                                    saw_clear = true;
+                                } else if ty == proto::ty::SPK_AUDIO && saw_clear {
+                                    audio_after_clear += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) if saw_clear => break,
+                Err(_) => continue,
+            }
+        }
+        link.close();
+        assert!(saw_clear, "SPK_CLEAR should arrive promptly");
+        // At most a single in-flight packet could still be exiting send_to when clear ran, never dozens.
+        assert!(audio_after_clear <= 2, "stale paced SPK_AUDIO leaked after SPK_CLEAR: {audio_after_clear}");
     }
 }

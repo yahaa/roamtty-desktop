@@ -12,7 +12,7 @@ use std::net::UdpSocket;
 fn parse_speaker_header_valid_and_invalid() {
     assert_eq!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=24000\n"), Ok(24000));
     assert_eq!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=16000\r\n"), Ok(16000));
-    assert_eq!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=48000 extra=1\n"), Ok(48000));
+    assert_eq!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=48000 channels=1 extra=1\n"), Ok(48000));
     assert_eq!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=8000\n"), Ok(8000));
     assert_eq!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=192000\n"), Ok(192000));
 
@@ -24,6 +24,10 @@ fn parse_speaker_header_valid_and_invalid() {
     assert!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=192001\n").is_err());
     assert!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=abc\n").is_err());
     assert!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=24000 rate=16000\n").is_err());
+    assert!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=24000 channels=2\n").is_err());
+    assert!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=24000 channels=0\n").is_err());
+    assert!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=24000 channels=abc\n").is_err());
+    assert!(parse_speaker_header("JETSKI-AUDIO/1 speaker rate=24000 channels=1 channels=1\n").is_err());
 }
 
 #[test]
@@ -70,9 +74,11 @@ fn bind_mic_listener_falls_back_when_port_busy() {
 
 struct VoiceHarness {
     mic_port: u16,
-    ev_tx: mpsc::Sender<Event>,
+    ev_tx: mpsc::SyncSender<Event>,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    mic_accept: Option<std::thread::JoinHandle<()>>,
+    last_udp: Arc<Mutex<Option<Arc<UdpLink>>>>,
 }
 
 struct ClientConn {
@@ -112,12 +118,16 @@ impl ClientConn {
 
 impl VoiceHarness {
     fn start(enable_udp: bool) -> Self {
+        Self::start_with_idle(enable_udp, Duration::from_secs(60))
+    }
+
+    fn start_with_idle(enable_udp: bool, idle_timeout: Duration) -> Self {
         let (mic_listener, mic_port) = bind_mic_listener(0).unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Event>();
+        let (ev_tx, ev_rx) = mpsc::sync_channel::<Event>(EV_CHANNEL_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         let client_connected = Arc::new(AtomicBool::new(false));
         let next_stream_id = Arc::new(AtomicU32::new(1));
-        let _mic_accept = spawn_mic_accept_loop(
+        let mic_accept = spawn_mic_accept_loop(
             mic_listener,
             next_stream_id,
             ev_tx.clone(),
@@ -129,22 +139,43 @@ impl VoiceHarness {
             session: "testvoice1234567".into(),
             resume_token: "test-resume-token-secret".into(),
         };
+        let last_udp: Arc<Mutex<Option<Arc<UdpLink>>>> = Arc::new(Mutex::new(None));
+        let udp_capture = last_udp.clone();
         let bind_udp: UdpBinder = if enable_udp {
-            Box::new(UdpLink::bind_ephemeral)
+            Box::new(move |rate| {
+                let link = UdpLink::bind_ephemeral(rate);
+                *udp_capture.lock().unwrap() = link.clone();
+                link
+            })
         } else {
             Box::new(|_| None)
         };
         let mut engine = VoiceEngine::new(
             mic_port,
             sess,
-            Duration::from_secs(60),
+            idle_timeout,
             bind_udp,
             ev_tx.clone(),
             client_connected,
             shutdown.clone(),
         );
-        let worker = std::thread::spawn(move || { let _ = engine.run(ev_rx); });
-        Self { mic_port, ev_tx, shutdown, worker: Some(worker) }
+        let worker = std::thread::spawn(move || {
+            let exit = engine.run(ev_rx);
+            if let Some(c) = exit.active_client {
+                c.close();
+            }
+            if let Some((reply_tx, _)) = exit.evict_reply {
+                let _ = reply_tx.send(true);
+            }
+        });
+        Self {
+            mic_port,
+            ev_tx,
+            shutdown,
+            worker: Some(worker),
+            mic_accept: Some(mic_accept),
+            last_udp,
+        }
     }
 
     fn attach(&self, resume: Option<&str>, token: Option<&str>) -> Result<ClientConn, ()> {
@@ -154,6 +185,7 @@ impl VoiceHarness {
         client.set_nodelay(true).unwrap();
         server.set_nodelay(true).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        server.set_write_timeout(Some(SSH_WRITE_TIMEOUT)).unwrap();
 
         let server_in = server.try_clone().unwrap();
         let server_close = server.try_clone().unwrap();
@@ -166,6 +198,7 @@ impl VoiceHarness {
             idle_timeout: None,
             ssh_client: Some("127.0.0.1 12345 22".into()),
             evict_idle_port: None,
+            shutdown: false,
         };
         self.ev_tx
             .send(Event::ClientAttach {
@@ -194,22 +227,25 @@ impl VoiceHarness {
         s
     }
 
-    fn stop(mut self) {
+    fn shutdown_and_join(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.ev_tx.send(Event::Shutdown);
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+        if let Some(m) = self.mic_accept.take() {
+            let _ = m.join();
+        }
+    }
+
+    fn stop(mut self) {
+        self.shutdown_and_join();
     }
 }
 
 impl Drop for VoiceHarness {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        let _ = self.ev_tx.send(Event::Shutdown);
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
+        self.shutdown_and_join();
     }
 }
 
@@ -722,6 +758,520 @@ fn speaker_open_without_attached_client_reports_no_client_connected() {
     agy.read_to_end(&mut resp).unwrap();
     let text = String::from_utf8(resp).unwrap();
     assert_eq!(text, "\nJETSKI-AUDIO/1 ERR no voice client connected\n");
+    h.stop();
+}
+
+struct StalledWriter {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    entered: Arc<AtomicBool>,
+    allow_initial_bytes: usize,
+    written: usize,
+}
+
+impl Write for StalledWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.written < self.allow_initial_bytes {
+            let take = buf.len().min(self.allow_initial_bytes - self.written);
+            self.written += take;
+            return Ok(take);
+        }
+        self.entered.store(true, Ordering::SeqCst);
+        let (lock, cvar) = &*self.gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = cvar.wait(released).unwrap();
+        }
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "stalled writer released"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn stalled_ssh_writer_does_not_block_engine_or_resume_takeover() {
+    let h = VoiceHarness::start(false);
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let entered = Arc::new(AtomicBool::new(false));
+
+    // Attach client 1 whose output stalls permanently right after initial writes.
+    let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let mut c1_in = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (server_in, _) = l.accept().unwrap();
+    let server_close = server_in.try_clone().unwrap();
+    let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+    h.ev_tx
+        .send(Event::ClientAttach {
+            req: AttachReq {
+                ipc_token: String::new(),
+                proto: proto::PROTO,
+                resume: None,
+                token: None,
+                idle_timeout: None,
+                ssh_client: None,
+                evict_idle_port: None,
+                shutdown: false,
+            },
+            input: Box::new(server_in),
+            output: Box::new(StalledWriter {
+                gate: gate.clone(),
+                entered: entered.clone(),
+                allow_initial_bytes: 0,
+                written: 0,
+            }),
+            closer: Box::new(move || { let _ = server_close.shutdown(Shutdown::Both); }),
+            reply_tx,
+        })
+        .unwrap();
+    assert!(reply_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+
+    // Wait for SshWriter thread to enter the blocked write() call.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(entered.load(Ordering::SeqCst), "stalled writer should be blocked inside write()");
+
+    // Open speaker stream, ACK it from c1, and flood > 300 SPK_AUDIO chunks (> SSH_QUEUE_CAPACITY)
+    // while c1's SSH writer is completely wedged.
+    let mut agy = h.connect_agy();
+    agy.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
+    std::thread::sleep(Duration::from_millis(40));
+    let (at, ap) = proto::encode_client(&ClientMsg::SpkAck { stream_id: 1, ok: true, error: String::new() });
+    proto::write_frame(&mut c1_in, at, &ap).unwrap();
+    c1_in.flush().unwrap();
+    let mut ok = [0u8; 19];
+    agy.read_exact(&mut ok).unwrap();
+    assert_eq!(&ok, b"\nJETSKI-AUDIO/1 OK\n");
+
+    let big_pcm = vec![0x5Au8; MAX_SPK_AUDIO_CHUNK * 300];
+    send_jetski_frame(&mut agy, b'A', &big_pcm);
+
+    // Despite c1's writer being permanently wedged AND flooded, --resume takeover MUST succeed
+    // immediately without blocking VoiceEngine!
+    let t0 = Instant::now();
+    let mut c2 = h
+        .attach(Some("testvoice1234567"), Some("test-resume-token-secret"))
+        .expect("resume takeover should succeed promptly");
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "resume takeover took too long: {:?}",
+        t0.elapsed()
+    );
+
+    // c2 receives re-announced SPK_START and subsequent SPK_AUDIO cleanly.
+    let (t, p) = c2.recv_frame();
+    assert_eq!(t, ty::SPK_START);
+    let spk_id = u32::from_le_bytes(p[0..4].try_into().unwrap());
+    assert_eq!(spk_id, 1);
+
+    let tail = vec![0x7Eu8; 320];
+    send_jetski_frame(&mut agy, b'A', &tail);
+    let mut saw_tail = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let (t, p) = c2.recv_frame();
+        if t == ty::SPK_AUDIO && &p[4..] == tail.as_slice() {
+            saw_tail = true;
+            break;
+        }
+    }
+    assert!(saw_tail, "resumed client should receive fresh SPK_AUDIO");
+
+    // Release stalled writer so background thread cleans up.
+    {
+        let (lock, cvar) = &*gate;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    drop(agy);
+    drop(c1_in);
+    c2.close();
+    h.stop();
+}
+
+#[test]
+fn udp_only_keepalive_after_ssh_drops_resists_eviction_and_reannounces() {
+    let h = VoiceHarness::start(true);
+    let client = h.attach(None, None).unwrap();
+    let udp_info = client.hello.udp.clone().expect("UDP link should bind");
+    let link = h.last_udp.lock().unwrap().clone().expect("captured UdpLink");
+
+    let key = decode_b64_16(&udp_info.key);
+    let crypto = Crypto::new(&key);
+    let sock = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let peer: SocketAddr = ([127, 0, 0, 1], udp_info.port).into();
+
+    let mut c2s_seq = 1u64;
+    let send_udp = |seq: &mut u64, pkt: &Packet| {
+        let datagram = crypto.seal(DIR_C2S, *seq, &pkt.encode());
+        *seq += 1;
+        sock.send_to(&datagram, peer).unwrap();
+    };
+
+    // Bring UDP alive and wait for heartbeat echo.
+    send_udp(&mut c2s_seq, &Packet::Heartbeat { t: 100, echo: 0 });
+    let mut buf = [0u8; 2048];
+    let _ = sock.recv_from(&mut buf).unwrap();
+
+    // Drop SSH while UDP is active -> engine must stay connected on UDP.
+    client.close();
+    std::thread::sleep(Duration::from_millis(60));
+
+    // Simulate 5s of UDP silence (inside 3s..30s UDP_KEEPALIVE_US roaming window).
+    link.advance_clock_us(5_000_000);
+    assert!(!link.alive());
+
+    // EvictIdle MUST NOT evict during the 30s UDP keepalive window!
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let (_ftx, flushed_rx) = mpsc::channel();
+    h.ev_tx
+        .send(Event::EvictIdle { port: h.mic_port, reply_tx, flushed_rx })
+        .unwrap();
+    assert!(!reply_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+
+    // Even while !l.alive() in the 3s..30s window, ClientOut::emit still attempts UDP delivery.
+    let agy_mic1 = h.connect_agy();
+    let mut reasm = Reassembler::default();
+    let mut saw_mic1 = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        let Some((DIR_S2C, _, plain)) = crypto.open(&buf[..n]) else { continue };
+        if let Some(Packet::Frag(f)) = Packet::decode(&plain) {
+            let msg = f.msg;
+            if let Some(d) = reasm.push(f, crate::serve::now_us()) {
+                let (t, _) = proto::read_frame(&mut d.bytes.as_slice()).unwrap().unwrap();
+                if t == ty::MIC_START {
+                    send_udp(&mut c2s_seq, &Packet::Rack(vec![msg]));
+                    saw_mic1 = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(saw_mic1, "MIC_START should still be attempted over UDP during 3s..30s keepalive");
+
+    // Now simulate total packet loss during roaming so a new mic stream's 5 UDP retries expire,
+    // clearing announced_to_epoch; once UDP returns to alive(), it MUST be re-announced!
+    link.advance_clock_us(5_000_000);
+    link.drop_ppm.store(1_000_000, Ordering::Relaxed);
+    let agy_mic2 = h.connect_agy();
+    // Wait for peek (80ms) + 5 retries * 80ms (~480ms) + margin so reliable retries exhaust.
+    std::thread::sleep(Duration::from_millis(850));
+
+    // Client roams back online: restore delivery and send a heartbeat so UDP becomes alive().
+    link.drop_ppm.store(0, Ordering::Relaxed);
+    send_udp(&mut c2s_seq, &Packet::Heartbeat { t: 200, echo: 0 });
+    let mut saw_mic2 = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        let Some((DIR_S2C, _, plain)) = crypto.open(&buf[..n]) else { continue };
+        if let Some(Packet::Frag(f)) = Packet::decode(&plain) {
+            let msg = f.msg;
+            if let Some(d) = reasm.push(f, crate::serve::now_us()) {
+                let (t, p) = proto::read_frame(&mut d.bytes.as_slice()).unwrap().unwrap();
+                if t == ty::MIC_START && u32::from_le_bytes(p[0..4].try_into().unwrap()) == 2 {
+                    send_udp(&mut c2s_seq, &Packet::Rack(vec![msg]));
+                    saw_mic2 = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(saw_mic2, "unannounced mic stream must re-announce once UDP returns to alive()");
+
+    // Wait briefly so the RACK sent above is processed before we advance the link clock.
+    std::thread::sleep(Duration::from_millis(50));
+    // After >30s UDP silence, engine disconnects client and EvictIdle succeeds.
+    link.advance_clock_us(31_000_000);
+    std::thread::sleep(Duration::from_millis(120));
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let (_ftx, flushed_rx) = mpsc::channel();
+    h.ev_tx
+        .send(Event::EvictIdle { port: h.mic_port, reply_tx, flushed_rx })
+        .unwrap();
+    assert!(reply_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+
+    drop(agy_mic1);
+    drop(agy_mic2);
+    h.stop();
+}
+
+#[test]
+fn reliable_control_frame_udp_tick_falls_back_to_ssh() {
+    let h = VoiceHarness::start(true);
+    let mut client = h.attach(None, None).unwrap();
+    let udp_info = client.hello.udp.clone().expect("UDP link should bind");
+    let link = h.last_udp.lock().unwrap().clone().expect("captured UdpLink");
+
+    let key = decode_b64_16(&udp_info.key);
+    let crypto = Crypto::new(&key);
+    let sock = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let peer: SocketAddr = ([127, 0, 0, 1], udp_info.port).into();
+
+    // Bring UDP alive so SPK_START is initially sent on UDP.
+    let hb = crypto.seal(DIR_C2S, 1, &Packet::Heartbeat { t: 100, echo: 0 }.encode());
+    sock.send_to(&hb, peer).unwrap();
+    let mut buf = [0u8; 2048];
+    let _ = sock.recv_from(&mut buf).unwrap();
+
+    // Blackhole S->C UDP packets while UDP is still considered alive (< 3s).
+    link.drop_ppm.store(1_000_000, Ordering::Relaxed);
+
+    let mut agy = h.connect_agy();
+    agy.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
+    agy.flush().unwrap();
+
+    // After 5 UDP retries (~450ms), VoiceEngine must automatically fall back SPK_START to SSH!
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_START);
+    let spk_id = u32::from_le_bytes(p[0..4].try_into().unwrap());
+    client.send(ClientMsg::SpkAck { stream_id: spk_id, ok: true, error: String::new() });
+
+    let mut ok = [0u8; 19];
+    agy.read_exact(&mut ok).unwrap();
+    assert_eq!(&ok, b"\nJETSKI-AUDIO/1 OK\n");
+
+    drop(agy);
+    client.close();
+    h.stop();
+}
+
+#[test]
+fn resumed_client_spk_ack_false_closes_active_speaker_stream() {
+    let h = VoiceHarness::start(false);
+    let mut c1 = h.attach(None, None).unwrap();
+    let sess = c1.hello.session.clone();
+    let tok = c1.hello.resume_token.clone();
+
+    let mut agy = h.connect_agy();
+    agy.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
+    let (t, p) = c1.recv_frame();
+    assert_eq!(t, ty::SPK_START);
+    let spk_id = u32::from_le_bytes(p[0..4].try_into().unwrap());
+    c1.send(ClientMsg::SpkAck { stream_id: spk_id, ok: true, error: String::new() });
+    let mut ok = [0u8; 19];
+    agy.read_exact(&mut ok).unwrap();
+    assert_eq!(&ok, b"\nJETSKI-AUDIO/1 OK\n");
+
+    // Client 2 resumes and rejects the already-open speaker stream with SPK_ACK(ok=false).
+    let mut c2 = h.attach(Some(&sess), Some(&tok)).unwrap();
+    let (t, p) = c2.recv_frame();
+    assert_eq!(t, ty::SPK_START);
+    assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), spk_id);
+    c2.send(ClientMsg::SpkAck { stream_id: spk_id, ok: false, error: "output busy".into() });
+
+    // `agy` speaker TCP stream must close cleanly (EOF, no bogus second header line).
+    let mut rest = Vec::new();
+    agy.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "expected clean EOF without extra ERR line, got {rest:?}");
+
+    c1.close();
+    c2.close();
+    h.stop();
+}
+
+#[test]
+fn speaker_framing_edge_cases_channels_timeout_empty_and_truncated() {
+    let h = VoiceHarness::start(false);
+    let mut client = h.attach(None, None).unwrap();
+
+    // 1. channels=2 rejected before SPK_START.
+    let mut agy_ch2 = h.connect_agy();
+    agy_ch2.write_all(b"JETSKI-AUDIO/1 speaker rate=24000 channels=2\n").unwrap();
+    let mut err_buf = Vec::new();
+    agy_ch2.read_to_end(&mut err_buf).unwrap();
+    assert_eq!(
+        String::from_utf8(err_buf).unwrap(),
+        "\nJETSKI-AUDIO/1 ERR unsupported channel count\n"
+    );
+
+    // 2. Empty 'A' frame (len=0) is skipped cleanly without closing stream, followed by valid audio.
+    let mut agy_empty = h.connect_agy();
+    agy_empty.write_all(b"JETSKI-AUDIO/1 speaker rate=24000 channels=1\n").unwrap();
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_START);
+    let id1 = u32::from_le_bytes(p[0..4].try_into().unwrap());
+    client.send(ClientMsg::SpkAck { stream_id: id1, ok: true, error: String::new() });
+    let mut ok = [0u8; 19];
+    agy_empty.read_exact(&mut ok).unwrap();
+    assert_eq!(&ok, b"\nJETSKI-AUDIO/1 OK\n");
+    send_jetski_frame(&mut agy_empty, b'A', &[]);
+    let pcm = vec![0x99u8; 320];
+    send_jetski_frame(&mut agy_empty, b'A', &pcm);
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_AUDIO);
+    assert_eq!(&p[4..], pcm.as_slice());
+    drop(agy_empty);
+    assert_eq!(client.recv_frame().0, ty::SPK_STOP);
+
+    // 3. Truncated 'A' payload hitting byte-0 EOF on second streamed chunk (len=1920, only 960 sent).
+    let mut agy_trunc1 = h.connect_agy();
+    agy_trunc1.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_START);
+    let id2 = u32::from_le_bytes(p[0..4].try_into().unwrap());
+    client.send(ClientMsg::SpkAck { stream_id: id2, ok: true, error: String::new() });
+    agy_trunc1.read_exact(&mut ok).unwrap();
+    let mut hdr = [0u8; 5];
+    hdr[0] = b'A';
+    hdr[1..5].copy_from_slice(&(1920u32).to_le_bytes());
+    agy_trunc1.write_all(&hdr).unwrap();
+    agy_trunc1.write_all(&vec![0x11u8; MAX_SPK_AUDIO_CHUNK]).unwrap();
+    agy_trunc1.flush().unwrap();
+    drop(agy_trunc1);
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_AUDIO);
+    assert_eq!(p.len(), 4 + MAX_SPK_AUDIO_CHUNK);
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_STOP);
+    assert_eq!(p, id2.to_le_bytes());
+
+    // 4. Truncated 'A' payload mid-chunk (len=400, only 100 sent).
+    let mut agy_trunc2 = h.connect_agy();
+    agy_trunc2.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_START);
+    let id3 = u32::from_le_bytes(p[0..4].try_into().unwrap());
+    client.send(ClientMsg::SpkAck { stream_id: id3, ok: true, error: String::new() });
+    agy_trunc2.read_exact(&mut ok).unwrap();
+    hdr[1..5].copy_from_slice(&(400u32).to_le_bytes());
+    agy_trunc2.write_all(&hdr).unwrap();
+    agy_trunc2.write_all(&[0x22u8; 100]).unwrap();
+    agy_trunc2.flush().unwrap();
+    drop(agy_trunc2);
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_STOP);
+    assert_eq!(p, id3.to_le_bytes());
+
+    // 5. Header timeout when peer sends partial speaker header without newline.
+    let mut agy_to = h.connect_agy();
+    agy_to.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    agy_to.write_all(b"JETSKI-AUDIO/1 speaker rate=24000").unwrap();
+    agy_to.flush().unwrap();
+    let mut to_buf = Vec::new();
+    agy_to.read_to_end(&mut to_buf).unwrap();
+    assert_eq!(
+        String::from_utf8(to_buf).unwrap(),
+        "\nJETSKI-AUDIO/1 ERR header timeout\n"
+    );
+
+    client.close();
+    h.stop();
+}
+
+#[test]
+fn handle_attach_failure_preserves_disconnected_since_and_exits_idle() {
+    let mut h = VoiceHarness::start_with_idle(false, Duration::from_millis(150));
+    let c1 = h.attach(None, None).unwrap();
+    let sess = c1.hello.session.clone();
+    let tok = c1.hello.resume_token.clone();
+
+    // Send a valid resume attach whose `reply_rx` is immediately dropped so `reply_tx.send(true)`
+    // fails AFTER `self.client.take()` closed `c1`. `disconnected_since` MUST be set so the
+    // engine exits after `idle_timeout` instead of leaking forever.
+    let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let _peer = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (server, _) = l.accept().unwrap();
+    let server_in = server.try_clone().unwrap();
+    let server_close = server.try_clone().unwrap();
+    let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+    drop(reply_rx);
+    h.ev_tx
+        .send(Event::ClientAttach {
+            req: AttachReq {
+                ipc_token: String::new(),
+                proto: proto::PROTO,
+                resume: Some(sess),
+                token: Some(tok),
+                idle_timeout: None,
+                ssh_client: None,
+                evict_idle_port: None,
+                shutdown: false,
+            },
+            input: Box::new(server_in),
+            output: Box::new(server),
+            closer: Box::new(move || { let _ = server_close.shutdown(Shutdown::Both); }),
+            reply_tx,
+        })
+        .unwrap();
+
+    // Wait for engine worker to exit cleanly on idle timeout (150ms) without calling h.stop()!
+    let worker = h.worker.take().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = worker.join();
+        let _ = done_tx.send(());
+    });
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "VoiceEngine leaked after handle_attach early return"
+    );
+    c1.close();
+}
+
+#[test]
+fn newborn_engine_not_evicted_before_first_attach() {
+    let h = VoiceHarness::start(false);
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let (_ftx, flushed_rx) = mpsc::channel();
+    h.ev_tx
+        .send(Event::EvictIdle { port: h.mic_port, reply_tx, flushed_rx })
+        .unwrap();
+    assert!(
+        !reply_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "newborn daemon must not be evicted before initial attach"
+    );
+    // Initial attach still succeeds afterwards.
+    let c = h.attach(None, None).unwrap();
+    c.close();
+    h.stop();
+}
+
+#[test]
+fn mic_fin_half_close_flushes_queued_tail_pcm() {
+    let h = VoiceHarness::start(false);
+    let mut client = h.attach(None, None).unwrap();
+    let mut agy_mic = h.connect_agy();
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::MIC_START);
+    let mic_id = u32::from_le_bytes(p[0..4].try_into().unwrap());
+
+    // Push several chunks and immediately FIN-close agy's write half before reading them.
+    let tail = vec![0x42u8; 640];
+    for _ in 0..5 {
+        client.send(ClientMsg::MicAudio { stream_id: mic_id, pcm: tail.clone() });
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    agy_mic.shutdown(Shutdown::Write).unwrap();
+
+    let mut got = Vec::new();
+    agy_mic.read_to_end(&mut got).unwrap();
+    assert_eq!(got.len(), 640 * 5, "all queued tail PCM chunks must flush before FIN");
+    assert_eq!(client.recv_frame().0, ty::MIC_STOP);
+
+    client.close();
+    h.stop();
+}
+
+#[test]
+fn force_shutdown_evicts_active_session_for_uninstall() {
+    let mut h = VoiceHarness::start(false);
+    let c = h.attach(None, None).unwrap();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let (_ftx, flushed_rx) = mpsc::channel();
+    h.ev_tx
+        .send(Event::ForceShutdown { reply_tx, flushed_rx })
+        .unwrap();
+    assert!(reply_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    let worker = h.worker.take().unwrap();
+    worker.join().unwrap();
+    c.close();
     h.stop();
 }
 

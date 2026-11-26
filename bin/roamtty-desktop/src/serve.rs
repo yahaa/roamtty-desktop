@@ -475,7 +475,7 @@ fn run_with(mut args: Args, input: Box<dyn std::io::Read + Send>, output: Box<dy
         }
         if ended { break; }
         if ssh_closed.is_some() && out.link.as_ref().is_none_or(|l| l.silent_us() > 30_000_000) { break; }
-        if let Some(l) = &out.link { l.tick(); }
+        if let Some(l) = &out.link { let _ = l.tick(); }
         let udp = out.udp();
         if udp != was_udp {
             crate::log!("transport {}", if udp { "udp" } else { "ssh" });

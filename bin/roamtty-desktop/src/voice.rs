@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,12 @@ const MIN_SAMPLE_RATE: u32 = 8_000;
 const MAX_SAMPLE_RATE: u32 = 192_000;
 const MIC_QUEUE_MAX_CHUNKS: usize = 100;
 const UDP_KEEPALIVE_US: u64 = 30_000_000;
+const IPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const SSH_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const SSH_QUEUE_CAPACITY: usize = 256;
+const EV_CHANNEL_CAPACITY: usize = 512;
+const MAX_EVENT_DRAIN: usize = 64;
+const MAX_AGY_CONNS: usize = 32;
 const EXIT_BIND_FAILED: i32 = 10;
 
 fn voice_dir() -> PathBuf {
@@ -66,6 +72,8 @@ struct AttachReq {
     ssh_client: Option<String>,
     #[serde(default)]
     evict_idle_port: Option<u16>,
+    #[serde(default)]
+    shutdown: bool,
 }
 
 /// Entry point for `roamtty-desktop voice --proto 1 [--port P] [--resume S --token T] [--idle-timeout SEC]`.
@@ -137,21 +145,43 @@ fn list_voice_sessions() -> Vec<String> {
     out
 }
 
+fn is_stale_ipc_error(e: &io::Error) -> bool {
+    // On Windows, connecting to an unused loopback TCP port takes ~1s to return WSAECONNREFUSED,
+    // so our 300ms loopback connect_timeout surfaces TimedOut for dead IPC ports.
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::InvalidData
+    )
+}
+
+fn wait_for_session_exit(sess: &str, max_wait: Duration) {
+    let deadline = Instant::now() + max_wait;
+    while Instant::now() < deadline {
+        if ipc::read_token(sess).is_none() {
+            return;
+        }
+        match ipc::connect(sess) {
+            Ok(c) => c.close(),
+            Err(e) if is_stale_ipc_error(&e) => {
+                ipc::cleanup(sess);
+                return;
+            }
+            Err(_) => return,
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn evict_idle_daemons_on_port(port: u16) {
     for sess in list_voice_sessions() {
         let Some(ipc_token) = ipc::read_token(&sess) else { continue };
         let mut conn = match ipc::connect(&sess) {
             Ok(c) => c,
             Err(e) => {
-                // On Windows, connecting to an unused loopback TCP port takes ~1s to return WSAECONNREFUSED,
-                // so our 300ms loopback connect_timeout surfaces TimedOut for dead IPC ports.
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::ConnectionRefused
-                        | io::ErrorKind::NotFound
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::InvalidData
-                ) {
+                if is_stale_ipc_error(&e) {
                     ipc::cleanup(&sess);
                 }
                 continue;
@@ -166,11 +196,53 @@ fn evict_idle_daemons_on_port(port: u16) {
             idle_timeout: None,
             ssh_client: None,
             evict_idle_port: Some(port),
+            shutdown: false,
         };
-        if writeln!(conn, "{}", serde_json::to_string(&req).unwrap()).is_ok() && conn.flush().is_ok() {
-            let _ = read_line_unbuffered(&mut *conn, 64);
-        }
+        let reply = if writeln!(conn, "{}", serde_json::to_string(&req).unwrap()).is_ok() && conn.flush().is_ok() {
+            read_line_unbuffered(&mut *conn, 64).ok()
+        } else {
+            None
+        };
         conn.close();
+        if reply.as_deref().is_some_and(|r| r.trim() == "ERR shutting down") {
+            wait_for_session_exit(&sess, Duration::from_millis(200));
+        }
+    }
+}
+
+/// Gracefully shuts down all running voice daemons (used by `uninstall`).
+pub fn stop_all_daemons() {
+    for sess in list_voice_sessions() {
+        let Some(ipc_token) = ipc::read_token(&sess) else { continue };
+        let mut conn = match ipc::connect(&sess) {
+            Ok(c) => c,
+            Err(e) => {
+                if is_stale_ipc_error(&e) {
+                    ipc::cleanup(&sess);
+                }
+                continue;
+            }
+        };
+        conn.set_io_timeout(Some(Duration::from_millis(500)));
+        let req = AttachReq {
+            ipc_token: ipc_token.trim().to_string(),
+            proto: proto::PROTO,
+            resume: None,
+            token: None,
+            idle_timeout: None,
+            ssh_client: None,
+            evict_idle_port: None,
+            shutdown: true,
+        };
+        let reply = if writeln!(conn, "{}", serde_json::to_string(&req).unwrap()).is_ok() && conn.flush().is_ok() {
+            read_line_unbuffered(&mut *conn, 64).ok()
+        } else {
+            None
+        };
+        conn.close();
+        if reply.as_deref().is_none_or(|r| r.trim() == "ERR shutting down") {
+            wait_for_session_exit(&sess, Duration::from_millis(200));
+        }
     }
 }
 
@@ -203,7 +275,8 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
         session: sess_id.clone(),
         resume_token: session::random_b64(16),
     };
-    let ipc_listener = match ipc::listen(&sess_id, &ipc_token) {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let ipc_listener = match ipc::listen(&sess_id, &ipc_token, shutdown.clone()) {
         Ok(l) => l,
         Err(e) => {
             crate::log!("voice-daemon ipc listen failed: {e}");
@@ -213,8 +286,7 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
     };
     crate::log!("voice-daemon start session={sess_id} mic_port={mic_port} idle={idle_secs}s");
 
-    let (ev_tx, ev_rx) = mpsc::channel::<Event>();
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let (ev_tx, ev_rx) = mpsc::sync_channel::<Event>(EV_CHANNEL_CAPACITY);
     let client_connected = Arc::new(AtomicBool::new(false));
     let next_stream_id = Arc::new(AtomicU32::new(1));
 
@@ -236,12 +308,15 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
         client_connected,
         shutdown.clone(),
     );
-    let evict_reply = engine.run(ev_rx);
+    let exit = engine.run(ev_rx);
 
     shutdown.store(true, Ordering::SeqCst);
     let _ = mic_accept.join();
     ipc::cleanup(&sess_id);
-    if let Some((reply_tx, flushed_rx)) = evict_reply {
+    if let Some(c) = exit.active_client {
+        c.close();
+    }
+    if let Some((reply_tx, flushed_rx)) = exit.evict_reply {
         let _ = reply_tx.send(true);
         let _ = flushed_rx.recv_timeout(Duration::from_millis(200));
     }
@@ -261,11 +336,12 @@ fn try_attach_existing(
     let ipc_token = ipc::read_token(sess_id).ok_or_else(|| "missing token".to_string())?;
     let mut conn = ipc::connect(sess_id).map_err(|e| {
         // Stale socket/ipc file from a dead daemon: clean up quietly only when probing an existing session.
-        if cleanup_stale && e.kind() == io::ErrorKind::ConnectionRefused {
+        if cleanup_stale && is_stale_ipc_error(&e) {
             ipc::cleanup(sess_id);
         }
         e.to_string()
     })?;
+    conn.set_io_timeout(Some(IPC_HANDSHAKE_TIMEOUT));
     let req = AttachReq {
         ipc_token: ipc_token.trim().to_string(),
         proto: proto_ver,
@@ -274,11 +350,21 @@ fn try_attach_existing(
         idle_timeout,
         ssh_client,
         evict_idle_port: None,
+        shutdown: false,
     };
-    writeln!(conn, "{}", serde_json::to_string(&req).unwrap()).map_err(|e| e.to_string())?;
-    conn.flush().map_err(|e| e.to_string())?;
-    let status = read_line_unbuffered(&mut *conn, 64).map_err(|e| e.to_string())?;
+    if let Err(e) = writeln!(conn, "{}", serde_json::to_string(&req).unwrap()).and_then(|_| conn.flush()) {
+        conn.close();
+        return Err(e.to_string());
+    }
+    let status = match read_line_unbuffered(&mut *conn, 64) {
+        Ok(s) => s,
+        Err(e) => {
+            conn.close();
+            return Err(e.to_string());
+        }
+    };
     if status.trim() == "OK" {
+        conn.set_io_timeout(None);
         Ok(conn)
     } else {
         conn.close();
@@ -342,6 +428,7 @@ fn spawn_and_attach(
         std::thread::sleep(Duration::from_millis(15));
     }
     let _ = child.kill();
+    let _ = child.wait();
     ipc::cleanup(sess_id);
     Err(("internal", "voice-daemon did not become ready in time".into()))
 }
@@ -379,27 +466,42 @@ fn relay_to_stdio(conn: Box<dyn IpcConn>) -> i32 {
 fn relay(mut conn: Box<dyn IpcConn>, mut input: impl Read + Send + 'static, mut output: impl Write + Send + 'static) -> io::Result<()> {
     let mut back = conn.split()?;
     let closer = conn.split()?;
+    enum RelayEnd {
+        Up,
+        Down,
+    }
     let (done, ended) = mpsc::channel();
     let up = done.clone();
     std::thread::spawn(move || {
         let _ = io::copy(&mut input, &mut conn);
-        let _ = up.send(());
+        let _ = conn.flush();
+        conn.shutdown_write();
+        let _ = up.send(RelayEnd::Up);
     });
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 1 << 16];
         loop {
             match back.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => {
                     if output.write_all(&buf[..n]).and_then(|_| output.flush()).is_err() {
                         break;
                     }
                 }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
         }
-        let _ = done.send(());
+        let _ = done.send(RelayEnd::Down);
     });
-    let _ = ended.recv();
+    match ended.recv() {
+        Ok(RelayEnd::Up) => {
+            // Allow the daemon to finish processing any final frame (e.g. `CONFIG {"shutdown":true}`)
+            // and close the IPC stream cleanly before forcing Shutdown::Both, preventing TCP RST.
+            let _ = ended.recv_timeout(Duration::from_millis(250));
+        }
+        Ok(RelayEnd::Down) | Err(_) => {}
+    }
     closer.close();
     Ok(())
 }
@@ -460,7 +562,7 @@ fn classify_connection(stream: &TcpStream) -> ConnKind {
     let deadline = Instant::now() + PEEK_TIMEOUT;
     let mut buf = [0u8; HEADER_MAX_BYTES];
     loop {
-        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
             return ConnKind::Mic;
         };
         if stream.set_read_timeout(Some(rem)).is_err() {
@@ -494,6 +596,7 @@ fn parse_speaker_header(line: &str) -> Result<u32, &'static str> {
         _ => return Err("expected speaker role"),
     }
     let mut rate: Option<u32> = None;
+    let mut channels: Option<u8> = None;
     for tok in parts {
         if let Some(val) = tok.strip_prefix("rate=") {
             if rate.is_some() {
@@ -504,6 +607,15 @@ fn parse_speaker_header(line: &str) -> Result<u32, &'static str> {
                 return Err("sample rate out of range");
             }
             rate = Some(parsed);
+        } else if let Some(val) = tok.strip_prefix("channels=") {
+            if channels.is_some() {
+                return Err("duplicate channels");
+            }
+            let parsed = val.parse::<u8>().map_err(|_| "invalid channels")?;
+            if parsed != CHANNELS {
+                return Err("unsupported channel count");
+            }
+            channels = Some(parsed);
         }
     }
     rate.ok_or("missing sample rate")
@@ -548,7 +660,7 @@ fn read_speaker_header(reader: &mut BufReader<TcpStream>, shutdown: &AtomicBool)
         if shutdown.load(Ordering::Relaxed) {
             return Err("daemon shutting down");
         }
-        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
             return Err("header timeout");
         };
         let _ = reader.get_ref().set_read_timeout(Some(rem.min(Duration::from_millis(100))));
@@ -583,8 +695,8 @@ fn read_speaker_header(reader: &mut BufReader<TcpStream>, shutdown: &AtomicBool)
 }
 
 /// Reads exactly `dst.len()` bytes from `reader`, polling `stop`/`shutdown` between short timeouts.
-/// Returns `Ok(true)` on full read, `Ok(false)` on clean EOF/stop before any byte was read,
-/// or `Err` on partial EOF / deadline exceeded / I/O error.
+/// Returns `Ok(true)` on full read, `Ok(false)` on clean EOF before any byte when `in_frame_deadline`
+/// is `None` (between frames) or on stop/shutdown, or `Err` on truncated EOF / deadline / I/O error.
 fn read_exact_interruptible(
     reader: &mut BufReader<TcpStream>,
     dst: &mut [u8],
@@ -599,7 +711,7 @@ fn read_exact_interruptible(
             return Ok(false);
         }
         let timeout = if let Some(dl) = mid_deadline {
-            let Some(rem) = dl.checked_duration_since(Instant::now()) else {
+            let Some(rem) = dl.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "frame read timeout"));
             };
             rem.min(Duration::from_millis(100))
@@ -609,7 +721,7 @@ fn read_exact_interruptible(
         let _ = reader.get_ref().set_read_timeout(Some(timeout));
         match reader.read(&mut dst[off..]) {
             Ok(0) => {
-                if off == 0 {
+                if off == 0 && in_frame_deadline.is_none() {
                     return Ok(false);
                 }
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated frame"));
@@ -719,22 +831,139 @@ enum Event {
         reply_tx: mpsc::Sender<bool>,
         flushed_rx: mpsc::Receiver<()>,
     },
+    ForceShutdown {
+        reply_tx: mpsc::Sender<bool>,
+        flushed_rx: mpsc::Receiver<()>,
+    },
     #[cfg_attr(not(test), allow(dead_code))]
     Shutdown,
 }
 
+enum SshOutItem {
+    Raw(Vec<u8>),
+    Frame { ty: u8, payload: Vec<u8> },
+}
+
+impl SshOutItem {
+    fn is_droppable_audio(&self) -> bool {
+        matches!(self, SshOutItem::Frame { ty: ty::SPK_AUDIO, .. })
+    }
+}
+
+struct SshQueue {
+    items: VecDeque<SshOutItem>,
+    closed: bool,
+    failed: bool,
+}
+
+/// Non-blocking bounded writer queue decoupled onto a dedicated thread so `VoiceEngine::run`
+/// never blocks in kernel `write()`/`flush()` when an SSH `relay()` stalls.
+struct SshWriter {
+    queue: Arc<(Mutex<SshQueue>, Condvar)>,
+}
+
+impl SshWriter {
+    fn spawn(output: Box<dyn Write + Send>, epoch: u64, ev_tx: mpsc::SyncSender<Event>) -> Self {
+        let queue = Arc::new((
+            Mutex::new(SshQueue {
+                items: VecDeque::new(),
+                closed: false,
+                failed: false,
+            }),
+            Condvar::new(),
+        ));
+        let q_clone = queue.clone();
+        std::thread::spawn(move || {
+            let (lock, cvar) = &*q_clone;
+            let mut writer = BufWriter::with_capacity(64 * 1024, output);
+            loop {
+                let batch: Vec<SshOutItem> = {
+                    let mut q = lock.lock().unwrap();
+                    while q.items.is_empty() && !q.closed && !q.failed {
+                        q = cvar.wait(q).unwrap();
+                    }
+                    if q.closed || q.failed {
+                        break;
+                    }
+                    q.items.drain(..).collect()
+                };
+                let mut err = false;
+                for item in batch {
+                    let res = match item {
+                        SshOutItem::Raw(bytes) => writer.write_all(&bytes),
+                        SshOutItem::Frame { ty, payload } => proto::write_frame(&mut writer, ty, &payload),
+                    };
+                    if res.is_err() {
+                        err = true;
+                        break;
+                    }
+                }
+                if !err && writer.flush().is_err() {
+                    err = true;
+                }
+                if err {
+                    {
+                        let mut q = lock.lock().unwrap();
+                        q.failed = true;
+                        q.items.clear();
+                    }
+                    let _ = ev_tx.send(Event::ClientSshClosed { epoch });
+                    break;
+                }
+            }
+        });
+        Self { queue }
+    }
+
+    /// Enqueues an item without blocking on I/O. Prioritizes control frames by evicting the oldest
+    /// `SPK_AUDIO` frame if full; marks failed and returns `false` if full of control frames or dead.
+    fn enqueue(&self, item: SshOutItem) -> bool {
+        let (lock, cvar) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        if q.closed || q.failed {
+            return false;
+        }
+        if q.items.len() >= SSH_QUEUE_CAPACITY {
+            if let Some(pos) = q.items.iter().position(SshOutItem::is_droppable_audio) {
+                q.items.remove(pos);
+            } else {
+                q.failed = true;
+                q.items.clear();
+                cvar.notify_all();
+                return false;
+            }
+        }
+        q.items.push_back(item);
+        cvar.notify_one();
+        true
+    }
+
+    fn close(&self) {
+        let (lock, cvar) = &*self.queue;
+        {
+            let mut q = lock.lock().unwrap();
+            q.closed = true;
+            q.items.clear();
+        }
+        cvar.notify_all();
+    }
+}
+
 struct ClientOut {
     epoch: u64,
-    ssh: BufWriter<Box<dyn Write + Send>>,
+    ssh: SshWriter,
     ssh_open: bool,
     ssh_closer: Box<dyn Fn() + Send>,
-    ssh_closed_at: Option<Instant>,
     link: Option<Arc<UdpLink>>,
     ssh_client: Option<String>,
     test_hooks: bool,
 }
 
 impl ClientOut {
+    fn udp_alive(&self) -> bool {
+        self.link.as_ref().is_some_and(|l| l.alive())
+    }
+
     fn udp_keeping_alive(&self) -> bool {
         self.link.as_ref().is_some_and(|l| {
             l.enabled.load(Ordering::Relaxed) && l.ever_received() && l.silent_us() <= UDP_KEEPALIVE_US
@@ -745,31 +974,52 @@ impl ClientOut {
         self.ssh_open || self.udp_keeping_alive()
     }
 
-    fn emit(&mut self, t: u8, payload: &[u8]) {
-        if let Some(l) = self.link.as_ref().filter(|l| l.alive()) {
-            l.send_frame(t, payload);
-            return;
+    fn emit_ssh(&mut self, t: u8, payload: &[u8]) -> bool {
+        if !self.ssh_open {
+            return false;
         }
-        if self.ssh_open && proto::write_frame(&mut self.ssh, t, payload).is_err() {
+        if !self.ssh.enqueue(SshOutItem::Frame { ty: t, payload: payload.to_vec() }) {
             self.ssh_open = false;
-            self.ssh_closed_at.get_or_insert_with(Instant::now);
+            self.close_ssh();
+            return false;
         }
+        true
     }
 
-    fn flush(&mut self) {
-        if self.ssh_open && self.ssh.flush().is_err() {
-            self.ssh_open = false;
-            self.ssh_closed_at.get_or_insert_with(Instant::now);
+    fn emit(&mut self, t: u8, payload: &[u8]) -> bool {
+        if let Some(l) = self.link.as_ref().filter(|l| l.alive()) {
+            l.send_frame(t, payload);
+            return true;
         }
+        if self.ssh_open {
+            return self.emit_ssh(t, payload);
+        }
+        if self.udp_keeping_alive() {
+            if let Some(l) = self.link.as_ref() {
+                l.send_frame(t, payload);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn close_ssh(&mut self) {
+        self.ssh_open = false;
+        self.ssh.close();
+        (self.ssh_closer)();
     }
 
     fn close(mut self) {
-        self.flush();
+        self.close_ssh();
         if let Some(l) = self.link.take() {
             l.close();
         }
-        (self.ssh_closer)();
     }
+}
+
+struct EngineExit {
+    active_client: Option<ClientOut>,
+    evict_reply: Option<(mpsc::Sender<bool>, mpsc::Receiver<()>)>,
 }
 
 type UdpBinder = Box<dyn Fn(f64) -> Option<Arc<UdpLink>> + Send>;
@@ -780,7 +1030,7 @@ struct VoiceEngine {
     attached_once: bool,
     idle_timeout: Duration,
     bind_udp: UdpBinder,
-    ev_tx: mpsc::Sender<Event>,
+    ev_tx: mpsc::SyncSender<Event>,
     client_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     client: Option<ClientOut>,
@@ -797,7 +1047,7 @@ impl VoiceEngine {
         session: Session,
         idle_timeout: Duration,
         bind_udp: UdpBinder,
-        ev_tx: mpsc::Sender<Event>,
+        ev_tx: mpsc::SyncSender<Event>,
         client_connected: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
@@ -820,28 +1070,63 @@ impl VoiceEngine {
     }
 
     fn is_client_reachable(&self) -> bool {
-        self.client
-            .as_ref()
-            .is_some_and(|c| c.ssh_open || c.link.as_ref().is_some_and(|l| l.alive()))
+        self.client.as_ref().is_some_and(|c| c.ssh_open || c.udp_alive())
     }
 
-    fn run(&mut self, ev_rx: mpsc::Receiver<Event>) -> Option<(mpsc::Sender<bool>, mpsc::Receiver<()>)> {
+    fn announce_unannounced_streams(&mut self) {
+        let Some(c) = self.client.as_mut() else {
+            return;
+        };
+        let epoch = c.epoch;
+        let mut mic_ids: Vec<u32> = self
+            .mic_streams
+            .iter()
+            .filter_map(|(&id, m)| (m.announced_to_epoch != Some(epoch)).then_some(id))
+            .collect();
+        mic_ids.sort_unstable();
+        for id in mic_ids {
+            if let Some(m) = self.mic_streams.get_mut(&id) {
+                if c.emit(ty::MIC_START, &proto::mic_start_payload(id, MIC_SAMPLE_RATE, CHANNELS)) {
+                    m.announced_to_epoch = Some(epoch);
+                }
+            }
+        }
+        let mut spk_ids: Vec<u32> = self
+            .spk_streams
+            .iter()
+            .filter_map(|(&id, s)| (s.announced_to_epoch != Some(epoch)).then_some(id))
+            .collect();
+        spk_ids.sort_unstable();
+        for id in spk_ids {
+            if let Some(s) = self.spk_streams.get_mut(&id) {
+                if c.emit(ty::SPK_START, &proto::spk_start_payload(id, s.sample_rate, CHANNELS)) {
+                    s.announced_to_epoch = Some(epoch);
+                }
+            }
+        }
+    }
+
+    fn run(&mut self, ev_rx: mpsc::Receiver<Event>) -> EngineExit {
         loop {
             match ev_rx.recv_timeout(Duration::from_millis(40)) {
                 Ok(ev) => {
                     if !self.handle_event(ev) {
                         break;
                     }
-                    // Drain queued events before flushing so bursts land immediately.
+                    // Drain a bounded batch of queued events before ticking so bursts don't starve timers.
                     let mut stop = false;
-                    while let Ok(next) = ev_rx.try_recv() {
-                        if !self.handle_event(next) {
-                            stop = true;
-                            break;
+                    let mut drained = 1usize;
+                    while drained < MAX_EVENT_DRAIN {
+                        match ev_rx.try_recv() {
+                            Ok(next) => {
+                                drained += 1;
+                                if !self.handle_event(next) {
+                                    stop = true;
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
-                    }
-                    if let Some(c) = self.client.as_mut() {
-                        c.flush();
                     }
                     if stop {
                         break;
@@ -852,8 +1137,36 @@ impl VoiceEngine {
             }
 
             if let Some(c) = self.client.as_mut() {
-                if let Some(l) = &c.link {
-                    l.tick();
+                let expired = if let Some(l) = &c.link {
+                    l.tick()
+                } else {
+                    Vec::new()
+                };
+                let mut unannounced_ids: Vec<(u8, u32)> = Vec::new();
+                for (frame_ty, payload) in expired {
+                    let sent = if c.ssh_open {
+                        c.emit_ssh(frame_ty, &payload)
+                    } else {
+                        false
+                    };
+                    if !sent && matches!(frame_ty, ty::MIC_START | ty::SPK_START) && payload.len() >= 4 {
+                        unannounced_ids.push((frame_ty, u32::from_le_bytes(payload[0..4].try_into().unwrap())));
+                    }
+                }
+                for (frame_ty, id) in unannounced_ids {
+                    match frame_ty {
+                        ty::MIC_START => {
+                            if let Some(m) = self.mic_streams.get_mut(&id) {
+                                m.announced_to_epoch = None;
+                            }
+                        }
+                        ty::SPK_START => {
+                            if let Some(s) = self.spk_streams.get_mut(&id) {
+                                s.announced_to_epoch = None;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 if !c.is_connected() {
                     let old = self.client.take().unwrap();
@@ -861,6 +1174,9 @@ impl VoiceEngine {
                     self.disconnected_since = Some(Instant::now());
                     crate::log!("voice client disconnected (session={})", self.session.session);
                 }
+            }
+            if self.is_client_reachable() {
+                self.announce_unannounced_streams();
             }
             self.client_connected.store(self.is_client_reachable(), Ordering::Relaxed);
 
@@ -871,26 +1187,26 @@ impl VoiceEngine {
                     // Initial grace period for the spawning `voice` CLI to attach over IPC.
                     self.idle_timeout.max(Duration::from_secs(10))
                 };
-                if let Some(since) = self.disconnected_since {
-                    if since.elapsed() >= wait {
-                        break;
-                    }
+                let since = *self.disconnected_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= wait {
+                    break;
                 }
             }
         }
 
         self.shutdown.store(true, Ordering::SeqCst);
         self.client_connected.store(false, Ordering::Relaxed);
-        if let Some(old) = self.client.take() {
-            old.close();
-        }
+        let active_client = self.client.take();
         for (_, m) in self.mic_streams.drain() {
             m.close();
         }
         for (_, s) in self.spk_streams.drain() {
             s.stop_flag.store(true, Ordering::SeqCst);
         }
-        self.evict_reply.take()
+        EngineExit {
+            active_client,
+            evict_reply: self.evict_reply.take(),
+        }
     }
 
     fn handle_event(&mut self, ev: Event) -> bool {
@@ -905,25 +1221,33 @@ impl VoiceEngine {
                 }
             }
             Event::EvictIdle { port, reply_tx, flushed_rx } => {
-                if self.mic_port == port && !self.is_client_reachable() {
+                if self.mic_port == port
+                    && self.attached_once
+                    && !self.client.as_ref().is_some_and(|c| c.is_connected())
+                {
                     crate::log!("voice-daemon evicted idle session={} mic_port={port}", self.session.session);
                     self.evict_reply = Some((reply_tx, flushed_rx));
                     return false;
                 }
                 let _ = reply_tx.send(false);
             }
+            Event::ForceShutdown { reply_tx, flushed_rx } => {
+                crate::log!("voice-daemon forced shutdown session={}", self.session.session);
+                self.evict_reply = Some((reply_tx, flushed_rx));
+                return false;
+            }
             Event::ClientSshClosed { epoch } => {
                 if let Some(c) = self.client.as_mut() {
                     if c.epoch == epoch {
-                        c.ssh_open = false;
-                        c.ssh_closed_at.get_or_insert_with(Instant::now);
+                        c.close_ssh();
                     }
                 }
             }
             Event::AgyMicOpen { stream_id, mut handle } => {
                 if let Some(c) = self.client.as_mut() {
-                    c.emit(ty::MIC_START, &proto::mic_start_payload(stream_id, MIC_SAMPLE_RATE, CHANNELS));
-                    handle.announced_to_epoch = Some(c.epoch);
+                    if c.emit(ty::MIC_START, &proto::mic_start_payload(stream_id, MIC_SAMPLE_RATE, CHANNELS)) {
+                        handle.announced_to_epoch = Some(c.epoch);
+                    }
                 }
                 self.mic_streams.insert(stream_id, handle);
             }
@@ -931,7 +1255,7 @@ impl VoiceEngine {
                 if let Some(handle) = self.mic_streams.remove(&stream_id) {
                     if let Some(c) = self.client.as_mut() {
                         if handle.announced_to_epoch == Some(c.epoch) {
-                            c.emit(ty::MIC_STOP, &proto::mic_stop_payload(stream_id));
+                            let _ = c.emit(ty::MIC_STOP, &proto::mic_stop_payload(stream_id));
                         }
                     }
                 }
@@ -944,22 +1268,23 @@ impl VoiceEngine {
                     announced_to_epoch: None,
                 };
                 if let Some(c) = self.client.as_mut() {
-                    c.emit(ty::SPK_START, &proto::spk_start_payload(stream_id, sample_rate, CHANNELS));
-                    state.announced_to_epoch = Some(c.epoch);
+                    if c.emit(ty::SPK_START, &proto::spk_start_payload(stream_id, sample_rate, CHANNELS)) {
+                        state.announced_to_epoch = Some(c.epoch);
+                    }
                 }
                 self.spk_streams.insert(stream_id, state);
             }
             Event::AgySpkAudio { stream_id, pcm } => {
                 if self.spk_streams.contains_key(&stream_id) {
                     if let Some(c) = self.client.as_mut() {
-                        c.emit(ty::SPK_AUDIO, &proto::spk_audio_payload(stream_id, &pcm));
+                        let _ = c.emit(ty::SPK_AUDIO, &proto::spk_audio_payload(stream_id, &pcm));
                     }
                 }
             }
             Event::AgySpkClear { stream_id } => {
                 if self.spk_streams.contains_key(&stream_id) {
                     if let Some(c) = self.client.as_mut() {
-                        c.emit(ty::SPK_CLEAR, &proto::spk_clear_payload(stream_id));
+                        let _ = c.emit(ty::SPK_CLEAR, &proto::spk_clear_payload(stream_id));
                     }
                 }
             }
@@ -968,7 +1293,7 @@ impl VoiceEngine {
                     if notify_client {
                         if let Some(c) = self.client.as_mut() {
                             if state.announced_to_epoch == Some(c.epoch) {
-                                c.emit(ty::SPK_STOP, &proto::spk_stop_payload(stream_id));
+                                let _ = c.emit(ty::SPK_STOP, &proto::spk_stop_payload(stream_id));
                             }
                         }
                     }
@@ -982,7 +1307,7 @@ impl VoiceEngine {
         &mut self,
         req: AttachReq,
         input: Box<dyn Read + Send>,
-        mut output: Box<dyn Write + Send>,
+        output: Box<dyn Write + Send>,
         closer: Box<dyn Fn() + Send>,
         reply_tx: mpsc::Sender<bool>,
     ) {
@@ -1004,14 +1329,19 @@ impl VoiceEngine {
         }
 
         if let Some(old) = self.client.take() {
-            // Valid resume silently replaces the prior controller.
+            // Valid resume silently replaces the prior controller; stamp disconnected_since
+            // immediately so any early return below never leaks the daemon without an idle timer.
+            self.disconnected_since = Some(Instant::now());
+            self.client_connected.store(false, Ordering::Relaxed);
             old.close();
+        } else if self.disconnected_since.is_none() {
+            self.disconnected_since = Some(Instant::now());
         }
         if let Some(secs) = req.idle_timeout {
             self.idle_timeout = Duration::from_secs(secs);
         }
 
-        // Confirm attach to the IPC handler BEFORE writing `VoiceHello` so `voice::cmd` sees `OK\n` first.
+        // Confirm attach to the IPC handler BEFORE queueing `VoiceHello` so `voice::cmd` sees `OK\n` first.
         if reply_tx.send(true).is_err() {
             closer();
             return;
@@ -1029,22 +1359,16 @@ impl VoiceEngine {
             udp: link.as_ref().map(|l| proto::Udp { port: l.port, key: session::b64(&l.key) }),
             codecs: vec!["pcm16".into()],
         };
-
-        if writeln!(output, "{}", serde_json::to_string(&hello).unwrap())
-            .and_then(|_| output.flush())
-            .is_err()
-        {
-            if let Some(l) = link {
-                l.close();
-            }
-            closer();
-            return;
-        }
+        let mut hello_line = serde_json::to_string(&hello).unwrap();
+        hello_line.push('\n');
 
         self.attached_once = true;
         self.disconnected_since = None;
         self.epoch += 1;
         let epoch = self.epoch;
+
+        let ssh = SshWriter::spawn(output, epoch, self.ev_tx.clone());
+        let ssh_open = ssh.enqueue(SshOutItem::Raw(hello_line.into_bytes()));
 
         if let Some(l) = &link {
             let (utx, urx) = mpsc::channel::<Option<ClientMsg>>();
@@ -1080,37 +1404,19 @@ impl VoiceEngine {
             }
         });
 
-        let mut out = ClientOut {
+        let out = ClientOut {
             epoch,
-            ssh: BufWriter::with_capacity(64 * 1024, output),
-            ssh_open: true,
+            ssh,
+            ssh_open,
             ssh_closer: closer,
-            ssh_closed_at: None,
             link,
             ssh_client: req.ssh_client,
             test_hooks: std::env::var("ROAMTTY_DESKTOP_TEST").as_deref() == Ok("1"),
         };
 
-        // Re-announce any still-open `agy` mic/speaker streams so a resumed app picks them up seamlessly.
-        let mut mic_ids: Vec<u32> = self.mic_streams.keys().copied().collect();
-        mic_ids.sort_unstable();
-        for id in mic_ids {
-            if let Some(m) = self.mic_streams.get_mut(&id) {
-                out.emit(ty::MIC_START, &proto::mic_start_payload(id, MIC_SAMPLE_RATE, CHANNELS));
-                m.announced_to_epoch = Some(epoch);
-            }
-        }
-        let mut spk_ids: Vec<u32> = self.spk_streams.keys().copied().collect();
-        spk_ids.sort_unstable();
-        for id in spk_ids {
-            if let Some(s) = self.spk_streams.get_mut(&id) {
-                out.emit(ty::SPK_START, &proto::spk_start_payload(id, s.sample_rate, CHANNELS));
-                s.announced_to_epoch = Some(epoch);
-            }
-        }
-        out.flush();
         self.client = Some(out);
-        self.client_connected.store(true, Ordering::Relaxed);
+        self.announce_unannounced_streams();
+        self.client_connected.store(self.is_client_reachable(), Ordering::Relaxed);
     }
 
     fn handle_client_msg(&mut self, msg: ClientMsg) -> bool {
@@ -1143,7 +1449,7 @@ impl VoiceEngine {
             ClientMsg::Ping(t1) => {
                 if let Some(out) = self.client.as_mut() {
                     let t2 = crate::serve::now_us();
-                    out.emit(ty::PONG, &proto::pong_payload(t1, t2, crate::serve::now_us()));
+                    let _ = out.emit(ty::PONG, &proto::pong_payload(t1, t2, crate::serve::now_us()));
                 }
             }
             ClientMsg::MicAudio { stream_id, pcm } => {
@@ -1192,18 +1498,49 @@ fn next_id(counter: &AtomicU32) -> u32 {
     }
 }
 
+struct ConnGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnGuard {
+    fn try_acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        let mut cur = active.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_AGY_CONNS {
+                return None;
+            }
+            match active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Some(Self { active: active.clone() }),
+                Err(next) => cur = next,
+            }
+        }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn spawn_mic_accept_loop(
     listener: TcpListener,
     next_stream_id: Arc<AtomicU32>,
-    ev_tx: mpsc::Sender<Event>,
+    ev_tx: mpsc::SyncSender<Event>,
     client_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     let _ = listener.set_nonblocking(true);
+    let active_conns = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         while !shutdown.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    let Some(guard) = ConnGuard::try_acquire(&active_conns) else {
+                        crate::log!("voice max concurrent agy connections ({MAX_AGY_CONNS}) reached; rejecting");
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_nodelay(true);
                     let next_stream_id = next_stream_id.clone();
@@ -1211,34 +1548,64 @@ fn spawn_mic_accept_loop(
                     let client_connected = client_connected.clone();
                     let shutdown = shutdown.clone();
                     std::thread::spawn(move || {
-                        handle_agy_conn(stream, &next_stream_id, ev_tx, client_connected, shutdown)
+                        let _guard = guard;
+                        handle_agy_conn(stream, &next_stream_id, ev_tx, client_connected, shutdown);
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Err(_) => break,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    crate::log!("voice mic accept error: {e}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
     })
 }
 
-fn write_spk_err_and_close(stream: &mut TcpStream, reason: &str) {
+fn write_spk_err_and_close(stream: &mut TcpStream, reason: &str, shutdown: &AtomicBool) {
     let _ = stream.set_write_timeout(Some(MIC_WRITE_TIMEOUT));
     let _ = stream.write_all(&format_spk_err(reason));
     let _ = stream.flush();
     // Half-close write and drain any unread bytes (such as peeked invalid headers) before drop
     // so peers (especially Winsock) receive the ERR line followed by clean FIN instead of RST.
     let _ = stream.shutdown(Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let deadline = Instant::now() + Duration::from_millis(100);
     let mut drain = [0u8; 512];
-    while matches!(stream.read(&mut drain), Ok(n) if n > 0) {}
+    let mut drained = 0usize;
+    const MAX_DRAIN_BYTES: usize = 64 * 1024;
+    while drained < MAX_DRAIN_BYTES && !shutdown.load(Ordering::Relaxed) {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+            break;
+        };
+        let _ = stream.set_read_timeout(Some(rem.min(Duration::from_millis(50))));
+        match stream.read(&mut drain) {
+            Ok(0) => break,
+            Ok(n) => drained += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 fn handle_agy_conn(
     mut stream: TcpStream,
     next_stream_id: &AtomicU32,
-    ev_tx: mpsc::Sender<Event>,
+    ev_tx: mpsc::SyncSender<Event>,
     client_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -1247,7 +1614,7 @@ fn handle_agy_conn(
             let _ = stream.shutdown(Shutdown::Both);
         }
         ConnKind::Invalid => {
-            write_spk_err_and_close(&mut stream, "invalid header");
+            write_spk_err_and_close(&mut stream, "invalid header", &shutdown);
         }
         ConnKind::Speaker => handle_speaker_conn(stream, next_stream_id, ev_tx, client_connected, shutdown),
         ConnKind::Mic => handle_mic_conn(stream, next_stream_id, ev_tx, shutdown),
@@ -1257,7 +1624,7 @@ fn handle_agy_conn(
 fn handle_speaker_conn(
     stream: TcpStream,
     next_stream_id: &AtomicU32,
-    ev_tx: mpsc::Sender<Event>,
+    ev_tx: mpsc::SyncSender<Event>,
     client_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -1270,7 +1637,7 @@ fn handle_speaker_conn(
     let sample_rate = match read_speaker_header(&mut reader, &shutdown) {
         Ok(rate) => rate,
         Err(reason) => {
-            write_spk_err_and_close(&mut write_half, reason);
+            write_spk_err_and_close(&mut write_half, reason, &shutdown);
             return;
         }
     };
@@ -1288,7 +1655,7 @@ fn handle_speaker_conn(
         })
         .is_err()
     {
-        write_spk_err_and_close(&mut write_half, "bridge unavailable");
+        write_spk_err_and_close(&mut write_half, "bridge unavailable", &shutdown);
         return;
     }
 
@@ -1301,7 +1668,7 @@ fn handle_speaker_conn(
             }
         }
         Ok((false, err)) => {
-            write_spk_err_and_close(&mut write_half, &err);
+            write_spk_err_and_close(&mut write_half, &err, &shutdown);
             let _ = ev_tx.send(Event::AgySpkClosed { stream_id, notify_client: false });
             return;
         }
@@ -1311,7 +1678,7 @@ fn handle_speaker_conn(
             } else {
                 "no voice client connected"
             };
-            write_spk_err_and_close(&mut write_half, reason);
+            write_spk_err_and_close(&mut write_half, reason, &shutdown);
             let _ = ev_tx.send(Event::AgySpkClosed { stream_id, notify_client: true });
             return;
         }
@@ -1343,17 +1710,26 @@ fn handle_speaker_conn(
                     crate::log!("voice speaker {stream_id} odd-length 'A' frame len={len}");
                     break;
                 }
-                let mut payload = vec![0u8; len];
+                // Stream payload incrementally in MAX_SPK_AUDIO_CHUNK (960B) buffers rather than
+                // allocating up to 1 MiB upfront.
+                let mut remaining = len;
                 let deadline = Instant::now() + SPK_FRAME_READ_TIMEOUT;
-                match read_exact_interruptible(&mut reader, &mut payload, &stop_flag, &shutdown, Some(deadline)) {
-                    Ok(true) => {
-                        for chunk in payload.chunks(MAX_SPK_AUDIO_CHUNK) {
-                            if ev_tx.send(Event::AgySpkAudio { stream_id, pcm: chunk.to_vec() }).is_err() {
+                while remaining > 0 {
+                    let take = remaining.min(MAX_SPK_AUDIO_CHUNK);
+                    let mut chunk = vec![0u8; take];
+                    match read_exact_interruptible(&mut reader, &mut chunk, &stop_flag, &shutdown, Some(deadline)) {
+                        Ok(true) => {
+                            remaining -= take;
+                            if ev_tx.send(Event::AgySpkAudio { stream_id, pcm: chunk }).is_err() {
                                 break 'frames;
                             }
                         }
+                        Ok(false) => break 'frames,
+                        Err(e) => {
+                            crate::log!("voice speaker {stream_id} payload read error: {e}");
+                            break 'frames;
+                        }
                     }
-                    Ok(false) | Err(_) => break,
                 }
             }
             b'C' => {
@@ -1379,7 +1755,7 @@ fn handle_speaker_conn(
 fn handle_mic_conn(
     stream: TcpStream,
     next_stream_id: &AtomicU32,
-    ev_tx: mpsc::Sender<Event>,
+    ev_tx: mpsc::SyncSender<Event>,
     shutdown: Arc<AtomicBool>,
 ) {
     let Ok(mut write_stream) = stream.try_clone() else {
@@ -1422,10 +1798,13 @@ fn handle_mic_conn(
                 while q.chunks.is_empty() && !q.closed {
                     q = cvar.wait(q).unwrap();
                 }
-                if q.closed {
+                if let Some(pcm) = q.chunks.pop_front() {
+                    Some(pcm)
+                } else if q.closed {
                     break;
+                } else {
+                    None
                 }
-                q.chunks.pop_front()
             };
             let Some(pcm) = chunk else {
                 continue;
@@ -1435,6 +1814,7 @@ fn handle_mic_conn(
                 had_error = true;
                 let mut q = lock.lock().unwrap();
                 q.closed = true;
+                q.chunks.clear();
                 cvar.notify_all();
                 break;
             }
@@ -1453,6 +1833,7 @@ fn handle_mic_conn(
 
     // Reader loop: detects `agy` half-close (FIN / EOF) or reset.
     let mut buf = [0u8; 64];
+    let mut logged_unexpected = false;
     let (lock, cvar) = &*queue;
     loop {
         if shutdown.load(Ordering::Relaxed) || lock.lock().unwrap().closed {
@@ -1460,7 +1841,12 @@ fn handle_mic_conn(
         }
         match read_stream.read(&mut buf) {
             Ok(0) => break, // `agy` half-closed write end (FIN) to stop recording.
-            Ok(_) => {}     // Ignore unexpected bytes from peer on mic socket.
+            Ok(n) => {
+                if !logged_unexpected {
+                    crate::log!("voice mic {stream_id} received unexpected {n} bytes from peer; ignoring");
+                    logged_unexpected = true;
+                }
+            }
             Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {
                 continue;
             }
@@ -1487,13 +1873,34 @@ fn handle_mic_conn(
 trait IpcConn: Read + Write + Send {
     fn split(&self) -> io::Result<Box<dyn IpcConn>>;
     fn set_io_timeout(&self, dur: Option<Duration>);
+    fn set_write_timeout(&self, dur: Option<Duration>);
+    fn shutdown_write(&self);
     fn close(&self);
+}
+
+impl IpcConn for TcpStream {
+    fn split(&self) -> io::Result<Box<dyn IpcConn>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+    fn set_io_timeout(&self, dur: Option<Duration>) {
+        let _ = self.set_read_timeout(dur);
+        let _ = self.set_write_timeout(dur);
+    }
+    fn set_write_timeout(&self, dur: Option<Duration>) {
+        let _ = TcpStream::set_write_timeout(self, dur);
+    }
+    fn shutdown_write(&self) {
+        let _ = self.shutdown(Shutdown::Write);
+    }
+    fn close(&self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
 }
 
 fn spawn_ipc_accept_loop(
     listener: Box<dyn Iterator<Item = Box<dyn IpcConn>> + Send>,
     ipc_token: String,
-    ev_tx: mpsc::Sender<Event>,
+    ev_tx: mpsc::SyncSender<Event>,
     shutdown: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
@@ -1505,6 +1912,7 @@ fn spawn_ipc_accept_loop(
             let ipc_token = ipc_token.clone();
             let ev_tx = ev_tx.clone();
             std::thread::spawn(move || {
+                conn.set_io_timeout(Some(IPC_HANDSHAKE_TIMEOUT));
                 let Ok(mut read_half) = conn.split() else {
                     conn.close();
                     return;
@@ -1534,6 +1942,30 @@ fn spawn_ipc_accept_loop(
                     conn.close();
                     return;
                 };
+                if req.shutdown {
+                    let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+                    let (flushed_tx, flushed_rx) = mpsc::channel::<()>();
+                    if ev_tx.send(Event::ForceShutdown { reply_tx, flushed_rx }).is_err() {
+                        let _ = writeln!(status_writer, "ERR shutting down");
+                        let _ = status_writer.flush();
+                        status_writer.close();
+                        return;
+                    }
+                    match reply_rx.recv() {
+                        Ok(true) => {
+                            let _ = writeln!(status_writer, "EVICTED");
+                            let _ = status_writer.flush();
+                            status_writer.close();
+                            let _ = flushed_tx.send(());
+                        }
+                        _ => {
+                            let _ = writeln!(status_writer, "ERR shutting down");
+                            let _ = status_writer.flush();
+                            status_writer.close();
+                        }
+                    }
+                    return;
+                }
                 if let Some(port) = req.evict_idle_port {
                     let (reply_tx, reply_rx) = mpsc::channel::<bool>();
                     let (flushed_tx, flushed_rx) = mpsc::channel::<()>();
@@ -1550,22 +1982,27 @@ fn spawn_ipc_accept_loop(
                             status_writer.close();
                             let _ = flushed_tx.send(());
                         }
-                        _ => {
+                        Ok(false) => {
                             let _ = writeln!(status_writer, "BUSY");
+                            let _ = status_writer.flush();
+                            status_writer.close();
+                        }
+                        Err(_) => {
+                            let _ = writeln!(status_writer, "ERR shutting down");
                             let _ = status_writer.flush();
                             status_writer.close();
                         }
                     }
                     return;
                 }
+                // Clear read timeout before handing `read_half` to the long-lived SSH reader thread,
+                // while keeping a short write timeout so a stalled `relay()` cannot wedge `SshWriter`.
+                conn.set_io_timeout(None);
+                conn.set_write_timeout(Some(SSH_WRITE_TIMEOUT));
+
                 let (reply_tx, reply_rx) = mpsc::channel::<bool>();
-                // Write `OK\n` only if authorized, BEFORE `VoiceEngine` writes `VoiceHello`.
-                // To preserve strict ordering between `OK\n` and `VoiceHello`, we wrap output so
-                // `OK\n` is written synchronously when `reply_tx.send(true)` is invoked? Even simpler:
-                // wait on a handshake channel — or have `VoiceEngine` write `OK\n` via a tiny wrapper?
-                // Wait: `VoiceEngine` writes `VoiceHello` right after `reply_tx.send(true)`, which
-                // could race with another thread writing `OK\n`! So wrap `output` to emit `OK\n`
-                // on first write, guaranteeing `OK\n` ALWAYS precedes `VoiceHello`!
+                // `OkPrefixWriter` emits `OK\n` on first write so `OK\n` is guaranteed to precede
+                // `VoiceHello` on the wire without racing across threads.
                 let prefixed_out = Box::new(OkPrefixWriter { inner: conn, sent_ok: false });
                 let closer: Box<dyn Fn() + Send> = Box::new(move || closer_half.close());
                 if ev_tx
@@ -1614,25 +2051,85 @@ impl Write for OkPrefixWriter {
     }
 }
 
-#[cfg(unix)]
 mod ipc {
     use super::*;
-    use std::os::unix::net::{UnixListener, UnixStream};
 
-    // macOS `sockaddr_un.sun_path` is 104 bytes (103 + NUL). If `ROAMTTY_DESKTOP_ROOT` is long
-    // (e.g. macOS `$TMPDIR`), fall back transparently to loopback TCP authenticated by the 0600 token.
-    const MAX_UNIX_PATH_BYTES: usize = 96;
-
-    fn sock_path(sess: &str) -> PathBuf {
-        voice_dir().join(format!("{sess}.sock"))
-    }
     fn port_path(sess: &str) -> PathBuf {
         voice_dir().join(format!("{sess}.ipc"))
     }
+
     fn token_path(sess: &str) -> PathBuf {
         voice_dir().join(format!("{sess}.token"))
     }
 
+    pub fn read_token(sess: &str) -> Option<String> {
+        std::fs::read_to_string(token_path(sess)).ok()
+    }
+
+    fn connect_tcp(port_file: &Path) -> io::Result<Box<dyn IpcConn>> {
+        let port: u16 = std::fs::read_to_string(port_file)?
+            .trim()
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad ipc port"))?;
+        let s = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300))?;
+        let _ = s.set_nodelay(true);
+        Ok(Box::new(s))
+    }
+
+    fn listen_tcp(
+        port_file: &Path,
+        shutdown: Arc<AtomicBool>,
+    ) -> io::Result<Box<dyn Iterator<Item = Box<dyn IpcConn>> + Send>> {
+        let l = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = l.local_addr()?.port();
+        paths::write_private(port_file, port.to_string().as_bytes())?;
+        Ok(Box::new(std::iter::from_fn(move || loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return None;
+            }
+            match l.accept() {
+                Ok((s, _)) => {
+                    let _ = s.set_nodelay(true);
+                    return Some(Box::new(s) as Box<dyn IpcConn>);
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    crate::log!("voice ipc tcp accept error: {e}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        })))
+    }
+
+    #[cfg(unix)]
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    // macOS `sockaddr_un.sun_path` is 104 bytes (103 + NUL). If `ROAMTTY_DESKTOP_ROOT` is long
+    // (e.g. macOS `$TMPDIR`), fall back transparently to loopback TCP authenticated by the 0600 token.
+    #[cfg(unix)]
+    const MAX_UNIX_PATH_BYTES: usize = 96;
+
+    #[cfg(unix)]
+    fn sock_path(sess: &str) -> PathBuf {
+        voice_dir().join(format!("{sess}.sock"))
+    }
+
+    #[cfg(unix)]
     impl IpcConn for UnixStream {
         fn split(&self) -> io::Result<Box<dyn IpcConn>> {
             Ok(Box::new(self.try_clone()?))
@@ -1641,138 +2138,113 @@ mod ipc {
             let _ = self.set_read_timeout(dur);
             let _ = self.set_write_timeout(dur);
         }
-        fn close(&self) {
-            let _ = self.shutdown(Shutdown::Both);
+        fn set_write_timeout(&self, dur: Option<Duration>) {
+            let _ = UnixStream::set_write_timeout(self, dur);
         }
-    }
-
-    impl IpcConn for TcpStream {
-        fn split(&self) -> io::Result<Box<dyn IpcConn>> {
-            Ok(Box::new(self.try_clone()?))
-        }
-        fn set_io_timeout(&self, dur: Option<Duration>) {
-            let _ = self.set_read_timeout(dur);
-            let _ = self.set_write_timeout(dur);
+        fn shutdown_write(&self) {
+            let _ = self.shutdown(Shutdown::Write);
         }
         fn close(&self) {
             let _ = self.shutdown(Shutdown::Both);
         }
     }
 
-    pub fn read_token(sess: &str) -> Option<String> {
-        std::fs::read_to_string(token_path(sess)).ok()
-    }
-
+    #[cfg(unix)]
     pub fn connect(sess: &str) -> io::Result<Box<dyn IpcConn>> {
         let sp = sock_path(sess);
         if sp.exists() {
             return Ok(Box::new(UnixStream::connect(&sp)?));
         }
-        let port: u16 = std::fs::read_to_string(port_path(sess))?
-            .trim()
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad ipc port"))?;
-        let s = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300))?;
-        let _ = s.set_nodelay(true);
-        Ok(Box::new(s))
+        connect_tcp(&port_path(sess))
     }
 
-    pub fn listen(sess: &str, token: &str) -> io::Result<Box<dyn Iterator<Item = Box<dyn IpcConn>> + Send>> {
-        paths::write_private(&token_path(sess), token.as_bytes())?;
+    #[cfg(unix)]
+    pub fn listen(
+        sess: &str,
+        token: &str,
+        shutdown: Arc<AtomicBool>,
+    ) -> io::Result<Box<dyn Iterator<Item = Box<dyn IpcConn>> + Send>> {
         let sp = sock_path(sess);
+        let pp = port_path(sess);
         let _ = std::fs::remove_file(&sp);
-        let _ = std::fs::remove_file(port_path(sess));
-        if sp.as_os_str().len() <= MAX_UNIX_PATH_BYTES {
-            let old = unsafe { libc::umask(0o077) };
-            let bound = UnixListener::bind(&sp);
-            unsafe { libc::umask(old); }
-            if let Ok(l) = bound {
-                return Ok(Box::new(std::iter::from_fn(move || loop {
-                    match l.accept() {
-                        Ok((s, _)) => return Some(Box::new(s) as Box<dyn IpcConn>),
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => return None,
-                    }
-                })));
-            }
-        }
-        let l = TcpListener::bind(("127.0.0.1", 0))?;
-        let port = l.local_addr()?.port();
-        paths::write_private(&port_path(sess), port.to_string().as_bytes())?;
-        Ok(Box::new(std::iter::from_fn(move || loop {
-            match l.accept() {
-                Ok((s, _)) => {
-                    let _ = s.set_nodelay(true);
-                    return Some(Box::new(s) as Box<dyn IpcConn>);
+        let _ = std::fs::remove_file(&pp);
+        // Bind `.sock` / `.ipc` FIRST and publish `.token` LAST so concurrent `voice` startups
+        // never observe a token without an active listener and delete it as stale.
+        let listener: Box<dyn Iterator<Item = Box<dyn IpcConn>> + Send> =
+            if sp.as_os_str().len() <= MAX_UNIX_PATH_BYTES {
+                let old = unsafe { libc::umask(0o077) };
+                let bound = UnixListener::bind(&sp);
+                unsafe { libc::umask(old); }
+                match bound {
+                    Ok(l) => Box::new(std::iter::from_fn(move || loop {
+                        if shutdown.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        match l.accept() {
+                            Ok((s, _)) => return Some(Box::new(s) as Box<dyn IpcConn>),
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::Interrupted
+                                        | io::ErrorKind::ConnectionAborted
+                                        | io::ErrorKind::ConnectionReset
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(e) => {
+                                if shutdown.load(Ordering::Relaxed) {
+                                    return None;
+                                }
+                                crate::log!("voice ipc unix accept error: {e}");
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                    })),
+                    Err(_) => listen_tcp(&pp, shutdown)?,
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => return None,
-            }
-        })))
+            } else {
+                listen_tcp(&pp, shutdown)?
+            };
+        if let Err(e) = paths::write_private(&token_path(sess), token.as_bytes()) {
+            cleanup(sess);
+            return Err(e);
+        }
+        Ok(listener)
     }
 
+    #[cfg(unix)]
     pub fn cleanup(sess: &str) {
         let _ = std::fs::remove_file(sock_path(sess));
         let _ = std::fs::remove_file(port_path(sess));
         let _ = std::fs::remove_file(token_path(sess));
     }
-}
 
-#[cfg(windows)]
-mod ipc {
-    use super::*;
-
-    fn port_path(sess: &str) -> PathBuf {
-        voice_dir().join(format!("{sess}.ipc"))
-    }
-    fn token_path(sess: &str) -> PathBuf {
-        voice_dir().join(format!("{sess}.token"))
-    }
-
-    impl IpcConn for TcpStream {
-        fn split(&self) -> io::Result<Box<dyn IpcConn>> {
-            Ok(Box::new(self.try_clone()?))
-        }
-        fn set_io_timeout(&self, dur: Option<Duration>) {
-            let _ = self.set_read_timeout(dur);
-            let _ = self.set_write_timeout(dur);
-        }
-        fn close(&self) {
-            let _ = self.shutdown(Shutdown::Both);
-        }
-    }
-
-    pub fn read_token(sess: &str) -> Option<String> {
-        std::fs::read_to_string(token_path(sess)).ok()
-    }
-
+    #[cfg(windows)]
     pub fn connect(sess: &str) -> io::Result<Box<dyn IpcConn>> {
-        let port: u16 = std::fs::read_to_string(port_path(sess))?
-            .trim()
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad ipc port"))?;
-        let s = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300))?;
-        let _ = s.set_nodelay(true);
-        Ok(Box::new(s))
+        connect_tcp(&port_path(sess))
     }
 
-    pub fn listen(sess: &str, token: &str) -> io::Result<Box<dyn Iterator<Item = Box<dyn IpcConn>> + Send>> {
-        paths::write_private(&token_path(sess), token.as_bytes())?;
-        let l = TcpListener::bind(("127.0.0.1", 0))?;
-        let port = l.local_addr()?.port();
-        paths::write_private(&port_path(sess), port.to_string().as_bytes())?;
-        Ok(Box::new(std::iter::from_fn(move || loop {
-            match l.accept() {
-                Ok((s, _)) => {
-                    let _ = s.set_nodelay(true);
-                    return Some(Box::new(s) as Box<dyn IpcConn>);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => return None,
-            }
-        })))
+    #[cfg(windows)]
+    pub fn listen(
+        sess: &str,
+        token: &str,
+        shutdown: Arc<AtomicBool>,
+    ) -> io::Result<Box<dyn Iterator<Item = Box<dyn IpcConn>> + Send>> {
+        let pp = port_path(sess);
+        let _ = std::fs::remove_file(&pp);
+        let listener = listen_tcp(&pp, shutdown)?;
+        if let Err(e) = paths::write_private(&token_path(sess), token.as_bytes()) {
+            cleanup(sess);
+            return Err(e);
+        }
+        Ok(listener)
     }
 
+    #[cfg(windows)]
     pub fn cleanup(sess: &str) {
         let _ = std::fs::remove_file(port_path(sess));
         let _ = std::fs::remove_file(token_path(sess));

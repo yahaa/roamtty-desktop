@@ -383,3 +383,106 @@ fn cli_voice_fresh_start_evicts_idle_daemon_and_reclaims_port() {
     assert!(p2.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn cli_voice_concurrent_fresh_startups_on_same_port() {
+    let exe = env!("CARGO_BIN_EXE_roamtty-desktop");
+    let root = std::env::temp_dir().join(format!("roamtty-voice-concurrent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let target_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let count = 4usize;
+    let mut handles = Vec::with_capacity(count);
+    for _ in 0..count {
+        let root = root.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut proc = Command::new(exe)
+                .args(["voice", "--proto", "1", "--port", &target_port.to_string(), "--idle-timeout", "0"])
+                .env("ROAMTTY_DESKTOP_ROOT", &root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut stdout = BufReader::new(proc.stdout.take().unwrap());
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            let hello: VoiceHello = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("expected valid VoiceHello, got {line:?} ({e})"));
+            (proc, stdout, hello)
+        }));
+    }
+
+    let mut results = Vec::with_capacity(count);
+    for h in handles {
+        results.push(h.join().unwrap());
+    }
+
+    let mut sessions = std::collections::HashSet::new();
+    let mut ports = std::collections::HashSet::new();
+    let mut won_target = 0usize;
+    for (_, _, hello) in &results {
+        assert!(sessions.insert(hello.session.clone()), "duplicate session id");
+        assert!(ports.insert(hello.mic_port), "duplicate mic_port {}", hello.mic_port);
+        if hello.mic_port == target_port {
+            won_target += 1;
+        }
+    }
+    assert_eq!(won_target, 1, "exactly one concurrent fresh startup must win target_port {target_port}");
+
+    for (mut proc, stdout, _) in results {
+        drop(proc.stdin.take());
+        drop(stdout);
+        assert!(proc.wait().unwrap().success());
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cli_voice_explicit_shutdown_rapid_reconnect_without_polling() {
+    let exe = env!("CARGO_BIN_EXE_roamtty-desktop");
+    let root = std::env::temp_dir().join(format!("roamtty-voice-rapid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let target_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    for round in 0..5 {
+        let mut proc = Command::new(exe)
+            .args(["voice", "--proto", "1", "--port", &target_port.to_string(), "--idle-timeout", "300"])
+            .env("ROAMTTY_DESKTOP_ROOT", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = proc.stdin.take().unwrap();
+        let mut stdout = BufReader::new(proc.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let hello: VoiceHello = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            hello.mic_port, target_port,
+            "round {round}: immediate reconnect without polling must reclaim exact port {target_port}"
+        );
+
+        let (t, p) = proto::encode_client(&ClientMsg::Config(proto::Config {
+            shutdown: Some(true),
+            ..Default::default()
+        }));
+        proto::write_frame(&mut stdin, t, &p).unwrap();
+        stdin.flush().unwrap();
+        drop(stdin);
+        drop(stdout);
+        assert!(proc.wait().unwrap().success());
+        // Intentionally NO sleep or TcpListener::bind polling here!
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}

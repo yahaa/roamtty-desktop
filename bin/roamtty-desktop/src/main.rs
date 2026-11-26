@@ -233,6 +233,7 @@ fn download(url: &str) -> Result<Vec<u8>, String> {
 }
 
 fn uninstall() -> i32 {
+    voice::stop_all_daemons();
     #[cfg(any(target_os = "macos", windows))]
     agent::uninstall();
     let _ = std::fs::remove_dir_all(paths::desktop_dir());
