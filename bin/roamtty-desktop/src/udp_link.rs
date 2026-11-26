@@ -222,7 +222,6 @@ impl UdpLink {
     /// has no IPv4 at all: a port whose IPv4 side is taken is skipped, because an IPv6 socket on it
     /// binds fine while the IPv4 datagrams keep going to the other socket, and the link never comes up.
     pub fn bind(start_rate: f64) -> Option<Arc<UdpLink>> {
-        let key: [u8; 16] = crate::session::random_bytes(16).try_into().ok()?;
         let offset = (std::process::id() as u16) % (PORTS.end - PORTS.start);
         let sock = (0..PORTS.end - PORTS.start)
             .map(|i| PORTS.start + (offset + i) % (PORTS.end - PORTS.start))
@@ -231,6 +230,19 @@ impl UdpLink {
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
                 Err(_) => UdpSocket::bind(("::", p)).ok(),
             })?;
+        Self::from_socket(sock, start_rate)
+    }
+
+    /// Test helper: binds an ephemeral loopback port outside the 60000..61000 mosh range so
+    /// parallel tests do not race with `sessions_in_one_process_reuse_ports_cleanly`.
+    #[cfg(test)]
+    pub fn bind_ephemeral(start_rate: f64) -> Option<Arc<UdpLink>> {
+        let sock = UdpSocket::bind(("127.0.0.1", 0)).ok()?;
+        Self::from_socket(sock, start_rate)
+    }
+
+    fn from_socket(sock: UdpSocket, start_rate: f64) -> Option<Arc<UdpLink>> {
+        let key: [u8; 16] = crate::session::random_bytes(16).try_into().ok()?;
         let port = sock.local_addr().ok()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok()?;
         let link = Arc::new(UdpLink {

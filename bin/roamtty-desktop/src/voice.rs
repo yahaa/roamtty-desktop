@@ -1220,6 +1220,10 @@ fn handle_speaker_conn(
                 if len == 0 {
                     continue;
                 }
+                if len % 2 != 0 {
+                    crate::log!("voice speaker {stream_id} odd-length 'A' frame len={len}");
+                    break;
+                }
                 let mut payload = vec![0u8; len];
                 let deadline = Instant::now() + SPK_FRAME_READ_TIMEOUT;
                 match read_exact_interruptible(&mut reader, &mut payload, &stop_flag, &shutdown, Some(deadline)) {

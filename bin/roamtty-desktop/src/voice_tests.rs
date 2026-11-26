@@ -123,7 +123,7 @@ impl VoiceHarness {
             resume_token: "test-resume-token-secret".into(),
         };
         let bind_udp: UdpBinder = if enable_udp {
-            Box::new(UdpLink::bind)
+            Box::new(UdpLink::bind_ephemeral)
         } else {
             Box::new(|_| None)
         };
@@ -350,6 +350,19 @@ fn speaker_rejects_bad_clear_len_and_oversized_frame() {
     let (t, p) = client.recv_frame();
     assert_eq!(t, ty::SPK_STOP);
     assert_eq!(p, id2.to_le_bytes());
+
+    // Case 3: 'A' with odd byte length (malformed s16le) -> close + SPK_STOP
+    let mut agy3 = h.connect_agy();
+    agy3.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_START);
+    let id3 = u32::from_le_bytes(p[0..4].try_into().unwrap());
+    client.send(ClientMsg::SpkAck { stream_id: id3, ok: true, error: String::new() });
+    agy3.read_exact(&mut ok_buf).unwrap();
+    send_jetski_frame(&mut agy3, b'A', &[1, 2, 3]);
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_STOP);
+    assert_eq!(p, id3.to_le_bytes());
 
     client.close();
     h.stop();
