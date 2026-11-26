@@ -22,7 +22,7 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const PEEK_TIMEOUT: Duration = Duration::from_millis(80);
 const HEADER_DEADLINE: Duration = Duration::from_secs(3);
 const HEADER_MAX_BYTES: usize = 256;
-const SPK_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const SPK_ACK_TIMEOUT: Duration = Duration::from_millis(2500);
 const MIC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SPK_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SPK_FRAME_MAX_LEN: usize = 1024 * 1024;
@@ -64,6 +64,8 @@ struct AttachReq {
     token: Option<String>,
     idle_timeout: Option<u64>,
     ssh_client: Option<String>,
+    #[serde(default)]
+    evict_idle_port: Option<u16>,
 }
 
 /// Entry point for `roamtty-desktop voice --proto 1 [--port P] [--resume S --token T] [--idle-timeout SEC]`.
@@ -105,12 +107,62 @@ pub fn cmd(args: &[String]) -> i32 {
         }
     }
 
-    // 2. Otherwise (fresh start, expired daemon, or unauthorized resume token): spawn a fresh per-session daemon.
+    // 2. Otherwise (fresh start, expired daemon, or unauthorized resume token): evict any idle/disconnected
+    //    daemon still holding the preferred port (and clean up stale IPC files), then spawn a fresh daemon.
+    if port != 0 {
+        evict_idle_daemons_on_port(port);
+    }
     let new_session = session::hex(&session::random_bytes(8));
     let idle_secs = idle_timeout_arg.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
     match spawn_and_attach(&new_session, proto_ver, port, idle_secs, ssh_client) {
         Ok(conn) => relay_to_stdio(conn),
         Err((code, detail)) => print_start_error(code, Some(detail), None, None),
+    }
+}
+
+fn list_voice_sessions() -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(voice_dir()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if let Some(sess) = s.strip_suffix(".token") {
+            if is_valid_session_id(sess) {
+                out.push(sess.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn evict_idle_daemons_on_port(port: u16) {
+    for sess in list_voice_sessions() {
+        let Some(ipc_token) = ipc::read_token(&sess) else { continue };
+        let mut conn = match ipc::connect(&sess) {
+            Ok(c) => c,
+            Err(e) => {
+                if matches!(e.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound) {
+                    ipc::cleanup(&sess);
+                }
+                continue;
+            }
+        };
+        conn.set_io_timeout(Some(Duration::from_millis(500)));
+        let req = AttachReq {
+            ipc_token: ipc_token.trim().to_string(),
+            proto: proto::PROTO,
+            resume: None,
+            token: None,
+            idle_timeout: None,
+            ssh_client: None,
+            evict_idle_port: Some(port),
+        };
+        if writeln!(conn, "{}", serde_json::to_string(&req).unwrap()).is_ok() && conn.flush().is_ok() {
+            let _ = read_line_unbuffered(&mut *conn, 64);
+        }
+        conn.close();
     }
 }
 
@@ -155,9 +207,16 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
 
     let (ev_tx, ev_rx) = mpsc::channel::<Event>();
     let shutdown = Arc::new(AtomicBool::new(false));
+    let client_connected = Arc::new(AtomicBool::new(false));
     let next_stream_id = Arc::new(AtomicU32::new(1));
 
-    spawn_mic_accept_loop(mic_listener, next_stream_id, ev_tx.clone(), shutdown.clone());
+    let mic_accept = spawn_mic_accept_loop(
+        mic_listener,
+        next_stream_id,
+        ev_tx.clone(),
+        client_connected.clone(),
+        shutdown.clone(),
+    );
     spawn_ipc_accept_loop(ipc_listener, ipc_token, ev_tx.clone(), shutdown.clone());
 
     let mut engine = VoiceEngine::new(
@@ -166,12 +225,18 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
         Duration::from_secs(idle_secs),
         Box::new(UdpLink::bind),
         ev_tx,
+        client_connected,
         shutdown.clone(),
     );
-    engine.run(ev_rx);
+    let evict_reply = engine.run(ev_rx);
 
     shutdown.store(true, Ordering::SeqCst);
+    let _ = mic_accept.join();
     ipc::cleanup(&sess_id);
+    if let Some((reply_tx, flushed_rx)) = evict_reply {
+        let _ = reply_tx.send(true);
+        let _ = flushed_rx.recv_timeout(Duration::from_millis(200));
+    }
     crate::log!("voice-daemon exit session={sess_id} mic_port={mic_port}");
     0
 }
@@ -200,6 +265,7 @@ fn try_attach_existing(
         token,
         idle_timeout,
         ssh_client,
+        evict_idle_port: None,
     };
     writeln!(conn, "{}", serde_json::to_string(&req).unwrap()).map_err(|e| e.to_string())?;
     conn.flush().map_err(|e| e.to_string())?;
@@ -640,6 +706,11 @@ enum Event {
         stream_id: u32,
         notify_client: bool,
     },
+    EvictIdle {
+        port: u16,
+        reply_tx: mpsc::Sender<bool>,
+        flushed_rx: mpsc::Receiver<()>,
+    },
     #[cfg_attr(not(test), allow(dead_code))]
     Shutdown,
 }
@@ -702,12 +773,14 @@ struct VoiceEngine {
     idle_timeout: Duration,
     bind_udp: UdpBinder,
     ev_tx: mpsc::Sender<Event>,
+    client_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     client: Option<ClientOut>,
     epoch: u64,
     disconnected_since: Option<Instant>,
     mic_streams: HashMap<u32, MicStreamHandle>,
     spk_streams: HashMap<u32, SpkStreamState>,
+    evict_reply: Option<(mpsc::Sender<bool>, mpsc::Receiver<()>)>,
 }
 
 impl VoiceEngine {
@@ -717,6 +790,7 @@ impl VoiceEngine {
         idle_timeout: Duration,
         bind_udp: UdpBinder,
         ev_tx: mpsc::Sender<Event>,
+        client_connected: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -726,16 +800,24 @@ impl VoiceEngine {
             idle_timeout,
             bind_udp,
             ev_tx,
+            client_connected,
             shutdown,
             client: None,
             epoch: 0,
             disconnected_since: Some(Instant::now()),
             mic_streams: HashMap::new(),
             spk_streams: HashMap::new(),
+            evict_reply: None,
         }
     }
 
-    fn run(&mut self, ev_rx: mpsc::Receiver<Event>) {
+    fn is_client_reachable(&self) -> bool {
+        self.client
+            .as_ref()
+            .is_some_and(|c| c.ssh_open || c.link.as_ref().is_some_and(|l| l.alive()))
+    }
+
+    fn run(&mut self, ev_rx: mpsc::Receiver<Event>) -> Option<(mpsc::Sender<bool>, mpsc::Receiver<()>)> {
         loop {
             match ev_rx.recv_timeout(Duration::from_millis(40)) {
                 Ok(ev) => {
@@ -772,6 +854,7 @@ impl VoiceEngine {
                     crate::log!("voice client disconnected (session={})", self.session.session);
                 }
             }
+            self.client_connected.store(self.is_client_reachable(), Ordering::Relaxed);
 
             if self.client.is_none() {
                 let wait = if self.attached_once {
@@ -789,6 +872,7 @@ impl VoiceEngine {
         }
 
         self.shutdown.store(true, Ordering::SeqCst);
+        self.client_connected.store(false, Ordering::Relaxed);
         if let Some(old) = self.client.take() {
             old.close();
         }
@@ -798,6 +882,7 @@ impl VoiceEngine {
         for (_, s) in self.spk_streams.drain() {
             s.stop_flag.store(true, Ordering::SeqCst);
         }
+        self.evict_reply.take()
     }
 
     fn handle_event(&mut self, ev: Event) -> bool {
@@ -807,9 +892,17 @@ impl VoiceEngine {
                 self.handle_attach(req, input, output, closer, reply_tx);
             }
             Event::ClientFrame { epoch, msg } => {
-                if self.client.as_ref().is_some_and(|c| c.epoch == epoch) {
-                    self.handle_client_msg(msg);
+                if self.client.as_ref().is_some_and(|c| c.epoch == epoch) && !self.handle_client_msg(msg) {
+                    return false;
                 }
+            }
+            Event::EvictIdle { port, reply_tx, flushed_rx } => {
+                if self.mic_port == port && !self.is_client_reachable() {
+                    crate::log!("voice-daemon evicted idle session={} mic_port={port}", self.session.session);
+                    self.evict_reply = Some((reply_tx, flushed_rx));
+                    return false;
+                }
+                let _ = reply_tx.send(false);
             }
             Event::ClientSshClosed { epoch } => {
                 if let Some(c) = self.client.as_mut() {
@@ -1009,11 +1102,16 @@ impl VoiceEngine {
         }
         out.flush();
         self.client = Some(out);
+        self.client_connected.store(true, Ordering::Relaxed);
     }
 
-    fn handle_client_msg(&mut self, msg: ClientMsg) {
+    fn handle_client_msg(&mut self, msg: ClientMsg) -> bool {
         match msg {
             ClientMsg::Config(c) => {
+                if c.shutdown == Some(true) {
+                    crate::log!("voice client requested shutdown (session={})", self.session.session);
+                    return false;
+                }
                 if let Some(out) = self.client.as_mut() {
                     if let (Some(on), Some(l)) = (c.udp, &out.link) {
                         l.enabled.store(on, Ordering::Relaxed);
@@ -1042,11 +1140,11 @@ impl VoiceEngine {
             }
             ClientMsg::MicAudio { stream_id, pcm } => {
                 if pcm.is_empty() {
-                    return;
+                    return true;
                 }
                 if pcm.len() % 2 != 0 {
                     crate::log!("voice dropping odd-length MIC_AUDIO ({} bytes) for stream {stream_id}", pcm.len());
-                    return;
+                    return true;
                 }
                 if let Some(m) = self.mic_streams.get(&stream_id) {
                     m.push(pcm);
@@ -1069,6 +1167,7 @@ impl VoiceEngine {
             }
             _ => {}
         }
+        true
     }
 }
 
@@ -1089,8 +1188,9 @@ fn spawn_mic_accept_loop(
     listener: TcpListener,
     next_stream_id: Arc<AtomicU32>,
     ev_tx: mpsc::Sender<Event>,
+    client_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-) {
+) -> std::thread::JoinHandle<()> {
     let _ = listener.set_nonblocking(true);
     std::thread::spawn(move || {
         while !shutdown.load(Ordering::Relaxed) {
@@ -1100,8 +1200,11 @@ fn spawn_mic_accept_loop(
                     let _ = stream.set_nodelay(true);
                     let next_stream_id = next_stream_id.clone();
                     let ev_tx = ev_tx.clone();
+                    let client_connected = client_connected.clone();
                     let shutdown = shutdown.clone();
-                    std::thread::spawn(move || handle_agy_conn(stream, &next_stream_id, ev_tx, shutdown));
+                    std::thread::spawn(move || {
+                        handle_agy_conn(stream, &next_stream_id, ev_tx, client_connected, shutdown)
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
@@ -1109,7 +1212,7 @@ fn spawn_mic_accept_loop(
                 Err(_) => break,
             }
         }
-    });
+    })
 }
 
 fn write_spk_err_and_close(stream: &mut TcpStream, reason: &str) {
@@ -1128,6 +1231,7 @@ fn handle_agy_conn(
     mut stream: TcpStream,
     next_stream_id: &AtomicU32,
     ev_tx: mpsc::Sender<Event>,
+    client_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) {
     match classify_connection(&stream) {
@@ -1137,7 +1241,7 @@ fn handle_agy_conn(
         ConnKind::Invalid => {
             write_spk_err_and_close(&mut stream, "invalid header");
         }
-        ConnKind::Speaker => handle_speaker_conn(stream, next_stream_id, ev_tx, shutdown),
+        ConnKind::Speaker => handle_speaker_conn(stream, next_stream_id, ev_tx, client_connected, shutdown),
         ConnKind::Mic => handle_mic_conn(stream, next_stream_id, ev_tx, shutdown),
     }
 }
@@ -1146,6 +1250,7 @@ fn handle_speaker_conn(
     stream: TcpStream,
     next_stream_id: &AtomicU32,
     ev_tx: mpsc::Sender<Event>,
+    client_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) {
     let Ok(mut write_half) = stream.try_clone() else {
@@ -1193,7 +1298,12 @@ fn handle_speaker_conn(
             return;
         }
         Err(_) => {
-            write_spk_err_and_close(&mut write_half, "speaker ack timeout");
+            let reason = if client_connected.load(Ordering::Relaxed) {
+                "speaker ack timeout"
+            } else {
+                "no voice client connected"
+            };
+            write_spk_err_and_close(&mut write_half, reason);
             let _ = ev_tx.send(Event::AgySpkClosed { stream_id, notify_client: true });
             return;
         }
@@ -1368,6 +1478,7 @@ fn handle_mic_conn(
 
 trait IpcConn: Read + Write + Send {
     fn split(&self) -> io::Result<Box<dyn IpcConn>>;
+    fn set_io_timeout(&self, dur: Option<Duration>);
     fn close(&self);
 }
 
@@ -1415,6 +1526,30 @@ fn spawn_ipc_accept_loop(
                     conn.close();
                     return;
                 };
+                if let Some(port) = req.evict_idle_port {
+                    let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+                    let (flushed_tx, flushed_rx) = mpsc::channel::<()>();
+                    if ev_tx.send(Event::EvictIdle { port, reply_tx, flushed_rx }).is_err() {
+                        let _ = writeln!(status_writer, "ERR shutting down");
+                        let _ = status_writer.flush();
+                        status_writer.close();
+                        return;
+                    }
+                    match reply_rx.recv() {
+                        Ok(true) => {
+                            let _ = writeln!(status_writer, "EVICTED");
+                            let _ = status_writer.flush();
+                            status_writer.close();
+                            let _ = flushed_tx.send(());
+                        }
+                        _ => {
+                            let _ = writeln!(status_writer, "BUSY");
+                            let _ = status_writer.flush();
+                            status_writer.close();
+                        }
+                    }
+                    return;
+                }
                 let (reply_tx, reply_rx) = mpsc::channel::<bool>();
                 // Write `OK\n` only if authorized, BEFORE `VoiceEngine` writes `VoiceHello`.
                 // To preserve strict ordering between `OK\n` and `VoiceHello`, we wrap output so
@@ -1494,6 +1629,10 @@ mod ipc {
         fn split(&self) -> io::Result<Box<dyn IpcConn>> {
             Ok(Box::new(self.try_clone()?))
         }
+        fn set_io_timeout(&self, dur: Option<Duration>) {
+            let _ = self.set_read_timeout(dur);
+            let _ = self.set_write_timeout(dur);
+        }
         fn close(&self) {
             let _ = self.shutdown(Shutdown::Both);
         }
@@ -1502,6 +1641,10 @@ mod ipc {
     impl IpcConn for TcpStream {
         fn split(&self) -> io::Result<Box<dyn IpcConn>> {
             Ok(Box::new(self.try_clone()?))
+        }
+        fn set_io_timeout(&self, dur: Option<Duration>) {
+            let _ = self.set_read_timeout(dur);
+            let _ = self.set_write_timeout(dur);
         }
         fn close(&self) {
             let _ = self.shutdown(Shutdown::Both);
@@ -1521,7 +1664,7 @@ mod ipc {
             .trim()
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad ipc port"))?;
-        let s = TcpStream::connect(("127.0.0.1", port))?;
+        let s = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300))?;
         let _ = s.set_nodelay(true);
         Ok(Box::new(s))
     }
@@ -1582,6 +1725,10 @@ mod ipc {
         fn split(&self) -> io::Result<Box<dyn IpcConn>> {
             Ok(Box::new(self.try_clone()?))
         }
+        fn set_io_timeout(&self, dur: Option<Duration>) {
+            let _ = self.set_read_timeout(dur);
+            let _ = self.set_write_timeout(dur);
+        }
         fn close(&self) {
             let _ = self.shutdown(Shutdown::Both);
         }
@@ -1596,7 +1743,7 @@ mod ipc {
             .trim()
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad ipc port"))?;
-        let s = TcpStream::connect(("127.0.0.1", port))?;
+        let s = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300))?;
         let _ = s.set_nodelay(true);
         Ok(Box::new(s))
     }

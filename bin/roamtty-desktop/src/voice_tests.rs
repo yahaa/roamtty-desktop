@@ -115,8 +115,15 @@ impl VoiceHarness {
         let (mic_listener, mic_port) = bind_mic_listener(0).unwrap();
         let (ev_tx, ev_rx) = mpsc::channel::<Event>();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let client_connected = Arc::new(AtomicBool::new(false));
         let next_stream_id = Arc::new(AtomicU32::new(1));
-        spawn_mic_accept_loop(mic_listener, next_stream_id, ev_tx.clone(), shutdown.clone());
+        let _mic_accept = spawn_mic_accept_loop(
+            mic_listener,
+            next_stream_id,
+            ev_tx.clone(),
+            client_connected.clone(),
+            shutdown.clone(),
+        );
 
         let sess = Session {
             session: "testvoice1234567".into(),
@@ -133,9 +140,10 @@ impl VoiceHarness {
             Duration::from_secs(60),
             bind_udp,
             ev_tx.clone(),
+            client_connected,
             shutdown.clone(),
         );
-        let worker = std::thread::spawn(move || engine.run(ev_rx));
+        let worker = std::thread::spawn(move || { let _ = engine.run(ev_rx); });
         Self { mic_port, ev_tx, shutdown, worker: Some(worker) }
     }
 
@@ -157,6 +165,7 @@ impl VoiceHarness {
             token: token.map(String::from),
             idle_timeout: None,
             ssh_client: Some("127.0.0.1 12345 22".into()),
+            evict_idle_port: None,
         };
         self.ev_tx
             .send(Event::ClientAttach {
@@ -697,6 +706,22 @@ fn udp_transport_roundtrip_and_ssh_fallback() {
 
     drop(agy_spk);
     client.close();
+    h.stop();
+}
+
+#[test]
+fn speaker_open_without_attached_client_reports_no_client_connected() {
+    let h = VoiceHarness::start(false);
+    // Connect agy speaker while NO mobile client is attached.
+    let mut agy = h.connect_agy();
+    agy.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    agy.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
+    agy.flush().unwrap();
+
+    let mut resp = Vec::new();
+    agy.read_to_end(&mut resp).unwrap();
+    let text = String::from_utf8(resp).unwrap();
+    assert_eq!(text, "\nJETSKI-AUDIO/1 ERR no voice client connected\n");
     h.stop();
 }
 

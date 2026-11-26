@@ -139,6 +139,9 @@ pub struct Config {
     /// Test fixtures only (the plugin honours it with ROAMTTY_DESKTOP_TEST=1): drop this share of UDP datagrams.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub debug_loss: Option<f32>,
+    /// Voice mode: when true, the headless voice daemon exits immediately and releases its loopback port.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub shutdown: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -509,7 +512,7 @@ mod tests {
         // VoiceHello JSON roundtrip
         let vh = VoiceHello {
             proto: 1,
-            ver: "0.9.8".into(),
+            ver: "0.9.9".into(),
             os: "macos".into(),
             mode: "voice".into(),
             mic_port: 24713,

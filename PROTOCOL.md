@@ -172,10 +172,11 @@ ssh exec ~/.roamtty/bin/roamtty-desktop voice --proto 1 [--port 24713] [--resume
 First stdout line (UTF-8 JSON + `\n`):
 
 ```json
-{"proto":1,"ver":"0.9.8","os":"macos","mode":"voice","mic_port":24713,"session":"9f2c…","resume_token":"base64(16 bytes)","udp":{"port":60123,"key":"base64(16 bytes)"},"codecs":["pcm16"]}
+{"proto":1,"ver":"0.9.9","os":"macos","mode":"voice","mic_port":24713,"session":"9f2c…","resume_token":"base64(16 bytes)","udp":{"port":60123,"key":"base64(16 bytes)"},"codecs":["pcm16"]}
 ```
 
-- Listens on `127.0.0.1:<mic_port>` (prefers `--port`, defaults to `24713`, falls back to ephemeral port `0` if busy).
+- Listens on `127.0.0.1:<mic_port>` (prefers `--port`, defaults to `24713`, evicts any disconnected/idle voice daemon still holding that port on fresh start, and falls back to ephemeral port `0` only if another live process holds it).
+- Sending `CONFIG {"shutdown":true}` on explicit hangup terminates the voice daemon immediately and releases `127.0.0.1:<mic_port>` without waiting for `--idle-timeout`.
 - Each session runs in a detached per-session daemon (`~/.roamtty/desktop/voice/<session>.sock` on Unix, `<session>.ipc` on Windows, mode 0600) that keeps `127.0.0.1:<mic_port>` bound for `--idle-timeout` seconds (default 300) after both SSH and UDP disconnect so `--resume <session> --token <token>` takes over the exact same `mic_port` and active `agy` streams. Multiple sessions without `--resume` coexist on distinct ports.
 - Reuses `u8 type | u24 BE len | payload` framing, `UdpLink` (AES-128-GCM + RS-FEC + roaming) with SSH fallback, and `CONFIG` (`0x01`), `PING` (`0x07`), `PONG` (`0x08`), `STATE` (`0x84`).
 - Voice payload integers are **little-endian** (`u32 LE`); PCM is mono **s16le**:

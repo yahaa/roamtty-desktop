@@ -248,3 +248,138 @@ fn cli_voice_unix_socket_ipc_resume_on_short_root() {
     assert!(!root.join("desktop/voice").join(format!("{}.sock", h1.session)).exists(), "sock should be cleaned up on daemon exit");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn cli_voice_explicit_shutdown_releases_port_immediately() {
+    let exe = env!("CARGO_BIN_EXE_roamtty-desktop");
+    let root = std::env::temp_dir().join(format!("roamtty-voice-shutdown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    // Pick a free loopback port to act like default port 24713.
+    let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let target_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    for round in 0..3 {
+        let mut proc = Command::new(exe)
+            .args(["voice", "--proto", "1", "--port", &target_port.to_string(), "--idle-timeout", "300"])
+            .env("ROAMTTY_DESKTOP_ROOT", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = proc.stdin.take().unwrap();
+        let mut stdout = BufReader::new(proc.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let hello: VoiceHello = serde_json::from_str(&line).unwrap();
+        assert_eq!(hello.mic_port, target_port, "round {round} must bind exact preferred port");
+
+        // Send explicit hangup shutdown config -> daemon must exit immediately despite idle_timeout=300!
+        let (t, p) = proto::encode_client(&ClientMsg::Config(proto::Config {
+            shutdown: Some(true),
+            ..Default::default()
+        }));
+        proto::write_frame(&mut stdin, t, &p).unwrap();
+        stdin.flush().unwrap();
+        drop(stdin);
+        drop(stdout);
+        assert!(proc.wait().unwrap().success());
+
+        // Port must become bindable almost immediately (well under 1s, not 300s).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut freed = false;
+        while Instant::now() < deadline {
+            if TcpListener::bind(("127.0.0.1", target_port)).is_ok() {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(freed, "round {round}: explicit shutdown must release port {target_port} immediately");
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cli_voice_fresh_start_evicts_idle_daemon_and_reclaims_port() {
+    let exe = env!("CARGO_BIN_EXE_roamtty-desktop");
+    let root = std::env::temp_dir().join(format!("roamtty-voice-evict-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let target_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    // Plant a stale orphaned token+ipc file to verify cleanup as well.
+    let vdir = root.join("desktop/voice");
+    std::fs::create_dir_all(&vdir).unwrap();
+    std::fs::write(vdir.join("deadbeef0000.token"), "stale-token").unwrap();
+    std::fs::write(vdir.join("deadbeef0000.ipc"), "1").unwrap();
+
+    // 1. Start session 1 on target_port with 300s idle timeout, then drop stdin WITHOUT shutdown.
+    let mut p1 = Command::new(exe)
+        .args(["voice", "--proto", "1", "--port", &target_port.to_string(), "--idle-timeout", "300"])
+        .env("ROAMTTY_DESKTOP_ROOT", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut out1 = BufReader::new(p1.stdout.take().unwrap());
+    let mut line1 = String::new();
+    out1.read_line(&mut line1).unwrap();
+    let h1: VoiceHello = serde_json::from_str(&line1).unwrap();
+    assert_eq!(h1.mic_port, target_port);
+    drop(p1.stdin.take());
+    drop(out1);
+    assert!(p1.wait().unwrap().success());
+
+    // Confirm old daemon is still squatting on target_port while disconnected.
+    assert!(TcpListener::bind(("127.0.0.1", target_port)).is_err());
+
+    // 2. Start a FRESH session requesting the exact same target_port (no --resume).
+    //    It MUST evict the idle daemon and reclaim target_port instead of falling back!
+    let mut p2 = Command::new(exe)
+        .args(["voice", "--proto", "1", "--port", &target_port.to_string(), "--idle-timeout", "0"])
+        .env("ROAMTTY_DESKTOP_ROOT", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut in2 = p2.stdin.take().unwrap();
+    let mut out2 = BufReader::new(p2.stdout.take().unwrap());
+    let mut line2 = String::new();
+    out2.read_line(&mut line2).unwrap();
+    let h2: VoiceHello = serde_json::from_str(&line2).unwrap();
+    assert_ne!(h2.session, h1.session);
+    assert_eq!(h2.mic_port, target_port, "fresh start must evict idle daemon and reclaim target_port");
+
+    // Verify stale files were also cleaned up.
+    assert!(!vdir.join("deadbeef0000.token").exists(), "stale token should be cleaned up");
+
+    // Verify agy speaker connection now reaches session 2 (not the evicted zombie)!
+    let mut agy = TcpStream::connect(("127.0.0.1", target_port)).unwrap();
+    agy.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    agy.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
+    let (t, p) = proto::read_frame(&mut out2).unwrap().unwrap();
+    assert_eq!(t, ty::SPK_START);
+    let spk_id = u32::from_le_bytes(p[0..4].try_into().unwrap());
+    let (at, ap) = proto::encode_client(&ClientMsg::SpkAck { stream_id: spk_id, ok: true, error: String::new() });
+    proto::write_frame(&mut in2, at, &ap).unwrap();
+    in2.flush().unwrap();
+    let mut ok = [0u8; 19];
+    agy.read_exact(&mut ok).unwrap();
+    assert_eq!(&ok, b"\nJETSKI-AUDIO/1 OK\n");
+
+    drop(agy);
+    drop(in2);
+    drop(out2);
+    assert!(p2.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&root);
+}
