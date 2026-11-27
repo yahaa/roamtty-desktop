@@ -61,9 +61,42 @@ struct Unacked {
     tries: u32,
 }
 
-/// Cap on queued `SPK_AUDIO` datagrams inside the UDP pacer (enough for a full 1 MiB burst at
-/// FEC 1.0 without overflowing memory under sustained floods).
-const MAX_PACED_SPK_PACKETS: usize = 2560;
+/// Cap on queued legacy `SPK_AUDIO` datagrams inside the UDP pacer (~640 ms at 2x shards).
+const MAX_PACED_SPK_PACKETS: usize = 64;
+/// DSCP Expedited Forwarding (EF = 46 << 2 = 0xB8) for Wi-Fi WMM AC_VO / low-latency routing.
+const DSCP_EF_TOS: u32 = 0xB8;
+
+fn set_voice_dscp(sock: &UdpSocket) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let tos = DSCP_EF_TOS as libc::c_int;
+        let is_v6 = sock.local_addr().is_ok_and(|a| a.is_ipv6());
+        unsafe {
+            if is_v6 {
+                let _ = libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_TCLASS,
+                    (&tos as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            } else {
+                let _ = libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_TOS,
+                    (&tos as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (sock, DSCP_EF_TOS);
+    }
+}
 /// Overhead added when sealing a plaintext packet (9-byte header + 16-byte AES-GCM tag).
 const SEAL_OVERHEAD: usize = 25;
 
@@ -293,6 +326,7 @@ impl UdpLink {
     }
 
     fn from_socket(sock: UdpSocket, start_rate: f64) -> Option<Arc<UdpLink>> {
+        set_voice_dscp(&sock);
         let key: [u8; 16] = crate::session::random_bytes(16).try_into().ok()?;
         let port = sock.local_addr().ok()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok()?;
@@ -458,8 +492,11 @@ impl UdpLink {
             | proto::ty::SPK_START
             | proto::ty::SPK_CLEAR
             | proto::ty::SPK_STOP => (FLAG_RELIABLE, 1.0),
-            // A packet is one datagram and a resend would come too late to play: send it twice.
+            // Legacy PCM packet: one datagram and a resend would come too late to play: send it twice.
             proto::ty::AUDIO | proto::ty::SPK_AUDIO => (0, 1.0),
+            // Opus voice frames carry temporal RED inside a single small datagram; bypass video pacing
+            // and avoid back-to-back duplication so burst loss is handled in time, not wasted bandwidth.
+            proto::ty::SPK_OPUS | proto::ty::VOICE_STATS_S2C => (0, 0.0),
             _ => (0, 0.0),
         };
         let video = flags & FLAG_VIDEO != 0;

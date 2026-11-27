@@ -266,7 +266,7 @@ fn speaker_handshake_ok_audio_barge_in_clear_and_eof() {
     let mut client = h.attach(None, None).unwrap();
     assert_eq!(client.hello.mode, "voice");
     assert_eq!(client.hello.mic_port, h.mic_port);
-    assert_eq!(client.hello.codecs, vec!["pcm16"]);
+    assert_eq!(client.hello.codecs, vec!["opus", "pcm16"]);
 
     let mut agy = h.connect_agy();
     agy.write_all(b"JETSKI-AUDIO/1 speaker rate=24000\n").unwrap();
@@ -1272,6 +1272,123 @@ fn force_shutdown_evicts_active_session_for_uninstall() {
     let worker = h.worker.take().unwrap();
     worker.join().unwrap();
     c.close();
+    h.stop();
+}
+
+#[test]
+fn opus_negotiation_streams_red_packets_barge_in_gen_and_uplink_jitter_playout() {
+    let h = VoiceHarness::start(false);
+    let mut client = h.attach(None, None).unwrap();
+    assert!(client.hello.codecs.iter().any(|c| c == "opus"));
+
+    // Negotiate Opus voice mode via CONFIG
+    client.send(ClientMsg::Config(proto::Config {
+        voice_codec: Some("opus".into()),
+        ..Default::default()
+    }));
+
+    // 1. Open speaker stream @ 24 kHz from agy
+    let mut agy_spk = TcpStream::connect(("127.0.0.1", h.mic_port)).unwrap();
+    agy_spk.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    agy_spk.write_all(b"JETSKI-AUDIO/1 speaker rate=24000 channels=1\n").unwrap();
+    let (ty, payload) = client.recv_frame();
+    assert_eq!(ty, ty::SPK_START);
+    let spk_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    client.send(ClientMsg::SpkAck { stream_id: spk_id, ok: true, error: String::new() });
+
+    let mut ack_buf = [0u8; 64];
+    let n = agy_spk.read(&mut ack_buf).unwrap();
+    assert!(String::from_utf8_lossy(&ack_buf[..n]).contains("JETSKI-AUDIO/1 OK"));
+
+    // Simulate weak network report from client (20% loss, burst=3) -> forces RED-2/3 on host downlink!
+    client.send(ClientMsg::VoiceStats(proto::VoiceStats {
+        stream_id: spk_id,
+        loss_permille: 200,
+        jitter_ms: 60,
+        buffer_ms: 80,
+        max_burst_loss: 3,
+        flags: 0,
+    }));
+    std::thread::sleep(Duration::from_millis(30));
+
+    // Write 4 x 20ms PCM frames (960 bytes each @ 24 kHz)
+    let mut pcm_4 = Vec::with_capacity(960 * 4);
+    for i in 0..(480 * 4) {
+        let s = (((i as f32) * 440.0 * std::f32::consts::TAU / 24000.0).sin() * 12000.0) as i16;
+        pcm_4.extend_from_slice(&s.to_le_bytes());
+    }
+    let mut frame_hdr = [0u8; 5];
+    frame_hdr[0] = b'A';
+    frame_hdr[1..5].copy_from_slice(&(pcm_4.len() as u32).to_le_bytes());
+    agy_spk.write_all(&frame_hdr).unwrap();
+    agy_spk.write_all(&pcm_4).unwrap();
+
+    let mut spk_pkts = Vec::new();
+    for _ in 0..4 {
+        let (t, p) = client.recv_frame();
+        assert_eq!(t, ty::SPK_OPUS, "expected SPK_OPUS when negotiated");
+        spk_pkts.push(proto::decode_voice_opus(&p).unwrap());
+    }
+    assert_eq!(spk_pkts[0].seq, 0);
+    assert_ne!(spk_pkts[0].flags & proto::voice_flags::RESET, 0);
+    assert_eq!(proto::voice_flags::turn_gen(spk_pkts[0].flags), 0);
+    assert!(spk_pkts[3].red.len() >= 2, "expected adaptive RED entries under 20% loss, got {}", spk_pkts[3].red.len());
+    assert!(spk_pkts[3].primary.len() < 200, "opus frame must be compressed (got {} B vs 960 B PCM)", spk_pkts[3].primary.len());
+
+    // Barge-in 'C' increments turn_gen and resets RED history
+    agy_spk.write_all(&[b'C', 0, 0, 0, 0]).unwrap();
+    assert_eq!(client.recv_frame().0, ty::SPK_CLEAR);
+    let mut one_hdr = [0u8; 5];
+    one_hdr[0] = b'A';
+    one_hdr[1..5].copy_from_slice(&960u32.to_le_bytes());
+    agy_spk.write_all(&one_hdr).unwrap();
+    agy_spk.write_all(&pcm_4[..960]).unwrap();
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::SPK_OPUS);
+    let after_clear = proto::decode_voice_opus(&p).unwrap();
+    assert_eq!(proto::voice_flags::turn_gen(after_clear.flags), 1);
+    assert_ne!(after_clear.flags & proto::voice_flags::RESET, 0);
+    assert!(after_clear.red.is_empty(), "RED history must clear across barge-in");
+
+    // 2. Open mic stream from agy and send MIC_OPUS with a dropped packet recovered by RED!
+    let mut agy_mic = TcpStream::connect(("127.0.0.1", h.mic_port)).unwrap();
+    agy_mic.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::MIC_START);
+    let mic_id = u32::from_le_bytes(p[0..4].try_into().unwrap());
+
+    let mut enc = crate::voice_codec::VoiceOpusEncoder::new(16_000, 24_000, false).unwrap();
+    let mut hist = crate::voice_codec::RedHistory::default();
+    let mut mic_frames = Vec::new();
+    for seq in 0..5u32 {
+        let samples: Vec<i16> = (0..320)
+            .map(|i| ((((seq as usize * 320 + i) as f32) * 330.0 * std::f32::consts::TAU / 16000.0).sin() * 14000.0) as i16)
+            .collect();
+        let data = enc.encode(&samples).unwrap();
+        let red = hist.build_red(seq, 2);
+        hist.record(seq, data.clone());
+        mic_frames.push(proto::VoiceOpusPacket {
+            stream_id: mic_id,
+            seq,
+            ts_samples: seq * 320,
+            flags: proto::voice_flags::FEC | proto::voice_flags::SPEECH,
+            red,
+            primary: data,
+        });
+    }
+    // Deliver seq 0, skip seq 1 (recovered by seq 2's RED!), deliver seq 2, 3, 4
+    for &idx in &[0usize, 2, 3, 4] {
+        client.send(ClientMsg::MicOpus(mic_frames[idx].clone()));
+    }
+    let mut got = vec![0u8; 640 * 3];
+    agy_mic.read_exact(&mut got).unwrap();
+    let mut decoded_samples = Vec::new();
+    crate::voice_codec::s16le_bytes_to_i16(&got, &mut decoded_samples);
+    assert!(crate::voice_codec::pcm_rms(&decoded_samples) > 0.05, "uplink decoded audio must be audible");
+
+    drop(agy_spk);
+    drop(agy_mic);
+    client.close();
     h.stop();
 }
 

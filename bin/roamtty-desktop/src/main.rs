@@ -11,6 +11,7 @@ mod serve;
 mod session;
 mod udp_link;
 mod voice;
+mod voice_codec;
 #[cfg(any(target_os = "linux", windows))]
 mod openh264enc;
 #[cfg(windows)]

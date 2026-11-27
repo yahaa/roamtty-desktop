@@ -51,7 +51,7 @@ fn cli_voice_subprocess_resume_concurrent_and_audio_roundtrip() {
     assert_eq!(hello1.proto, 1);
     assert_eq!(hello1.mode, "voice");
     assert_ne!(hello1.mic_port, 0);
-    assert_eq!(hello1.codecs, vec!["pcm16"]);
+    assert_eq!(hello1.codecs, vec!["opus", "pcm16"]);
     assert!(hello1.udp.is_some());
 
     // 3. Concurrent second fresh `voice` requesting session 1's exact port must coexist on a fallback port!

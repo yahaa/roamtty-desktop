@@ -183,11 +183,18 @@ First stdout line (UTF-8 JSON + `\n`):
 
 | type | dir | name | UDP mode | payload |
 |---|---|---|---|---|
-| `0x10` | C→S | `MIC_AUDIO` | Unreliable (FEC 1.0 rec.) | `u32 LE stream_id` + raw 16 kHz mono s16le PCM (even byte count) |
+| `0x10` | C→S | `MIC_AUDIO` | Unreliable (FEC 1.0 rec., legacy) | `u32 LE stream_id` + raw 16 kHz mono s16le PCM (even byte count) |
 | `0x11` | C→S | `SPK_ACK` | Reliable | `u32 LE stream_id` `u8 ok` (`1` OK, `0` ERR) + UTF-8 error (≤ 235 B, empty if OK) |
+| `0x12` | C→S | `MIC_OPUS` | Unreliable (FEC 0.0, in-packet RED) | `u32 LE stream_id` `u32 LE seq` `u32 LE ts_samples` `u8 flags` `u8 red_count` + `red_count × (u8 delta_seq, u16 LE len, opus_bytes)` + primary 20 ms Opus VOIP payload |
+| `0x13` | C→S | `VOICE_STATS` | Unreliable (FEC 0.0, every 250 ms) | `u32 LE stream_id` `u16 LE loss_permille` `u16 LE jitter_ms` `u16 LE buffer_ms` `u8 max_burst_loss` `u8 flags` |
 | `0x90` | S→C | `MIC_START` | Reliable (FEC 1.0) | `u32 LE stream_id` `u32 LE sample_rate` (`16000`) `u8 channels` (`1`) |
 | `0x91` | S→C | `MIC_STOP` | Reliable (FEC 1.0) | `u32 LE stream_id` |
 | `0x92` | S→C | `SPK_START` | Reliable (FEC 1.0) | `u32 LE stream_id` `u32 LE sample_rate` `u8 channels` (`1`) |
-| `0x93` | S→C | `SPK_AUDIO` | Unreliable (FEC 1.0) | `u32 LE stream_id` + raw mono s16le PCM at negotiated `sample_rate` (chunked ≤ 960 B) |
+| `0x93` | S→C | `SPK_AUDIO` | Unreliable (FEC 1.0, legacy) | `u32 LE stream_id` + raw mono s16le PCM at negotiated `sample_rate` (chunked ≤ 960 B) |
 | `0x94` | S→C | `SPK_CLEAR` | Reliable (FEC 1.0) | `u32 LE stream_id` |
 | `0x95` | S→C | `SPK_STOP` | Reliable (FEC 1.0) | `u32 LE stream_id` |
+| `0x96` | S→C | `SPK_OPUS` | Unreliable (FEC 0.0, unpaced, in-packet RED) | Same binary layout as `MIC_OPUS` (`0x12`) |
+| `0x97` | S→C | `VOICE_STATS` | Unreliable (FEC 0.0, every 250 ms) | Same 12-byte layout as `VOICE_STATS` (`0x13`), reporting uplink Mic stats to client |
+
+- Codec negotiation keeps `proto: 1` backward-compatible: `VoiceHello` advertises `"codecs": ["opus", "pcm16"]`; clients supporting Opus send `CONFIG {"voice_codec": "opus"}` after hello. Legacy clients stay on `pcm16` (`0x10`/`0x93`).
+- `flags` in `MIC_OPUS`/`SPK_OPUS`: bit 0 `DTX` (silence keepalive; primary may be 0 bytes), bit 1 `FEC` (Opus in-band LBRR enabled), bit 2 `SPEECH`, bit 3 `RESET` (first frame after `SPK_START`/`SPK_CLEAR`), upper 4 bits `turn_gen` (wrapping 0..15 incremented on `SPK_CLEAR` to drop reordered pre-barge-in packets).

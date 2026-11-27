@@ -23,6 +23,8 @@ pub mod ty {
     pub const PONG: u8 = 0x08;
     pub const MIC_AUDIO: u8 = 0x10;
     pub const SPK_ACK: u8 = 0x11;
+    pub const MIC_OPUS: u8 = 0x12;
+    pub const VOICE_STATS_C2S: u8 = 0x13;
     pub const VIDEO: u8 = 0x81;
     pub const CURSOR_POS: u8 = 0x82;
     pub const CURSOR_SHAPE: u8 = 0x83;
@@ -34,7 +36,33 @@ pub mod ty {
     pub const SPK_AUDIO: u8 = 0x93;
     pub const SPK_CLEAR: u8 = 0x94;
     pub const SPK_STOP: u8 = 0x95;
+    pub const SPK_OPUS: u8 = 0x96;
+    pub const VOICE_STATS_S2C: u8 = 0x97;
 }
+
+/// Bitflags carried in `MIC_OPUS` (`0x12`) and `SPK_OPUS` (`0x96`) headers.
+/// Upper 4 bits (`0xF0`) carry a 4-bit wrapping turn generation incremented on `SPK_CLEAR`
+/// so stale pre-barge-in UDP packets are discarded cleanly even when reordered.
+pub mod voice_flags {
+    pub const DTX: u8 = 1 << 0;
+    pub const FEC: u8 = 1 << 1;
+    pub const SPEECH: u8 = 1 << 2;
+    pub const RESET: u8 = 1 << 3;
+    pub const GEN_SHIFT: u8 = 4;
+    pub const GEN_MASK: u8 = 0xF0;
+
+    pub const fn with_gen(flags: u8, turn_gen: u8) -> u8 {
+        (flags & !GEN_MASK) | ((turn_gen & 0x0F) << GEN_SHIFT)
+    }
+
+    pub const fn turn_gen(flags: u8) -> u8 {
+        (flags >> GEN_SHIFT) & 0x0F
+    }
+}
+
+pub const VOICE_MAX_RED_ENTRIES: usize = 3;
+pub const VOICE_MAX_RED_DELTA: u8 = 6;
+pub const VOICE_MAX_OPUS_BYTES: usize = 1000;
 
 pub mod req {
     pub const KEYFRAME: u8 = 1;
@@ -142,6 +170,43 @@ pub struct Config {
     /// Voice mode: when true, the headless voice daemon exits immediately and releases its loopback port.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub shutdown: Option<bool>,
+    /// Voice mode: negotiated audio codec (`"opus"` or `"pcm16"`). Absent defaults to `"pcm16"`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub voice_codec: Option<String>,
+}
+
+/// One RFC 2198-style redundant Opus frame piggybacked inside `MIC_OPUS` / `SPK_OPUS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceRedEntry {
+    /// Positive sequence delta (`1..=6`): this entry carries frame `seq.wrapping_sub(delta_seq)`.
+    pub delta_seq: u8,
+    pub data: Vec<u8>,
+}
+
+/// Sequenced Opus voice packet (`MIC_OPUS 0x12` C->S, `SPK_OPUS 0x96` S->C).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceOpusPacket {
+    pub stream_id: u32,
+    pub seq: u32,
+    pub ts_samples: u32,
+    pub flags: u8,
+    pub red: Vec<VoiceRedEntry>,
+    pub primary: Vec<u8>,
+}
+
+/// Periodic receiver-side voice quality report (`VOICE_STATS_C2S 0x13`, `VOICE_STATS_S2C 0x97`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VoiceStats {
+    pub stream_id: u32,
+    /// Raw primary packet loss BEFORE RED/FEC recovery, in permille (`0..=1000`).
+    pub loss_permille: u16,
+    /// Estimated arrival jitter (ms).
+    pub jitter_ms: u16,
+    /// Current receiver jitter-buffer depth (ms).
+    pub buffer_ms: u16,
+    /// Maximum consecutive primary packets lost in the last reporting window.
+    pub max_burst_loss: u8,
+    pub flags: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +231,8 @@ pub enum ClientMsg {
     Pong { t1: u64, t2: u64, t3: u64 },
     MicAudio { stream_id: u32, pcm: Vec<u8> },
     SpkAck { stream_id: u32, ok: bool, error: String },
+    MicOpus(VoiceOpusPacket),
+    VoiceStats(VoiceStats),
     Unknown(u8),
 }
 
@@ -216,6 +283,7 @@ impl Cur<'_> {
     }
     fn u8(&mut self) -> io::Result<u8> { Ok(self.take(1)?[0]) }
     fn u16(&mut self) -> io::Result<u16> { Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap())) }
+    fn u16_le(&mut self) -> io::Result<u16> { Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap())) }
     fn i16(&mut self) -> io::Result<i16> { Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap())) }
     fn u32(&mut self) -> io::Result<u32> { Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap())) }
     fn u32_le(&mut self) -> io::Result<u32> { Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap())) }
@@ -256,6 +324,8 @@ pub fn decode_client(ty: u8, p: &[u8]) -> io::Result<ClientMsg> {
             let error = text(c.0)?;
             ClientMsg::SpkAck { stream_id, ok, error }
         }
+        ty::MIC_OPUS => ClientMsg::MicOpus(decode_voice_opus(p)?),
+        ty::VOICE_STATS_C2S => ClientMsg::VoiceStats(decode_voice_stats(p)?),
         other => ClientMsg::Unknown(other),
     })
 }
@@ -290,6 +360,8 @@ pub fn encode_client(m: &ClientMsg) -> (u8, Vec<u8>) {
         ClientMsg::SpkAck { stream_id, ok, error } => {
             v.extend(stream_id.to_le_bytes()); v.push(*ok as u8); v.extend_from_slice(error.as_bytes()); ty::SPK_ACK
         }
+        ClientMsg::MicOpus(pkt) => { v = encode_voice_opus(pkt); ty::MIC_OPUS }
+        ClientMsg::VoiceStats(st) => { v = encode_voice_stats(st); ty::VOICE_STATS_C2S }
         ClientMsg::Unknown(t) => *t,
     };
     (t, v)
@@ -377,6 +449,80 @@ pub fn spk_clear_payload(stream_id: u32) -> Vec<u8> {
 
 pub fn spk_stop_payload(stream_id: u32) -> Vec<u8> {
     stream_id.to_le_bytes().to_vec()
+}
+
+/// Encodes `MIC_OPUS (0x12)` / `SPK_OPUS (0x96)` payload:
+/// `stream_id u32 LE | seq u32 LE | ts_samples u32 LE | flags u8 | red_count u8 | [delta_seq u8 | len u16 LE | data]* | primary`.
+pub fn encode_voice_opus(pkt: &VoiceOpusPacket) -> Vec<u8> {
+    let red_count = pkt.red.len().min(VOICE_MAX_RED_ENTRIES);
+    let red_bytes: usize = pkt.red[..red_count].iter().map(|r| 3 + r.data.len()).sum();
+    let mut p = Vec::with_capacity(14 + red_bytes + pkt.primary.len());
+    p.extend(pkt.stream_id.to_le_bytes());
+    p.extend(pkt.seq.to_le_bytes());
+    p.extend(pkt.ts_samples.to_le_bytes());
+    p.push(pkt.flags);
+    p.push(red_count as u8);
+    for entry in &pkt.red[..red_count] {
+        p.push(entry.delta_seq);
+        p.extend((entry.data.len() as u16).to_le_bytes());
+        p.extend_from_slice(&entry.data);
+    }
+    p.extend_from_slice(&pkt.primary);
+    p
+}
+
+pub fn decode_voice_opus(p: &[u8]) -> io::Result<VoiceOpusPacket> {
+    let mut c = Cur(p);
+    let stream_id = c.u32_le()?;
+    let seq = c.u32_le()?;
+    let ts_samples = c.u32_le()?;
+    let flags = c.u8()?;
+    let red_count = c.u8()? as usize;
+    if red_count > VOICE_MAX_RED_ENTRIES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "too many RED entries"));
+    }
+    let mut red = Vec::with_capacity(red_count);
+    for _ in 0..red_count {
+        let delta_seq = c.u8()?;
+        let len = c.u16_le()? as usize;
+        if delta_seq == 0 || delta_seq > VOICE_MAX_RED_DELTA || len == 0 || len > VOICE_MAX_OPUS_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RED entry"));
+        }
+        let data = c.take(len)?.to_vec();
+        red.push(VoiceRedEntry { delta_seq, data });
+    }
+    if c.0.len() > VOICE_MAX_OPUS_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "primary opus frame too large"));
+    }
+    let primary = c.0.to_vec();
+    if primary.is_empty() && (flags & voice_flags::DTX) == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty non-DTX opus frame"));
+    }
+    Ok(VoiceOpusPacket { stream_id, seq, ts_samples, flags, red, primary })
+}
+
+/// Encodes `VOICE_STATS_C2S (0x13)` / `VOICE_STATS_S2C (0x97)` payload (12 bytes):
+/// `stream_id u32 LE | loss_permille u16 LE | jitter_ms u16 LE | buffer_ms u16 LE | max_burst_loss u8 | flags u8`.
+pub fn encode_voice_stats(st: &VoiceStats) -> Vec<u8> {
+    let mut p = Vec::with_capacity(12);
+    p.extend(st.stream_id.to_le_bytes());
+    p.extend(st.loss_permille.min(1000).to_le_bytes());
+    p.extend(st.jitter_ms.to_le_bytes());
+    p.extend(st.buffer_ms.to_le_bytes());
+    p.push(st.max_burst_loss);
+    p.push(st.flags);
+    p
+}
+
+pub fn decode_voice_stats(p: &[u8]) -> io::Result<VoiceStats> {
+    let mut c = Cur(p);
+    let stream_id = c.u32_le()?;
+    let loss_permille = c.u16_le()?.min(1000);
+    let jitter_ms = c.u16_le()?;
+    let buffer_ms = c.u16_le()?;
+    let max_burst_loss = c.u8()?;
+    let flags = c.u8()?;
+    Ok(VoiceStats { stream_id, loss_permille, jitter_ms, buffer_ms, max_burst_loss, flags })
 }
 
 #[cfg(test)]
@@ -523,5 +669,61 @@ mod tests {
         };
         let s = serde_json::to_string(&vh).unwrap();
         assert_eq!(serde_json::from_str::<VoiceHello>(&s).unwrap(), vh);
+
+        // Voice Opus packet with RED entries + turn_gen flags
+        let flags = voice_flags::with_gen(voice_flags::FEC | voice_flags::SPEECH | voice_flags::RESET, 9);
+        assert_eq!(voice_flags::turn_gen(flags), 9);
+        let opus_pkt = VoiceOpusPacket {
+            stream_id: 42,
+            seq: 105,
+            ts_samples: 105 * 320,
+            flags,
+            red: vec![
+                VoiceRedEntry { delta_seq: 1, data: vec![0xAA, 0xBB, 0xCC] },
+                VoiceRedEntry { delta_seq: 2, data: vec![0xDD, 0xEE] },
+            ],
+            primary: vec![0x01, 0x02, 0x03, 0x04],
+        };
+        let (t, p) = encode_client(&ClientMsg::MicOpus(opus_pkt.clone()));
+        assert_eq!(t, ty::MIC_OPUS);
+        assert_eq!(t, 0x12);
+        assert_eq!(decode_client(t, &p).unwrap(), ClientMsg::MicOpus(opus_pkt.clone()));
+        assert_eq!(decode_voice_opus(&encode_voice_opus(&opus_pkt)).unwrap(), opus_pkt);
+
+        // DTX packet allows empty primary payload
+        let dtx = VoiceOpusPacket {
+            stream_id: 7,
+            seq: 200,
+            ts_samples: 200 * 320,
+            flags: voice_flags::DTX,
+            red: Vec::new(),
+            primary: Vec::new(),
+        };
+        assert_eq!(decode_voice_opus(&encode_voice_opus(&dtx)).unwrap(), dtx);
+
+        // Malformed packets rejected
+        assert!(decode_voice_opus(&[0u8; 10]).is_err());
+        let mut bad_empty = encode_voice_opus(&dtx);
+        bad_empty[12] = 0; // clear DTX flag -> empty non-DTX rejected
+        assert!(decode_voice_opus(&bad_empty).is_err());
+
+        // VoiceStats roundtrip
+        let st = VoiceStats {
+            stream_id: 42,
+            loss_permille: 185,
+            jitter_ms: 42,
+            buffer_ms: 60,
+            max_burst_loss: 3,
+            flags: 1,
+        };
+        let (t, p) = encode_client(&ClientMsg::VoiceStats(st));
+        assert_eq!(t, ty::VOICE_STATS_C2S);
+        assert_eq!(p.len(), 12);
+        assert_eq!(decode_client(t, &p).unwrap(), ClientMsg::VoiceStats(st));
+
+        // Config voice_codec roundtrip
+        let cfg = Config { voice_codec: Some("opus".into()), ..Default::default() };
+        let (t, p) = encode_client(&ClientMsg::Config(cfg.clone()));
+        assert_eq!(decode_client(t, &p).unwrap(), ClientMsg::Config(cfg));
     }
 }
