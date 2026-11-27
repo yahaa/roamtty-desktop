@@ -814,12 +814,18 @@ impl MicStreamHandle {
     }
 }
 
+const MAX_SPK_OPUS_TX_QUEUE: usize = 250;
+const SPK_OPUS_PACE_MS: u64 = 19;
+
 struct SpkOpusState {
     encoder: VoiceOpusEncoder,
     red: RedHistory,
     pcm_pending: Vec<i16>,
     scratch: Vec<i16>,
     last_pcm_at: Option<Instant>,
+    tx_queue: VecDeque<VoiceOpusPacket>,
+    next_tx_at: Option<Instant>,
+    burst_budget: u8,
     seq: u32,
     turn_gen: u8,
     pending_reset: bool,
@@ -833,6 +839,9 @@ impl SpkOpusState {
             pcm_pending: Vec::with_capacity(frame_samples(sample_rate) * 2),
             scratch: Vec::with_capacity(frame_samples(sample_rate) * 2),
             last_pcm_at: None,
+            tx_queue: VecDeque::with_capacity(64),
+            next_tx_at: None,
+            burst_budget: 2,
             seq: 0,
             turn_gen: 0,
             pending_reset: true,
@@ -842,10 +851,26 @@ impl SpkOpusState {
     fn clear(&mut self) {
         self.pcm_pending.clear();
         self.last_pcm_at = None;
+        self.tx_queue.clear();
+        self.next_tx_at = None;
+        self.burst_budget = 2;
         self.red.clear();
         self.encoder.reset();
         self.turn_gen = self.turn_gen.wrapping_add(1) & 0x0F;
         self.pending_reset = true;
+    }
+
+    fn enqueue_tx(&mut self, pkt: VoiceOpusPacket, now: Instant) {
+        if self.tx_queue.is_empty()
+            && self.next_tx_at.is_none_or(|t| now >= t + Duration::from_millis(40))
+        {
+            self.next_tx_at = Some(now);
+            self.burst_budget = 2;
+        }
+        while self.tx_queue.len() >= MAX_SPK_OPUS_TX_QUEUE {
+            self.tx_queue.pop_front();
+        }
+        self.tx_queue.push_back(pkt);
     }
 
     fn encode_frame(&mut self, stream_id: u32, pcm: &[i16], red_count: usize) -> Option<VoiceOpusPacket> {
@@ -1237,9 +1262,59 @@ impl VoiceEngine {
         }
     }
 
+    fn next_spk_pace_wait(&self) -> Duration {
+        let now = Instant::now();
+        let mut wait = Duration::from_millis(15);
+        for state in self.spk_streams.values() {
+            if let Some(op) = state.opus.as_ref() {
+                if !op.tx_queue.is_empty() {
+                    let due = op.next_tx_at.unwrap_or(now);
+                    let rem = due.saturating_duration_since(now);
+                    wait = wait.min(rem.min(Duration::from_millis(5)));
+                }
+            }
+        }
+        wait
+    }
+
+    fn drain_paced_spk_opus(&mut self) {
+        let Some(c) = self.client.as_mut() else { return };
+        if !c.voice_opus {
+            return;
+        }
+        let now = Instant::now();
+        let pace = Duration::from_millis(SPK_OPUS_PACE_MS);
+        let mut to_emit: Vec<Vec<u8>> = Vec::new();
+        for state in self.spk_streams.values_mut() {
+            let Some(op) = state.opus.as_mut() else { continue };
+            let mut sent_this_tick = 0u8;
+            while sent_this_tick < 2 {
+                let due = op.next_tx_at.unwrap_or(now);
+                if op.burst_budget == 0 && now < due {
+                    break;
+                }
+                let Some(pkt) = op.tx_queue.pop_front() else {
+                    break;
+                };
+                to_emit.push(proto::encode_voice_opus(&pkt));
+                sent_this_tick += 1;
+                if op.burst_budget > 0 {
+                    op.burst_budget -= 1;
+                    op.next_tx_at = Some(now + pace);
+                } else {
+                    let next = due + pace;
+                    op.next_tx_at = Some(if now > next + Duration::from_millis(60) { now + pace } else { next });
+                }
+            }
+        }
+        for payload in to_emit {
+            let _ = c.emit(ty::SPK_OPUS, &payload);
+        }
+    }
+
     fn run(&mut self, ev_rx: mpsc::Receiver<Event>) -> EngineExit {
         loop {
-            match ev_rx.recv_timeout(Duration::from_millis(15)) {
+            match ev_rx.recv_timeout(self.next_spk_pace_wait()) {
                 Ok(ev) => {
                     if !self.handle_event(ev) {
                         break;
@@ -1309,6 +1384,7 @@ impl VoiceEngine {
             if self.is_client_reachable() {
                 self.announce_unannounced_streams();
                 self.flush_pending_spk_tails();
+                self.drain_paced_spk_opus();
                 self.maybe_emit_mic_stats();
             }
             self.client_connected.store(self.is_client_reachable(), Ordering::Relaxed);
@@ -1425,13 +1501,15 @@ impl VoiceEngine {
                                 s16le_bytes_to_i16(&pcm, &mut op.scratch);
                                 op.pcm_pending.extend_from_slice(&op.scratch);
                                 let flen = op.encoder.frame_len();
+                                let now = Instant::now();
                                 while op.pcm_pending.len() >= flen {
                                     let frame: Vec<i16> = op.pcm_pending.drain(..flen).collect();
                                     if let Some(pkt) = op.encode_frame(stream_id, &frame, profile.red_count) {
-                                        let _ = c.emit(ty::SPK_OPUS, &proto::encode_voice_opus(&pkt));
+                                        op.enqueue_tx(pkt, now);
                                     }
                                 }
-                                op.last_pcm_at = if op.pcm_pending.is_empty() { None } else { Some(Instant::now()) };
+                                op.last_pcm_at = if op.pcm_pending.is_empty() { None } else { Some(now) };
+                                self.drain_paced_spk_opus();
                                 return true;
                             }
                         }
@@ -1601,7 +1679,7 @@ impl VoiceEngine {
                 let profile = state.link_ctrl.profile();
                 op.encoder.apply_params(profile.bitrate, profile.opus_loss_perc);
                 if let Some(pkt) = op.encode_frame(stream_id, &frame, profile.red_count) {
-                    let _ = c.emit(ty::SPK_OPUS, &proto::encode_voice_opus(&pkt));
+                    op.enqueue_tx(pkt, now);
                 }
             }
         }
@@ -2028,17 +2106,23 @@ fn handle_mic_conn(
         let (lock, cvar) = &*w_queue;
         let mut had_error = false;
         let mut next_opus_tick: Option<Instant> = None;
+        let mut ever_played_opus = false;
+        let silence_20ms = vec![0u8; frame_samples(MIC_SAMPLE_RATE) * 2];
         loop {
             let opus_active = w_opus_jb.lock().unwrap().is_some();
             if opus_active {
-                let now = Instant::now();
-                let target_tick = *next_opus_tick.get_or_insert(now);
-                if now < target_tick {
+                let target_tick = *next_opus_tick.get_or_insert_with(Instant::now);
+                loop {
+                    let now = Instant::now();
+                    if now >= target_tick {
+                        break;
+                    }
                     let wait = target_tick.saturating_duration_since(now);
                     let q = lock.lock().unwrap();
-                    if !q.closed && q.chunks.is_empty() {
-                        let _ = cvar.wait_timeout(q, wait).unwrap();
+                    if q.closed || !q.chunks.is_empty() {
+                        break;
                     }
+                    let _ = cvar.wait_timeout(q, wait).unwrap();
                 }
                 // Drain any legacy raw chunks if present.
                 let legacy = {
@@ -2063,9 +2147,20 @@ fn handle_mic_conn(
                     jb_guard.as_mut().and_then(|jb| jb.pop_frame(now_ms))
                 };
                 if let Some(samples) = popped {
+                    ever_played_opus = true;
                     let pcm = i16_to_s16le_bytes(&samples);
                     if let Err(e) = write_stream.write_all(&pcm) {
                         crate::log!("voice mic {stream_id} opus write error: {e}");
+                        had_error = true;
+                        let mut q = lock.lock().unwrap();
+                        q.closed = true;
+                        q.chunks.clear();
+                        cvar.notify_all();
+                        break;
+                    }
+                } else if ever_played_opus && !legacy.1 {
+                    if let Err(e) = write_stream.write_all(&silence_20ms) {
+                        crate::log!("voice mic {stream_id} opus silence write error: {e}");
                         had_error = true;
                         let mut q = lock.lock().unwrap();
                         q.closed = true;

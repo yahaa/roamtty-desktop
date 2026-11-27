@@ -385,10 +385,17 @@ impl VoiceRxStats {
     pub fn reset_seq_cursor(&mut self) {
         self.max_seq = None;
         self.current_loss_streak = 0;
-        self.last_transit_ms = None;
+        self.reset_timing();
     }
 
-    pub fn on_primary(&mut self, seq: u32, now_ms: u64) {
+    /// Resets interarrival jitter baseline when a stream goes idle between utterances so pauses aren't measured as jitter.
+    pub fn reset_timing(&mut self) {
+        self.last_transit_ms = None;
+        self.arrival_at.clear();
+        self.arrival_offset.clear();
+    }
+
+    pub fn on_primary(&mut self, seq: u32, now_ms: u64, reset_discontinuity: bool) {
         if self.seen_seqs.contains(&seq) {
             return;
         }
@@ -399,26 +406,35 @@ impl VoiceRxStats {
 
         // Update RFC-3550 style interarrival jitter and 3s P95 residual window.
         let transit = now_ms as i64 - (seq as i64) * (FRAME_MS as i64);
-        if let Some(prev) = self.last_transit_ms {
-            let d = (transit - prev).abs() as f64;
-            self.ewma_jitter_ms += (d - self.ewma_jitter_ms) / 16.0;
-        }
-        self.last_transit_ms = Some(transit);
-        if let Some(&last_o) = self.arrival_offset.back() {
-            if (transit - last_o).abs() > 2_000 {
-                self.arrival_at.clear();
-                self.arrival_offset.clear();
+        if reset_discontinuity {
+            self.last_transit_ms = Some(transit);
+        } else {
+            if let Some(prev) = self.last_transit_ms {
+                let d = (transit - prev).abs() as f64;
+                self.ewma_jitter_ms += (d - self.ewma_jitter_ms) / 16.0;
             }
-        }
-        self.arrival_at.push_back(now_ms as i64);
-        self.arrival_offset.push_back(transit);
-        while self.arrival_at.len() > JITTER_WINDOW {
-            self.arrival_at.pop_front();
-            self.arrival_offset.pop_front();
+            self.last_transit_ms = Some(transit);
+            if let Some(&last_o) = self.arrival_offset.back() {
+                if (transit - last_o).abs() > 2_000 {
+                    self.arrival_at.clear();
+                    self.arrival_offset.clear();
+                }
+            }
+            self.arrival_at.push_back(now_ms as i64);
+            self.arrival_offset.push_back(transit);
+            while self.arrival_at.len() > JITTER_WINDOW {
+                self.arrival_at.pop_front();
+                self.arrival_offset.pop_front();
+            }
         }
 
         match self.max_seq {
             None => {
+                self.max_seq = Some(seq);
+                self.window_events.push_back((now_ms, true));
+                self.current_loss_streak = 0;
+            }
+            Some(_) if reset_discontinuity => {
                 self.max_seq = Some(seq);
                 self.window_events.push_back((now_ms, true));
                 self.current_loss_streak = 0;
@@ -672,9 +688,24 @@ impl VoiceJitterBuffer {
             // Same generation with RESET only occurs on initial packet; ignore duplicates.
         }
 
-        self.rx_stats.on_primary(pkt.seq, now_ms);
+        let is_dtx_pkt = (pkt.flags & voice_flags::DTX) != 0;
+        let is_reset_pkt = (pkt.flags & voice_flags::RESET) != 0;
+        self.rx_stats.on_primary(pkt.seq, now_ms, is_dtx_pkt || is_reset_pkt || self.in_dtx);
         if self.first_arrival_ms.is_none() {
             self.first_arrival_ms = Some(now_ms);
+        }
+
+        // Self-heal if playout_seq drifted ahead during DTX or sustained underrun while empty.
+        if self.slots.is_empty() {
+            if let Some(p) = self.playout_seq {
+                let behind = pkt.seq.wrapping_sub(p) as i32;
+                if (self.in_dtx && !is_dtx_pkt) || ((-64..0).contains(&behind) && (self.in_dtx || self.consecutive_plc >= 2)) {
+                    self.playout_seq = Some(pkt.seq);
+                    self.highest_seq = pkt.seq;
+                    self.in_dtx = false;
+                    self.consecutive_plc = 0;
+                }
+            }
         }
 
         // Insert primary packet if not older than playout cursor.
@@ -845,9 +876,12 @@ impl VoiceJitterBuffer {
                 is_silence = true;
             }
         } else if self.in_dtx {
-            // In active DTX silence interval: emit clean silence without triggering underrun penalty.
+            // In active DTX silence interval: emit clean silence without letting playout_seq outrun sender.
             pcm.resize(frame_len, 0);
             is_silence = true;
+            if self.slots.is_empty() {
+                advance_seq = false;
+            }
         } else {
             // Genuine packet loss or jitter underrun: run Opus native PLC with smooth fadeout past 100 ms.
             self.consecutive_plc = self.consecutive_plc.saturating_add(1);
@@ -869,16 +903,25 @@ impl VoiceJitterBuffer {
                 } else {
                     pcm.resize(frame_len, 0);
                 }
+                // NetEQ expand: while no newer frame has arrived, hold `playout_seq` at `cur_seq` so
+                // slight clock drift or delayed RED packets are never rejected as late.
+                if self.slots.is_empty() {
+                    advance_seq = false;
+                    self.expand_credits = self.expand_credits.saturating_sub(1);
+                }
             } else {
+                // Past 100 ms with zero packets: clean idle between utterances so next talkspurt starts fast.
+                if self.slots.is_empty() {
+                    self.playout_seq = None;
+                    self.started = false;
+                    self.first_arrival_ms = None;
+                    self.consecutive_plc = 0;
+                    self.underrun_penalty_ms = 0.0;
+                    self.rx_stats.reset_timing();
+                    return None;
+                }
                 pcm.resize(frame_len, 0);
                 is_silence = true;
-            }
-            // NetEQ-style buffer expansion: when target grew (loss/jitter detected) and we just played PLC,
-            // hold `playout_seq` at `cur_seq` so the incoming next packet's RED can still recover `cur_seq`
-            // and subsequent packets sit inside the expanded jitter cushion!
-            if self.expand_credits > 0 && self.slots.is_empty() && self.consecutive_plc <= 2 {
-                self.expand_credits -= 1;
-                advance_seq = false;
             }
         }
 
@@ -886,14 +929,14 @@ impl VoiceJitterBuffer {
             self.playout_seq = Some(cur_seq.wrapping_add(1));
         }
 
-        // Latency convergence: if backlog exceeds target + 1 frame, drop silence frames or WSOLA-compress speech.
+        // Latency convergence: if backlog exceeds target + 2 frames, drop silence or gently WSOLA-compress speech.
         let excess = (self.highest_seq.wrapping_sub(cur_seq) as i32) - self.target_frames as i32;
-        if excess >= 2 {
+        if excess >= 3 {
             if is_silence && !self.slots.is_empty() {
                 // Recurse once to seamlessly skip a silent pause frame and pull playout closer to live!
                 return self.pop_frame(now_ms);
             } else if !is_silence {
-                let target_samples = (pcm.len() * 88) / 100; // ~12% pitch-preserving time compression
+                let target_samples = (pcm.len() * 90) / 100; // ~10% pitch-preserving time compression
                 pcm = wsola_compress(&pcm, target_samples);
             }
         }
@@ -1070,5 +1113,60 @@ mod tests {
             80,
         );
         assert!(jb.pop_frame(100).is_some());
+    }
+
+    #[test]
+    fn clock_drift_and_dtx_pause_never_drop_resumed_speech() {
+        let rate = 16_000;
+        let mut enc = VoiceOpusEncoder::new(rate, 28_000, false).unwrap();
+        let mut jb = VoiceJitterBuffer::new(1, rate).unwrap();
+
+        // 1. Steady 15 frames of speech
+        for seq in 0..15u32 {
+            let encoded = enc.encode(&sine_frame(rate, 440.0, seq)).unwrap();
+            jb.push(
+                &VoiceOpusPacket {
+                    stream_id: 1,
+                    seq,
+                    ts_samples: seq * frame_samples(rate) as u32,
+                    flags: voice_flags::FEC | voice_flags::SPEECH,
+                    red: vec![],
+                    primary: encoded,
+                },
+                seq as u64 * 20,
+            );
+            assert!(jb.pop_frame(seq as u64 * 20).is_some());
+        }
+
+        // 2. Simulate 400 ms sender pause (or clock drift where receiver ticks 20 times with no packets)
+        for t in 15..35u64 {
+            let _ = jb.pop_frame(t * 20);
+        }
+
+        // 3. Sender resumes at seq = 15 (even though receiver ticked 20 times during the gap!)
+        let mut audible = 0u32;
+        for i in 0..15u32 {
+            let seq = 15 + i;
+            let now = (35 + i as u64) * 20;
+            let encoded = enc.encode(&sine_frame(rate, 440.0, seq)).unwrap();
+            jb.push(
+                &VoiceOpusPacket {
+                    stream_id: 1,
+                    seq,
+                    ts_samples: seq * frame_samples(rate) as u32,
+                    flags: voice_flags::FEC | voice_flags::SPEECH,
+                    red: vec![],
+                    primary: encoded,
+                },
+                now,
+            );
+            if let Some(pcm) = jb.pop_frame(now) {
+                if pcm_rms(&pcm) > 0.05 {
+                    audible += 1;
+                }
+            }
+        }
+        assert!(audible >= 13, "resumed speech after clock drift / pause must not be dropped (audible={audible}/15)");
+        assert_eq!(jb.stats_snapshot(50 * 20).loss_permille, 0, "pause without gaps must report 0% loss");
     }
 }
