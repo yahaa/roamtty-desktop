@@ -792,7 +792,8 @@ impl MicStreamHandle {
         jb.push(pkt, now_ms);
         drop(guard);
         if newly_created {
-            let (_, cvar) = &*self.queue;
+            let (lock, cvar) = &*self.queue;
+            let _q = lock.lock().unwrap();
             cvar.notify_one();
         }
     }
@@ -1529,10 +1530,28 @@ impl VoiceEngine {
                 }
             }
             Event::AgySpkClosed { stream_id, notify_client } => {
-                if let Some(state) = self.spk_streams.remove(&stream_id) {
+                if let Some(mut state) = self.spk_streams.remove(&stream_id) {
                     if notify_client {
                         if let Some(c) = self.client.as_mut() {
                             if state.announced_to_epoch == Some(c.epoch) {
+                                if c.voice_opus {
+                                    if let Some(op) = state.opus.as_mut() {
+                                        if !op.pcm_pending.is_empty() {
+                                            let flen = op.encoder.frame_len();
+                                            let mut frame = std::mem::take(&mut op.pcm_pending);
+                                            frame.resize(flen, 0);
+                                            op.last_pcm_at = None;
+                                            let profile = state.link_ctrl.profile();
+                                            op.encoder.apply_params(profile.bitrate, profile.opus_loss_perc);
+                                            if let Some(pkt) = op.encode_frame(stream_id, &frame, profile.red_count) {
+                                                op.enqueue_tx(pkt, Instant::now());
+                                            }
+                                        }
+                                        while let Some(pkt) = op.tx_queue.pop_front() {
+                                            let _ = c.emit(ty::SPK_OPUS, &proto::encode_voice_opus(&pkt));
+                                        }
+                                    }
+                                }
                                 let _ = c.emit(ty::SPK_STOP, &proto::spk_stop_payload(stream_id));
                             }
                         }
@@ -2142,12 +2161,41 @@ fn handle_mic_conn(
                     continue;
                 }
                 let now_ms = crate::serve::now_us() / 1000;
+                if legacy.1 {
+                    // Drain all remaining buffered Opus frames before sending TCP FIN to `agy`.
+                    // Advance `now_ms` by 200 ms so any sub-pre-roll tail still flushes cleanly.
+                    let drain_now = now_ms.saturating_add(200);
+                    for _ in 0..64 {
+                        let popped = {
+                            let mut jb_guard = w_opus_jb.lock().unwrap();
+                            jb_guard.as_mut().and_then(|jb| {
+                                if jb.queued_frames() > 0 {
+                                    jb.pop_frame(drain_now)
+                                } else {
+                                    None
+                                }
+                            })
+                        };
+                        let Some(samples) = popped else {
+                            break;
+                        };
+                        let pcm = i16_to_s16le_bytes(&samples);
+                        if let Err(e) = write_stream.write_all(&pcm) {
+                            crate::log!("voice mic {stream_id} opus drain write error: {e}");
+                            had_error = true;
+                            break;
+                        }
+                    }
+                    break;
+                }
                 let popped = {
                     let mut jb_guard = w_opus_jb.lock().unwrap();
                     jb_guard.as_mut().and_then(|jb| jb.pop_frame(now_ms))
                 };
+                let mut played_samples: Option<usize> = None;
                 if let Some(samples) = popped {
                     ever_played_opus = true;
+                    played_samples = Some(samples.len());
                     let pcm = i16_to_s16le_bytes(&samples);
                     if let Err(e) = write_stream.write_all(&pcm) {
                         crate::log!("voice mic {stream_id} opus write error: {e}");
@@ -2158,7 +2206,7 @@ fn handle_mic_conn(
                         cvar.notify_all();
                         break;
                     }
-                } else if ever_played_opus && !legacy.1 {
+                } else if ever_played_opus {
                     if let Err(e) = write_stream.write_all(&silence_20ms) {
                         crate::log!("voice mic {stream_id} opus silence write error: {e}");
                         had_error = true;
@@ -2169,11 +2217,14 @@ fn handle_mic_conn(
                         break;
                     }
                 }
-                if legacy.1 {
-                    break;
-                }
-                // Advance 20 ms playout clock (re-sync if scheduler drifted > 60 ms).
-                let step = Duration::from_millis(crate::voice_codec::FRAME_MS as u64);
+                // Advance playout clock by actual played sample duration so WSOLA-compressed frames drain backlog.
+                let step = match played_samples {
+                    Some(n) if n > 0 => {
+                        let us = (n as u64).saturating_mul(1_000_000) / (MIC_SAMPLE_RATE as u64);
+                        Duration::from_micros(us.clamp(10_000, 25_000))
+                    }
+                    _ => Duration::from_millis(crate::voice_codec::FRAME_MS as u64),
+                };
                 let after = Instant::now();
                 let next = target_tick + step;
                 next_opus_tick = Some(if after > next + Duration::from_millis(60) { after + step } else { next });

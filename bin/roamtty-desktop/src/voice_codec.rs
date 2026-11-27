@@ -787,6 +787,9 @@ impl VoiceJitterBuffer {
     }
 
     pub fn queued_frames(&self) -> u32 {
+        if self.slots.is_empty() {
+            return 0;
+        }
         let Some(p) = self.playout_seq else {
             return 0;
         };

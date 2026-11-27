@@ -1392,6 +1392,78 @@ fn opus_negotiation_streams_red_packets_barge_in_gen_and_uplink_jitter_playout()
     h.stop();
 }
 
+#[test]
+fn opus_speaker_flushes_partial_tail_before_spk_stop_and_mic_drains_before_fin() {
+    let h = VoiceHarness::start(false);
+    let mut client = h.attach(None, None).unwrap();
+    client.send(ClientMsg::Config(proto::Config {
+        voice_codec: Some("opus".into()),
+        ..Default::default()
+    }));
+
+    // 1. Speaker writes a partial 10 ms tail (480 B @ 24 kHz) and immediately closes -> SPK_OPUS must precede SPK_STOP.
+    let mut agy_spk = TcpStream::connect(("127.0.0.1", h.mic_port)).unwrap();
+    agy_spk.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    agy_spk.write_all(b"JETSKI-AUDIO/1 speaker rate=24000 channels=1\n").unwrap();
+    let (ty, payload) = client.recv_frame();
+    assert_eq!(ty, ty::SPK_START);
+    let spk_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    client.send(ClientMsg::SpkAck { stream_id: spk_id, ok: true, error: String::new() });
+    let mut ack_buf = [0u8; 64];
+    let _ = agy_spk.read(&mut ack_buf).unwrap();
+
+    let mut half_frame = Vec::with_capacity(480);
+    for i in 0..240 {
+        let s = (((i as f32) * 440.0 * std::f32::consts::TAU / 24000.0).sin() * 12000.0) as i16;
+        half_frame.extend_from_slice(&s.to_le_bytes());
+    }
+    let mut hdr = [0u8; 5];
+    hdr[0] = b'A';
+    hdr[1..5].copy_from_slice(&(half_frame.len() as u32).to_le_bytes());
+    agy_spk.write_all(&hdr).unwrap();
+    agy_spk.write_all(&half_frame).unwrap();
+    agy_spk.flush().unwrap();
+    drop(agy_spk);
+
+    let (t1, _) = client.recv_frame();
+    assert_eq!(t1, ty::SPK_OPUS, "partial speaker tail must flush before SPK_STOP");
+    let (t2, _) = client.recv_frame();
+    assert_eq!(t2, ty::SPK_STOP);
+
+    // 2. Mic receives 3 queued MIC_OPUS frames right before agy half-closes -> all 3 frames drain before EOF.
+    let mut agy_mic = TcpStream::connect(("127.0.0.1", h.mic_port)).unwrap();
+    agy_mic.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let (t, p) = client.recv_frame();
+    assert_eq!(t, ty::MIC_START);
+    let mic_id = u32::from_le_bytes(p[0..4].try_into().unwrap());
+
+    let mut enc = crate::voice_codec::VoiceOpusEncoder::new(16_000, 24_000, false).unwrap();
+    for seq in 0..3u32 {
+        let samples: Vec<i16> = (0..320)
+            .map(|i| ((((seq as usize * 320 + i) as f32) * 330.0 * std::f32::consts::TAU / 16000.0).sin() * 14000.0) as i16)
+            .collect();
+        let data = enc.encode(&samples).unwrap();
+        client.send(ClientMsg::MicOpus(proto::VoiceOpusPacket {
+            stream_id: mic_id,
+            seq,
+            ts_samples: seq * 320,
+            flags: proto::voice_flags::FEC | proto::voice_flags::SPEECH,
+            red: Vec::new(),
+            primary: data,
+        }));
+    }
+    // Give engine loop a moment to push all 3 frames into opus_jb, then half-close agy's write end.
+    std::thread::sleep(Duration::from_millis(15));
+    agy_mic.shutdown(Shutdown::Write).unwrap();
+
+    let mut all_pcm = Vec::new();
+    agy_mic.read_to_end(&mut all_pcm).unwrap();
+    assert!(all_pcm.len() >= 640 * 3, "expected all 3 buffered mic frames drained before EOF, got {} B", all_pcm.len());
+
+    client.close();
+    h.stop();
+}
+
 fn decode_b64_16(s: &str) -> [u8; 16] {
     fn val(b: u8) -> u8 {
         match b {
