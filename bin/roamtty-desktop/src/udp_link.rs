@@ -314,7 +314,21 @@ impl UdpLink {
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
                 Err(_) => UdpSocket::bind(("::", p)).ok(),
             })?;
-        Self::from_socket(sock, start_rate)
+        Self::from_socket(sock, start_rate, false)
+    }
+
+    /// Voice-specific UDP bind: identical to `bind` plus DSCP EF (`0xB8`) for real-time voice QoS,
+    /// leaving Remote Desktop's video UDP socket completely untouched.
+    pub fn bind_voice(start_rate: f64) -> Option<Arc<UdpLink>> {
+        let offset = u16::from_le_bytes(crate::session::random_bytes(2).try_into().ok()?) % (PORTS.end - PORTS.start);
+        let sock = (0..PORTS.end - PORTS.start)
+            .map(|i| PORTS.start + (offset + i) % (PORTS.end - PORTS.start))
+            .find_map(|p| match UdpSocket::bind(("0.0.0.0", p)) {
+                Ok(s) => Some(s),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(_) => UdpSocket::bind(("::", p)).ok(),
+            })?;
+        Self::from_socket(sock, start_rate, true)
     }
 
     /// Test helper: binds an ephemeral loopback port outside the 60000..61000 mosh range so
@@ -322,11 +336,13 @@ impl UdpLink {
     #[cfg(test)]
     pub fn bind_ephemeral(start_rate: f64) -> Option<Arc<UdpLink>> {
         let sock = UdpSocket::bind(("127.0.0.1", 0)).ok()?;
-        Self::from_socket(sock, start_rate)
+        Self::from_socket(sock, start_rate, false)
     }
 
-    fn from_socket(sock: UdpSocket, start_rate: f64) -> Option<Arc<UdpLink>> {
-        set_voice_dscp(&sock);
+    fn from_socket(sock: UdpSocket, start_rate: f64, voice_qos: bool) -> Option<Arc<UdpLink>> {
+        if voice_qos {
+            set_voice_dscp(&sock);
+        }
         let key: [u8; 16] = crate::session::random_bytes(16).try_into().ok()?;
         let port = sock.local_addr().ok()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok()?;

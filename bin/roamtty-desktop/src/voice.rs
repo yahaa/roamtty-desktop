@@ -310,7 +310,7 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
         mic_port,
         session,
         Duration::from_secs(idle_secs),
-        Box::new(UdpLink::bind),
+        Box::new(UdpLink::bind_voice),
         ev_tx,
         client_connected,
         shutdown.clone(),
