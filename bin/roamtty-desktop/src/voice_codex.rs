@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code))]
 //! Isolated Codex CLI voice backend for `roamtty-desktop voice --backend codex`.
 //!
 //! Bridges Roamtty's existing `VoiceEngine` (Opus+RED+JitterBuffer over `UdpLink`/SSH)
@@ -10,8 +11,8 @@
 
 use crate::voice::{Event, MicQueue, MicStreamHandle, MIC_SAMPLE_RATE};
 use crate::voice_codec::{
-    frame_samples, i16_to_s16le_bytes, pcm_rms, s16le_bytes_to_i16, VoiceJitterBuffer,
-    VoiceOpusDecoder, VoiceOpusEncoder,
+    frame_samples, i16_to_s16le_bytes, s16le_bytes_to_i16, VoiceJitterBuffer, VoiceOpusDecoder,
+    VoiceOpusEncoder,
 };
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -24,8 +25,18 @@ const SPK_SAMPLE_RATE: u32 = 24_000;
 const WEBRTC_SAMPLE_RATE: u32 = 48_000;
 const WEBRTC_BITRATE: i32 = 32_000;
 const SPK_SILENCE_RMS: f32 = 0.002;
-const SPK_TAIL_FRAMES: u32 = 12; // 240 ms comfort hangover after speech stops
+const SPK_TAIL_FRAMES: u32 = 25; // 500 ms hangover bridges natural inter-clause pauses without PLC clicks
 const SPK_OPUS_SILENCE_MAX_BYTES: usize = 8;
+const SPK_FADE_SAMPLES: usize = 120; // 5 ms @ 24 kHz raised-cosine fade-in / fade-out
+const SPK_HEADROOM_GAIN: f32 = 0.84; // -1.5 dB headroom prevents double-Opus peak clipping
+const SPK_LIMITER_KNEE: f32 = 0.85;
+const SPK_LIMITER_CEIL: f32 = 0.98;
+#[cfg(unix)]
+const SPK_OUT_QUEUE_MAX: usize = 32; // 640 ms local buffer before ev_tx so bursts never drop frames
+const RTP_FRAME_TICKS_48K: u64 = 960; // 20 ms @ 48 kHz
+const RTP_MAX_CONCEAL_TICKS_48K: i64 = 12_000; // 250 ms max gap concealed as loss (larger = talkspurt pause)
+const RTP_MAX_CONCEAL_FRAMES: usize = 5;
+const RTP_LATE_WINDOW_TICKS_48K: i64 = -(48_000 * 5);
 
 /// Configuration parsed from `roamtty-desktop voice --backend codex ...`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,29 +187,163 @@ impl BargeInTracker {
     }
 }
 
-/// Speaker comfort-silence suppressor for continuous WebRTC Opus streams.
+fn f32_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0f64;
+    for &s in samples {
+        let f = s as f64;
+        sum += f * f;
+    }
+    (sum / samples.len() as f64).sqrt() as f32
+}
+
+/// Click-free gate decision for continuous WebRTC speaker audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateDecision {
+    Suppress,
+    FadeIn,
+    Pass,
+    FadeOut,
+}
+
+/// Speaker comfort-silence suppressor for continuous WebRTC Opus streams with 5 ms fade edges.
 #[derive(Debug, Default)]
 pub(crate) struct SpeakerSilenceGate {
+    active: bool,
     tail_remaining: u32,
 }
 
 impl SpeakerSilenceGate {
-    /// Returns true if this decoded 20 ms frame should be forwarded to the phone.
-    pub(crate) fn accept(&mut self, opus_len: usize, pcm: &[i16]) -> bool {
-        let rms = pcm_rms(pcm);
+    /// Classifies this decoded frame as suppressed silence, fade-in attack, normal pass, or fade-out tail.
+    pub(crate) fn accept(&mut self, opus_len: usize, rms: f32) -> GateDecision {
         if opus_len > SPK_OPUS_SILENCE_MAX_BYTES || rms >= SPK_SILENCE_RMS {
+            let was_active = self.active;
+            self.active = true;
             self.tail_remaining = SPK_TAIL_FRAMES;
-            true
-        } else if self.tail_remaining > 0 {
+            if was_active {
+                GateDecision::Pass
+            } else {
+                GateDecision::FadeIn
+            }
+        } else if self.tail_remaining > 1 {
             self.tail_remaining -= 1;
-            true
+            GateDecision::Pass
+        } else if self.tail_remaining == 1 {
+            self.tail_remaining = 0;
+            self.active = false;
+            GateDecision::FadeOut
         } else {
-            false
+            self.active = false;
+            GateDecision::Suppress
         }
     }
 
     pub(crate) fn reset(&mut self) {
+        self.active = false;
         self.tail_remaining = 0;
+    }
+}
+
+/// Downlink floating-point DSP for Codex speaker audio:
+/// 1. 20 Hz DC-blocker (prevents DC-offset thumps on gate/barge-in edges)
+/// 2. -1.5 dB headroom + smooth tanh soft-knee limiter (eliminates double-Opus hard clipping)
+/// 3. 5 ms raised-cosine fade-in / fade-out on silence-gate edges (eliminates step clicks)
+#[derive(Debug, Default)]
+pub(crate) struct SpeakerDsp {
+    dc_prev_x: f32,
+    dc_prev_y: f32,
+}
+
+impl SpeakerDsp {
+    pub(crate) fn process_to_i16(&mut self, input: &[f32], decision: GateDecision, out: &mut Vec<i16>) {
+        out.clear();
+        out.reserve(input.len());
+        let n = input.len();
+        let fade_len = SPK_FADE_SAMPLES.min(n);
+        let knee = SPK_LIMITER_KNEE;
+        let span = SPK_LIMITER_CEIL - SPK_LIMITER_KNEE;
+        let mut prev_x = self.dc_prev_x;
+        let mut prev_y = self.dc_prev_y;
+
+        for (i, &raw) in input.iter().enumerate() {
+            let x = if raw.is_finite() { raw } else { 0.0 };
+            let dc = x - prev_x + 0.995 * prev_y;
+            prev_x = x;
+            prev_y = dc;
+
+            let scaled = dc * SPK_HEADROOM_GAIN;
+            let abs = scaled.abs();
+            let mut limited = if abs > knee {
+                let sign = if scaled >= 0.0 { 1.0 } else { -1.0 };
+                sign * (knee + span * ((abs - knee) / span).tanh())
+            } else {
+                scaled
+            };
+
+            match decision {
+                GateDecision::FadeIn if fade_len > 0 && i < fade_len => {
+                    let w = 0.5 * (1.0 - (std::f32::consts::PI * i as f32 / fade_len as f32).cos());
+                    limited *= w;
+                }
+                GateDecision::FadeOut if fade_len > 0 && i >= n - fade_len => {
+                    let k = i - (n - fade_len);
+                    let w = 0.5 * (1.0 + (std::f32::consts::PI * (k + 1) as f32 / fade_len as f32).cos());
+                    limited *= w;
+                }
+                _ => {}
+            }
+
+            let sample = (limited * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+            out.push(sample);
+        }
+
+        self.dc_prev_x = prev_x;
+        self.dc_prev_y = prev_y;
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.dc_prev_x = 0.0;
+        self.dc_prev_y = 0.0;
+    }
+}
+
+/// WebRTC RTP timestamp continuity tracker for incoming Codex audio frames (48 kHz clock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RtpGapAction {
+    Normal,
+    DropLate,
+    Conceal { plc_frames: usize, use_fec: bool },
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RtpGapTracker {
+    expected_time_48k: Option<u64>,
+}
+
+impl RtpGapTracker {
+    pub(crate) fn on_packet(&self, rtp_time_48k: u64, start_of_talk_spurt: bool) -> RtpGapAction {
+        let Some(expected) = self.expected_time_48k else {
+            return RtpGapAction::Normal;
+        };
+        let delta = rtp_time_48k.wrapping_sub(expected) as i64;
+        if delta < 0 && delta > RTP_LATE_WINDOW_TICKS_48K {
+            return RtpGapAction::DropLate;
+        }
+        if start_of_talk_spurt || delta < (RTP_FRAME_TICKS_48K as i64 / 2) || delta > RTP_MAX_CONCEAL_TICKS_48K {
+            return RtpGapAction::Normal;
+        }
+        let missing = ((delta as u64 + RTP_FRAME_TICKS_48K / 2) / RTP_FRAME_TICKS_48K)
+            .clamp(1, RTP_MAX_CONCEAL_FRAMES as u64) as usize;
+        RtpGapAction::Conceal {
+            plc_frames: missing - 1,
+            use_fec: true,
+        }
+    }
+
+    pub(crate) fn advance(&mut self, rtp_time_48k: u64, decoded_samples_24k: usize) {
+        self.expected_time_48k = Some(rtp_time_48k.wrapping_add((decoded_samples_24k as u64) * 2));
     }
 }
 
@@ -684,7 +829,7 @@ mod unix_impl {
         let mut rtc = RtcConfig::new()
             .set_crypto_provider(provider.into())
             .clear_codecs()
-            .enable_opus(true, false)
+            .enable_opus(true, true)
             .build(Instant::now());
         let host_cand = Candidate::host(local_addr, Protocol::Udp)
             .map_err(|e| format!("invalid local host candidate: {e}"))?;
@@ -850,18 +995,45 @@ mod unix_impl {
         let silence_48k = vec![0i16; frame_samples(WEBRTC_SAMPLE_RATE)];
         let mic_frame_16k = frame_samples(MIC_SAMPLE_RATE);
 
-        let mut spk_decoded: Vec<i16> = Vec::with_capacity(frame_samples(SPK_SAMPLE_RATE));
+        let mut spk_float: Vec<f32> = Vec::with_capacity(frame_samples(SPK_SAMPLE_RATE) * 6);
+        let mut spk_decoded: Vec<i16> = Vec::with_capacity(frame_samples(SPK_SAMPLE_RATE) * 6);
         let mut silence_gate = SpeakerSilenceGate::default();
+        let mut spk_dsp = SpeakerDsp::default();
+        let mut rtp_gap = RtpGapTracker::default();
+        let mut spk_out_queue: VecDeque<Vec<u8>> = VecDeque::with_capacity(SPK_OUT_QUEUE_MAX);
         let mut barge_tracker = BargeInTracker::default();
 
         let mut rtp_ts: u64 = 0;
         let mut next_tx_at = Instant::now();
         let mut udp_buf = vec![0u8; 4096];
 
+        let flush_spk_queue = |queue: &mut VecDeque<Vec<u8>>, local_stop: &AtomicBool| {
+            while let Some(pcm) = queue.pop_front() {
+                match ev_tx.try_send(Event::AgySpkAudio {
+                    stream_id: spk_stream_id,
+                    pcm,
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(Event::AgySpkAudio { pcm, .. })) => {
+                        queue.push_front(pcm);
+                        break;
+                    }
+                    Err(mpsc::TrySendError::Full(_)) => break,
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        local_stop.store(true, Ordering::SeqCst);
+                        queue.clear();
+                        break;
+                    }
+                }
+            }
+        };
+
         while !shutdown.load(Ordering::Relaxed)
             && !local_stop.load(Ordering::Relaxed)
             && !spk_stop_flag.load(Ordering::Relaxed)
         {
+            flush_spk_queue(&mut spk_out_queue, &local_stop);
+
             // Drain SPK_ACK non-blocking so channel stays clean.
             while let Ok((ok, err)) = spk_ack_rx.try_recv() {
                 if !ok {
@@ -891,7 +1063,9 @@ mod unix_impl {
                                     && barge_tracker.on_app_server_notification(meth, params)
                                         == BargeInAction::ClearSpeaker
                                 {
+                                    spk_out_queue.clear();
                                     silence_gate.reset();
+                                    spk_dsp.reset();
                                     let _ = ev_tx.send(Event::AgySpkClear {
                                         stream_id: spk_stream_id,
                                     });
@@ -1044,7 +1218,9 @@ mod unix_impl {
                                 if streams_opened
                                     && barge_tracker.on_oai_event(&v) == BargeInAction::ClearSpeaker
                                 {
+                                    spk_out_queue.clear();
                                     silence_gate.reset();
+                                    spk_dsp.reset();
                                     let _ = ev_tx.send(Event::AgySpkClear {
                                         stream_id: spk_stream_id,
                                     });
@@ -1055,16 +1231,51 @@ mod unix_impl {
                             if !streams_opened {
                                 continue;
                             }
-                            if let Ok(n) = spk_dec.decode(&md.data, &mut spk_decoded, false) {
-                                if n > 0 && silence_gate.accept(md.data.len(), &spk_decoded) {
-                                    if md.data.len() > SPK_OPUS_SILENCE_MAX_BYTES {
-                                        barge_tracker.on_speaker_speech();
+                            let mut emit_frame = |opus_len: usize, samples: &[f32]| {
+                                if samples.is_empty() {
+                                    return;
+                                }
+                                let decision = silence_gate.accept(opus_len, f32_rms(samples));
+                                if decision == GateDecision::Suppress {
+                                    return;
+                                }
+                                if opus_len > SPK_OPUS_SILENCE_MAX_BYTES {
+                                    barge_tracker.on_speaker_speech();
+                                }
+                                spk_dsp.process_to_i16(samples, decision, &mut spk_decoded);
+                                let pcm = i16_to_s16le_bytes(&spk_decoded);
+                                while spk_out_queue.len() >= SPK_OUT_QUEUE_MAX {
+                                    spk_out_queue.pop_front();
+                                }
+                                spk_out_queue.push_back(pcm);
+                                flush_spk_queue(&mut spk_out_queue, &local_stop);
+                            };
+
+                            match rtp_gap.on_packet(md.time.numer(), md.audio_start_of_talk_spurt) {
+                                RtpGapAction::DropLate => continue,
+                                RtpGapAction::Conceal { plc_frames, use_fec } => {
+                                    for _ in 0..plc_frames {
+                                        if let Ok(n) = spk_dec.decode_plc_float(&mut spk_float) {
+                                            if n > 0 {
+                                                emit_frame(0, &spk_float);
+                                            }
+                                        }
                                     }
-                                    let pcm = i16_to_s16le_bytes(&spk_decoded);
-                                    let _ = ev_tx.try_send(Event::AgySpkAudio {
-                                        stream_id: spk_stream_id,
-                                        pcm,
-                                    });
+                                    if use_fec {
+                                        if let Ok(n) = spk_dec.decode_float(&md.data, &mut spk_float, true) {
+                                            if n > 0 {
+                                                emit_frame(0, &spk_float);
+                                            }
+                                        }
+                                    }
+                                }
+                                RtpGapAction::Normal => {}
+                            }
+
+                            if let Ok(n) = spk_dec.decode_float(&md.data, &mut spk_float, false) {
+                                if n > 0 {
+                                    rtp_gap.advance(md.time.numer(), n);
+                                    emit_frame(md.data.len(), &spk_float);
                                 }
                             }
                         }
@@ -1209,23 +1420,99 @@ mod tests {
     #[test]
     fn speaker_silence_gate_forwards_speech_and_tail_then_suppresses_idle() {
         let mut gate = SpeakerSilenceGate::default();
-        let silence = vec![0i16; 480];
-        let speech = vec![4000i16; 480];
 
         // Pure initial silence is suppressed.
-        assert!(!gate.accept(3, &silence));
-        // Real speech opens the gate.
-        assert!(gate.accept(140, &speech));
-        // Next SPK_TAIL_FRAMES silent frames pass through as hangover tail.
-        for _ in 0..SPK_TAIL_FRAMES {
-            assert!(gate.accept(3, &silence));
+        assert_eq!(gate.accept(3, 0.0), GateDecision::Suppress);
+        // Real speech opens the gate with a click-free fade-in.
+        assert_eq!(gate.accept(140, 0.12), GateDecision::FadeIn);
+        // Subsequent speech passes cleanly without re-fading.
+        assert_eq!(gate.accept(140, 0.12), GateDecision::Pass);
+        // Next SPK_TAIL_FRAMES - 1 silent frames pass; final tail frame fades out to 0.
+        for _ in 0..(SPK_TAIL_FRAMES - 1) {
+            assert_eq!(gate.accept(3, 0.0), GateDecision::Pass);
         }
+        assert_eq!(gate.accept(3, 0.0), GateDecision::FadeOut);
         // After hangover expires, idle silence is suppressed again.
-        assert!(!gate.accept(3, &silence));
+        assert_eq!(gate.accept(3, 0.0), GateDecision::Suppress);
+        // Next utterance fades in again.
+        assert_eq!(gate.accept(140, 0.12), GateDecision::FadeIn);
         // Barge-in reset immediately closes tail.
-        assert!(gate.accept(140, &speech));
         gate.reset();
-        assert!(!gate.accept(3, &silence));
+        assert_eq!(gate.accept(3, 0.0), GateDecision::Suppress);
+    }
+
+    #[test]
+    fn speaker_dsp_soft_limits_overshoots_and_applies_smooth_edge_fades() {
+        let mut dsp = SpeakerDsp::default();
+        let mut out = Vec::new();
+        // Hot +3 dB (1.4x full-scale) signal must NEVER hard-clip to ±32767 and stays below 0.98 ceiling.
+        let hot: Vec<f32> = (0..480)
+            .map(|i| 1.4 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SPK_SAMPLE_RATE as f32).sin())
+            .collect();
+        dsp.process_to_i16(&hot, GateDecision::Pass, &mut out);
+        assert_eq!(out.len(), 480);
+        let peak = out.iter().map(|&s| (s as i32).abs()).max().unwrap();
+        assert!(peak > 26_000 && peak <= 32_200, "unexpected soft-limited peak {peak}");
+
+        // FadeIn starts at exact 0; FadeOut ends at exact 0.
+        dsp.reset();
+        let tone: Vec<f32> = vec![0.5; 480];
+        dsp.process_to_i16(&tone, GateDecision::FadeIn, &mut out);
+        assert_eq!(out[0], 0);
+        assert!(out[SPK_FADE_SAMPLES] > 5_000);
+
+        dsp.process_to_i16(&tone, GateDecision::FadeOut, &mut out);
+        assert_eq!(*out.last().unwrap(), 0);
+    }
+
+    #[test]
+    fn rtp_gap_tracker_detects_loss_drops_late_and_ignores_talkspurt_pause() {
+        let mut tracker = RtpGapTracker::default();
+        assert_eq!(tracker.on_packet(10_000, false), RtpGapAction::Normal);
+        tracker.advance(10_000, 480); // expected = 10_960
+
+        // Contiguous next 20 ms frame -> Normal.
+        assert_eq!(tracker.on_packet(10_960, false), RtpGapAction::Normal);
+        tracker.advance(10_960, 480); // expected = 11_920
+
+        // Late / duplicate packet from earlier -> DropLate.
+        assert_eq!(tracker.on_packet(10_960, false), RtpGapAction::DropLate);
+
+        // 1 missing 20 ms frame (jump +1920 instead of +960) -> 0 PLC + in-band FEC.
+        assert_eq!(
+            tracker.on_packet(11_920 + 960, false),
+            RtpGapAction::Conceal {
+                plc_frames: 0,
+                use_fec: true,
+            }
+        );
+
+        // 3 missing 20 ms frames -> 2 PLC + 1 FEC.
+        assert_eq!(
+            tracker.on_packet(11_920 + 960 * 3, false),
+            RtpGapAction::Conceal {
+                plc_frames: 2,
+                use_fec: true,
+            }
+        );
+
+        // Large >250 ms pause or talkspurt marker -> Normal (do not synthesize PLC across silence).
+        assert_eq!(tracker.on_packet(11_920 + 48_000, false), RtpGapAction::Normal);
+        assert_eq!(tracker.on_packet(11_920 + 960 * 2, true), RtpGapAction::Normal);
+    }
+
+    #[test]
+    fn opus_decode_float_handles_normal_fec_plc_and_oversized_frames() {
+        let mut enc = VoiceOpusEncoder::new(SPK_SAMPLE_RATE, 36_000, false).unwrap();
+        let mut dec = VoiceOpusDecoder::new(SPK_SAMPLE_RATE).unwrap();
+        let frame: Vec<i16> = (0..480)
+            .map(|i| (12_000.0 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / SPK_SAMPLE_RATE as f32).sin()) as i16)
+            .collect();
+        let pkt = enc.encode(&frame).unwrap();
+        let mut fbuf = Vec::new();
+        assert_eq!(dec.decode_float(&pkt, &mut fbuf, false).unwrap(), 480);
+        assert_eq!(dec.decode_plc_float(&mut fbuf).unwrap(), 480);
+        assert_eq!(dec.decode_float(&pkt, &mut fbuf, true).unwrap(), 480);
     }
 
     #[cfg(unix)]

@@ -148,6 +148,7 @@ impl Drop for VoiceOpusEncoder {
 pub struct VoiceOpusDecoder {
     ptr: *mut audiopus_sys::OpusDecoder,
     frame_len: usize,
+    max_frame_len: usize,
 }
 
 unsafe impl Send for VoiceOpusDecoder {}
@@ -166,6 +167,7 @@ impl VoiceOpusDecoder {
         Ok(Self {
             ptr,
             frame_len: frame_samples(sample_rate),
+            max_frame_len: (sample_rate as usize * 120) / 1000,
         })
     }
 
@@ -192,6 +194,29 @@ impl VoiceOpusDecoder {
         Ok(n as usize)
     }
 
+    /// Decodes an Opus packet (any RFC 6716 duration up to 120 ms) into floating-point samples,
+    /// preserving headroom above ±1.0 so downstream soft-limiting avoids hard int16 clipping.
+    #[allow(dead_code)]
+    pub fn decode_float(&mut self, packet: &[u8], out: &mut Vec<f32>, decode_fec: bool) -> Result<usize, String> {
+        let cap = if decode_fec { self.frame_len } else { self.max_frame_len };
+        out.resize(cap, 0.0);
+        let n = unsafe {
+            audiopus_sys::opus_decode_float(
+                self.ptr,
+                packet.as_ptr(),
+                packet.len() as i32,
+                out.as_mut_ptr(),
+                cap as i32,
+                if decode_fec { 1 } else { 0 },
+            )
+        };
+        if n < 0 {
+            return Err(format!("opus_decode_float failed: {n}"));
+        }
+        out.truncate(n as usize);
+        Ok(n as usize)
+    }
+
     pub fn decode_plc(&mut self, out: &mut Vec<i16>) -> Result<usize, String> {
         out.resize(self.frame_len, 0);
         let n = unsafe {
@@ -206,6 +231,27 @@ impl VoiceOpusDecoder {
         };
         if n < 0 {
             return Err(format!("opus_decode PLC failed: {n}"));
+        }
+        out.truncate(n as usize);
+        Ok(n as usize)
+    }
+
+    /// Generates one 20 ms native Opus PLC frame in floating-point format.
+    #[allow(dead_code)]
+    pub fn decode_plc_float(&mut self, out: &mut Vec<f32>) -> Result<usize, String> {
+        out.resize(self.frame_len, 0.0);
+        let n = unsafe {
+            audiopus_sys::opus_decode_float(
+                self.ptr,
+                std::ptr::null(),
+                0,
+                out.as_mut_ptr(),
+                self.frame_len as i32,
+                0,
+            )
+        };
+        if n < 0 {
+            return Err(format!("opus_decode_float PLC failed: {n}"));
         }
         out.truncate(n as usize);
         Ok(n as usize)
