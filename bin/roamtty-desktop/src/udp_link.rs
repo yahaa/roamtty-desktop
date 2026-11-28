@@ -842,7 +842,7 @@ mod tests {
         // Send three reliable frames: acknowledge the first one via RACK, let the other two expire.
         let p0 = proto::spk_start_payload(1, 24_000, 1);
         let p1 = proto::spk_start_payload(2, 24_000, 1);
-        let p2 = proto::spk_clear_payload(2);
+        let p2 = proto::spk_clear_payload(2, 1);
         link.send_frame(proto::ty::SPK_START, &p0);
         // Acknowledge msg=1 so it is removed from `reliable`.
         let rack = crypto.seal(DIR_C2S, 2, &Packet::Rack(vec![1]).encode());
@@ -924,7 +924,7 @@ mod tests {
         for _ in 0..60 {
             link.send_frame(proto::ty::SPK_AUDIO, &chunk);
         }
-        link.send_frame(proto::ty::SPK_CLEAR, &proto::spk_clear_payload(1));
+        link.send_frame(proto::ty::SPK_CLEAR, &proto::spk_clear_payload(1, 1));
 
         let mut reasm = Reassembler::default();
         let mut saw_clear = false;

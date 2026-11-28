@@ -487,6 +487,50 @@ fn cli_voice_explicit_shutdown_rapid_reconnect_without_polling() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Answer the real ICE/DTLS handshake, then echo received Opus over SRTP.
+#[cfg(unix)]
+fn echo_codex_media(
+    mut rtc: str0m::Rtc,
+    socket: std::net::UdpSocket,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use str0m::{Event, Input, Output};
+    use str0m::net::{Protocol, Receive};
+
+    let local = socket.local_addr().unwrap();
+    let mut buf = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !stop.load(std::sync::atomic::Ordering::Acquire) {
+        let next = loop {
+            match rtc.poll_output().unwrap() {
+                Output::Transmit(t) => {
+                    socket.send_to(&t.contents, t.destination).unwrap();
+                }
+                Output::Event(Event::MediaData(media)) => {
+                    let writer = rtc.writer(media.mid).unwrap();
+                    writer.write(media.pt, Instant::now(), media.time, media.data.to_vec()).unwrap();
+                }
+                Output::Event(_) => {}
+                Output::Timeout(at) => break at,
+            }
+        };
+        let wait = next.saturating_duration_since(Instant::now()).min(Duration::from_millis(20));
+        if !wait.is_zero() {
+            socket.set_read_timeout(Some(wait)).unwrap();
+            match socket.recv_from(&mut buf) {
+                Ok((n, src)) => {
+                    let recv = Receive::new(Protocol::Udp, src, local, &buf[..n]).unwrap();
+                    rtc.handle_input(Input::Receive(Instant::now(), recv)).unwrap();
+                    continue;
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => panic!("Codex audio peer: {e}"),
+            }
+        }
+        rtc.handle_input(Input::Timeout(Instant::now())).unwrap();
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
@@ -511,6 +555,16 @@ fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
     assert_eq!(bad.status.code(), Some(1));
     let err: StartError = serde_json::from_slice(&bad.stdout).unwrap();
     assert_eq!(err.error, "internal");
+
+    let expired = Command::new(exe)
+        .args(["voice", "--backend", "codex", "--resume", "aaaaaaaaaaaaaaaa", "--token", "expired",
+               "--codex-cwd", "/other", "--codex-sock", root.join("no-daemon.sock").to_str().unwrap()])
+        .env("ROAMTTY_DESKTOP_ROOT", &root)
+        .output()
+        .unwrap();
+    let error: StartError = serde_json::from_slice(&expired.stdout).unwrap();
+    assert_eq!(error.error, "codex_voice_failed");
+    assert!(error.detail.unwrap().contains("--codex-thread"));
 
     // 2. Start an `agy` daemon first on an ephemeral port and keep it alive (simulates active agy call).
     let mut agy_proc = Command::new(exe)
@@ -601,15 +655,19 @@ fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
             let _ = conn.write_all(&frame);
         }
 
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut ans_rtc = str0m::RtcConfig::new()
             .set_crypto_provider(str0m_rust_crypto::default_provider().into())
             .clear_codecs()
             .enable_opus(true, false)
             .build(Instant::now());
         ans_rtc.add_local_candidate(
-            str0m::Candidate::host("127.0.0.1:49998".parse().unwrap(), str0m::net::Protocol::Udp)
+            str0m::Candidate::host(socket.local_addr().unwrap(), str0m::net::Protocol::Udp)
                 .unwrap(),
         );
+
+        let mut media_peer = Some((ans_rtc, socket));
+        let mut media_worker = None;
 
         while let Some(msg) = read_ws(&mut conn) {
             let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
@@ -623,7 +681,10 @@ fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
                 "thread/realtime/start" => {
                     let offer_str = msg["params"]["transport"]["sdp"].as_str().unwrap();
                     let offer = str0m::change::SdpOffer::from_sdp_string(offer_str).unwrap();
-                    let answer = ans_rtc.sdp_api().accept_offer(offer).unwrap();
+                    let (mut rtc, socket) = media_peer.take().unwrap();
+                    let answer = rtc.sdp_api().accept_offer(offer).unwrap();
+                    let stop = stop_seen_srv.clone();
+                    media_worker = Some(std::thread::spawn(move || echo_codex_media(rtc, socket, stop)));
                     write_ws(&mut conn, &json!({"id": id, "result": {}}));
                     write_ws(
                         &mut conn,
@@ -640,6 +701,9 @@ fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
                 }
                 _ => {}
             }
+        }
+        if let Some(worker) = media_worker {
+            worker.join().unwrap();
         }
     });
 
@@ -668,6 +732,47 @@ fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
     assert_eq!(codex_hello.codecs, vec!["opus", "pcm16"]);
     assert!(codex_hello.udp.is_some());
 
+    let (frame_tx, frames) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        while let Ok(Some(frame)) = proto::read_frame(&mut codex_out) {
+            if frame_tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    let mut heard = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !heard && Instant::now() < deadline {
+        let (ty, payload) = frames
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("ICE and speaker media");
+        match ty {
+            proto::ty::MIC_START => {
+                let stream_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                let pcm = (0..320)
+                    .map(|i| if i % 32 < 16 { 7000_i16 } else { -7000_i16 })
+                    .flat_map(i16::to_le_bytes)
+                    .collect();
+                let (t, p) = proto::encode_client(&ClientMsg::MicAudio { stream_id, pcm });
+                for _ in 0..10 {
+                    proto::write_frame(&mut codex_stdin, t, &p).unwrap();
+                }
+                codex_stdin.flush().unwrap();
+            }
+            proto::ty::SPK_START => {
+                let stream_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                let (t, p) = proto::encode_client(&ClientMsg::SpkAck { stream_id, ok: true, error: String::new() });
+                proto::write_frame(&mut codex_stdin, t, &p).unwrap();
+                codex_stdin.flush().unwrap();
+            }
+            proto::ty::SPK_AUDIO => {
+                heard = payload[4..].chunks_exact(2).any(|p| i16::from_le_bytes([p[0], p[1]]).unsigned_abs() > 500);
+            }
+            _ => {}
+        }
+    }
+    assert!(heard, "Codex must return the test audio through the WebRTC peer");
+
     // 5. Verify the concurrent `agy` daemon's loopback port is STILL bound and untouched!
     assert!(
         TcpListener::bind(("127.0.0.1", agy_hello.mic_port)).is_err(),
@@ -682,8 +787,8 @@ fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
     proto::write_frame(&mut codex_stdin, t, &p).unwrap();
     codex_stdin.flush().unwrap();
     drop(codex_stdin);
-    drop(codex_out);
     assert!(codex_proc.wait().unwrap().success());
+    reader.join().unwrap();
     server.join().unwrap();
     assert!(stop_seen.load(Ordering::SeqCst), "codex shutdown must invoke thread/realtime/stop");
 

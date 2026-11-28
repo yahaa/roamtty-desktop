@@ -309,7 +309,7 @@ fn speaker_handshake_ok_audio_barge_in_clear_and_eof() {
     send_jetski_frame(&mut agy, b'C', &[]);
     let (t, p) = client.recv_frame();
     assert_eq!(t, ty::SPK_CLEAR);
-    assert_eq!(p, stream_id.to_le_bytes());
+    assert_eq!(p, proto::spk_clear_payload(stream_id, 1));
 
     // Send second 'A' chunk after clear -> client receives SPK_AUDIO.
     let pcm2 = vec![0xAAu8; 320];
@@ -738,7 +738,7 @@ fn udp_transport_roundtrip_and_ssh_fallback() {
     send_jetski_frame(&mut agy_spk, b'C', &[]);
     let (t, p) = client.recv_frame();
     assert_eq!(t, ty::SPK_CLEAR);
-    assert_eq!(p, spk_id.to_le_bytes());
+    assert_eq!(p, proto::spk_clear_payload(spk_id, 1));
 
     drop(agy_spk);
     client.close();
@@ -1337,7 +1337,9 @@ fn opus_negotiation_streams_red_packets_barge_in_gen_and_uplink_jitter_playout()
 
     // Barge-in 'C' increments turn_gen and resets RED history
     agy_spk.write_all(&[b'C', 0, 0, 0, 0]).unwrap();
-    assert_eq!(client.recv_frame().0, ty::SPK_CLEAR);
+    let (ty, clear) = client.recv_frame();
+    assert_eq!(ty, ty::SPK_CLEAR);
+    assert_eq!(&clear[4..], &1u32.to_le_bytes());
     let mut one_hdr = [0u8; 5];
     one_hdr[0] = b'A';
     one_hdr[1..5].copy_from_slice(&960u32.to_le_bytes());

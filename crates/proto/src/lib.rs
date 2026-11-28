@@ -443,8 +443,10 @@ pub fn spk_audio_payload(stream_id: u32, pcm: &[u8]) -> Vec<u8> {
     p
 }
 
-pub fn spk_clear_payload(stream_id: u32) -> Vec<u8> {
-    stream_id.to_le_bytes().to_vec()
+/// Protocol 1 readers consume the stream ID prefix. The optional turn identifies a clear
+/// across reliable UDP retries and the SSH fallback, even when media arrives first.
+pub fn spk_clear_payload(stream_id: u32, turn: u32) -> Vec<u8> {
+    [stream_id.to_le_bytes(), turn.to_le_bytes()].concat()
 }
 
 pub fn spk_stop_payload(stream_id: u32) -> Vec<u8> {
@@ -652,7 +654,7 @@ mod tests {
         assert_eq!(mic_stop_payload(1), vec![1, 0, 0, 0]);
         assert_eq!(spk_start_payload(2, 24000, 1), vec![2, 0, 0, 0, 0xC0, 0x5D, 0, 0, 1]);
         assert_eq!(spk_audio_payload(2, &[0x11, 0x22]), vec![2, 0, 0, 0, 0x11, 0x22]);
-        assert_eq!(spk_clear_payload(2), vec![2, 0, 0, 0]);
+        assert_eq!(spk_clear_payload(2, 257), vec![2, 0, 0, 0, 1, 1, 0, 0]);
         assert_eq!(spk_stop_payload(2), vec![2, 0, 0, 0]);
 
         // VoiceHello JSON roundtrip
