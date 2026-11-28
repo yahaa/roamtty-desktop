@@ -187,6 +187,13 @@ pub fn cmd(args: &[String]) -> i32 {
         }
     }
 
+    // An expired Codex daemon no longer proves which thread the caller was using.
+    if (resume.is_some() || token.is_some())
+        && matches!(&backend, VoiceBackend::Codex(config) if config.thread_id.is_none())
+    {
+        return print_start_error("codex_voice_failed", Some("Codex voice session expired; reconnect with the original --codex-thread".into()), None, None);
+    }
+
     // 2. Otherwise (fresh start, expired daemon, or unauthorized resume token):
     //    only the `agy` backend owns a loopback TCP port, so only `agy` evicts idle daemons on `port`.
     if matches!(backend, VoiceBackend::Agy) && port != 0 {
@@ -987,7 +994,6 @@ struct SpkOpusState {
     next_tx_at: Option<Instant>,
     burst_budget: u8,
     seq: u32,
-    turn_gen: u8,
     pending_reset: bool,
 }
 
@@ -1003,7 +1009,6 @@ impl SpkOpusState {
             next_tx_at: None,
             burst_budget: 2,
             seq: 0,
-            turn_gen: 0,
             pending_reset: true,
         })
     }
@@ -1016,7 +1021,6 @@ impl SpkOpusState {
         self.burst_budget = 2;
         self.red.clear();
         self.encoder.reset();
-        self.turn_gen = self.turn_gen.wrapping_add(1) & 0x0F;
         self.pending_reset = true;
     }
 
@@ -1033,7 +1037,7 @@ impl SpkOpusState {
         self.tx_queue.push_back(pkt);
     }
 
-    fn encode_frame(&mut self, stream_id: u32, pcm: &[i16], red_count: usize) -> Option<VoiceOpusPacket> {
+    fn encode_frame(&mut self, stream_id: u32, turn: u32, pcm: &[i16], red_count: usize) -> Option<VoiceOpusPacket> {
         let encoded = match self.encoder.encode(pcm) {
             Ok(b) => b,
             Err(e) => {
@@ -1052,7 +1056,7 @@ impl SpkOpusState {
             raw_flags |= voice_flags::RESET;
             self.pending_reset = false;
         }
-        let flags = voice_flags::with_gen(raw_flags, self.turn_gen);
+        let flags = voice_flags::with_gen(raw_flags, turn as u8);
         let ts_samples = seq.wrapping_mul(self.encoder.frame_len() as u32);
         self.red.record(seq, encoded.clone());
         self.seq = seq.wrapping_add(1);
@@ -1068,6 +1072,7 @@ impl SpkOpusState {
 }
 
 struct SpkStreamState {
+    turn: u32,
     sample_rate: u32,
     ack_tx: Option<mpsc::Sender<(bool, String)>>,
     stop_flag: Arc<AtomicBool>,
@@ -1638,6 +1643,7 @@ impl VoiceEngine {
                     None
                 };
                 let mut state = SpkStreamState {
+                    turn: 0,
                     sample_rate,
                     ack_tx: Some(ack_tx),
                     stop_flag,
@@ -1665,7 +1671,7 @@ impl VoiceEngine {
                                 let now = Instant::now();
                                 while op.pcm_pending.len() >= flen {
                                     let frame: Vec<i16> = op.pcm_pending.drain(..flen).collect();
-                                    if let Some(pkt) = op.encode_frame(stream_id, &frame, profile.red_count) {
+                                    if let Some(pkt) = op.encode_frame(stream_id, state.turn, &frame, profile.red_count) {
                                         op.enqueue_tx(pkt, now);
                                     }
                                 }
@@ -1680,12 +1686,13 @@ impl VoiceEngine {
             }
             Event::AgySpkClear { stream_id } => {
                 if let Some(state) = self.spk_streams.get_mut(&stream_id) {
+                    state.turn = state.turn.wrapping_add(1);
                     if let Some(op) = state.opus.as_mut() {
                         op.clear();
                     }
                     if let Some(c) = self.client.as_mut() {
                         c.ssh.clear_droppable_audio();
-                        let _ = c.emit(ty::SPK_CLEAR, &proto::spk_clear_payload(stream_id));
+                        let _ = c.emit(ty::SPK_CLEAR, &proto::spk_clear_payload(stream_id, state.turn));
                     }
                 }
             }
@@ -1703,7 +1710,7 @@ impl VoiceEngine {
                                             op.last_pcm_at = None;
                                             let profile = state.link_ctrl.profile();
                                             op.encoder.apply_params(profile.bitrate, profile.opus_loss_perc);
-                                            if let Some(pkt) = op.encode_frame(stream_id, &frame, profile.red_count) {
+                                            if let Some(pkt) = op.encode_frame(stream_id, state.turn, &frame, profile.red_count) {
                                                 op.enqueue_tx(pkt, Instant::now());
                                             }
                                         }
@@ -1857,7 +1864,7 @@ impl VoiceEngine {
                 op.last_pcm_at = None;
                 let profile = state.link_ctrl.profile();
                 op.encoder.apply_params(profile.bitrate, profile.opus_loss_perc);
-                if let Some(pkt) = op.encode_frame(stream_id, &frame, profile.red_count) {
+                if let Some(pkt) = op.encode_frame(stream_id, state.turn, &frame, profile.red_count) {
                     op.enqueue_tx(pkt, now);
                 }
             }

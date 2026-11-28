@@ -512,6 +512,16 @@ fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
     let err: StartError = serde_json::from_slice(&bad.stdout).unwrap();
     assert_eq!(err.error, "internal");
 
+    let expired = Command::new(exe)
+        .args(["voice", "--backend", "codex", "--resume", "aaaaaaaaaaaaaaaa", "--token", "expired",
+               "--codex-cwd", "/other", "--codex-sock", root.join("no-daemon.sock").to_str().unwrap()])
+        .env("ROAMTTY_DESKTOP_ROOT", &root)
+        .output()
+        .unwrap();
+    let error: StartError = serde_json::from_slice(&expired.stdout).unwrap();
+    assert_eq!(error.error, "codex_voice_failed");
+    assert!(error.detail.unwrap().contains("--codex-thread"));
+
     // 2. Start an `agy` daemon first on an ephemeral port and keep it alive (simulates active agy call).
     let mut agy_proc = Command::new(exe)
         .args(["voice", "--proto", "1", "--port", "0", "--idle-timeout", "30"])

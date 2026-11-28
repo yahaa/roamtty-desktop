@@ -716,73 +716,102 @@ mod unix_impl {
             .unwrap_or_else(|| p.trim_end_matches('/').to_string())
     }
 
+    #[cfg(test)]
+    mod thread_selection_tests {
+        use super::*;
+
+        #[test]
+        fn directory_selection_requires_one_proven_match() {
+            let ids = vec!["a".to_string(), "b".to_string()];
+            let pick = |dirs: &[Option<&str>]| {
+                let mut dirs = dirs.iter();
+                select_loaded_thread(&ids[..dirs.len()], Some("/project"), |_| {
+                    dirs.next().unwrap().map(str::to_owned).ok_or_else(|| "missing cwd".into())
+                })
+            };
+            assert!(pick(&[Some("/other")]).is_err());
+            assert!(pick(&[Some("/project"), Some("/project/")]).is_err());
+            assert!(pick(&[Some("/project"), None]).is_err());
+            assert_eq!(pick(&[Some("/other"), Some("/project")]).unwrap(), "b");
+            assert_eq!(select_loaded_thread(&ids[..1], None, |_| unreachable!()).unwrap(), "a");
+            assert!(select_loaded_thread(&ids, None, |_| unreachable!()).is_err());
+        }
+    }
+
+    fn select_loaded_thread(
+        loaded: &[String],
+        cwd_hint: Option<&str>,
+        mut read_cwd: impl FnMut(&str) -> Result<String, String>,
+    ) -> Result<String, String> {
+        if loaded.is_empty() {
+            return Err("no active Codex session found; send a prompt or run /status in Codex first".into());
+        }
+        let Some(hint) = cwd_hint.filter(|s| !s.is_empty()) else {
+            return match loaded {
+                [only] => Ok(only.clone()),
+                _ => Err("multiple active Codex sessions; pass --codex-thread".into()),
+            };
+        };
+        let want = canonical_path_str(hint);
+        let mut matching = None;
+        for tid in loaded {
+            let cwd = read_cwd(tid)?;
+            if canonical_path_str(&cwd) == want {
+                if matching.is_some() {
+                    return Err("multiple active Codex sessions in this directory; pass --codex-thread".into());
+                }
+                matching = Some(tid.clone());
+            }
+        }
+        matching.ok_or_else(|| "no active Codex session in this directory; pass --codex-thread".into())
+    }
+
     fn resolve_thread_id(
         ws: &mut UnixWsClient,
         rpc_id: &mut u64,
         requested: Option<&str>,
         cwd_hint: Option<&str>,
     ) -> Result<String, String> {
-        let list_id = send_rpc(ws, rpc_id, "thread/loaded/list", json!({}))?;
-        let (list_res, _) = wait_rpc_resp(ws, list_id, RPC_TIMEOUT)?;
-        let loaded: Vec<String> = list_res
-            .get("data")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut cursor = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut loaded = Vec::new();
+        loop {
+            let params = cursor.as_ref().map_or_else(|| json!({}), |c| json!({"cursor": c}));
+            let list_id = send_rpc(ws, rpc_id, "thread/loaded/list", params)?;
+            let (page, _) = wait_rpc_resp(ws, list_id, RPC_TIMEOUT)?;
+            let ids = page["data"].as_array().ok_or("Codex returned an invalid thread list")?;
+            for value in ids {
+                let id = value.as_str().ok_or("Codex returned an invalid thread ID")?;
+                if Some(id) == requested {
+                    return Ok(id.to_string());
+                }
+                loaded.push(id.to_string());
+            }
+            let next = match &page["nextCursor"] {
+                Value::Null => break,
+                Value::String(s) if s.is_empty() => break,
+                Value::String(s) => s,
+                _ => return Err("Codex returned an invalid thread cursor".into()),
+            };
+            if !seen_cursors.insert(next.to_owned()) {
+                return Err("Codex returned a repeated thread cursor".into());
+            }
+            cursor = Some(next.to_string());
+        }
 
         if let Some(tid) = requested.filter(|s| !s.is_empty()) {
-            if loaded.iter().any(|x| x == tid) {
-                return Ok(tid.to_string());
-            }
-            // Thread may exist on disk but not yet loaded into the daemon; try thread/resume best-effort.
-            let res_id = send_rpc(ws, rpc_id, "thread/resume", json!({ "threadId": tid }))?;
-            match wait_rpc_resp(ws, res_id, RPC_TIMEOUT) {
-                Ok(_) => return Ok(tid.to_string()),
-                Err(e) => {
-                    return Err(format!(
-                        "codex thread {tid} is not attached to app-server daemon ({e}); ensure Codex started without -c overrides"
-                    ));
-                }
-            }
+            let id = send_rpc(ws, rpc_id, "thread/resume", json!({ "threadId": tid }))?;
+            wait_rpc_resp(ws, id, RPC_TIMEOUT)
+                .map_err(|e| format!("could not resume Codex thread {tid}: {e}"))?;
+            return Ok(tid.to_string());
         }
-
-        if loaded.len() == 1 {
-            return Ok(loaded.into_iter().next().unwrap());
-        }
-        if loaded.is_empty() {
-            return Err(
-                "no active Codex session found on app-server daemon; send one prompt or run /status in Codex first"
-                    .into(),
-            );
-        }
-        if let Some(hint) = cwd_hint.filter(|s| !s.is_empty()) {
-            let want = canonical_path_str(hint);
-            let mut best: Option<(i64, String)> = None;
-            for tid in &loaded {
-                let read_id = send_rpc(ws, rpc_id, "thread/read", json!({ "threadId": tid }))?;
-                if let Ok((res, _)) = wait_rpc_resp(ws, read_id, Duration::from_secs(3)) {
-                    let thread = res.get("thread").unwrap_or(&res);
-                    let t_cwd = thread.get("cwd").and_then(Value::as_str).unwrap_or("");
-                    if !t_cwd.is_empty() && (t_cwd == hint || canonical_path_str(t_cwd) == want) {
-                        let updated = thread.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
-                        if best.as_ref().is_none_or(|(b_ts, _)| updated >= *b_ts) {
-                            best = Some((updated, tid.clone()));
-                        }
-                    }
-                }
-            }
-            if let Some((_, tid)) = best {
-                return Ok(tid);
-            }
-        }
-        Err(format!(
-            "found {} active Codex sessions on daemon without --codex-thread; send a message in this Codex session or pass --codex-thread",
-            loaded.len()
-        ))
+        select_loaded_thread(&loaded, cwd_hint, |tid| {
+            let id = send_rpc(ws, rpc_id, "thread/read", json!({ "threadId": tid }))?;
+            let (res, _) = wait_rpc_resp(ws, id, Duration::from_secs(3))?;
+            res.get("thread").unwrap_or(&res)["cwd"].as_str()
+                .filter(|cwd| !cwd.is_empty()).map(str::to_owned)
+                .ok_or_else(|| "could not verify the Codex thread directory; pass --codex-thread".into())
+        })
     }
 
     /// Connects to Codex `app-server`, resolves the target thread, and completes SDP signaling
@@ -1614,7 +1643,12 @@ mod tests {
                     }
                     "initialized" => {}
                     "thread/loaded/list" => {
-                        write_ws(&mut conn, &json!({"id": id, "result": {"data": ["thread-mock-1"]}}));
+                        let page = match msg["params"].get("cursor") {
+                            None => json!({"data": ["other-thread"], "nextCursor": "page-two"}),
+                            Some(cursor) if cursor == "page-two" => json!({"data": ["thread-mock-1"]}),
+                            other => panic!("unexpected cursor: {other:?}"),
+                        };
+                        write_ws(&mut conn, &json!({"id": id, "result": page}));
                     }
                     "thread/realtime/start" => {
                         let offer_str = msg["params"]["transport"]["sdp"].as_str().unwrap();
