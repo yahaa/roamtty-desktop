@@ -63,6 +63,8 @@ fn ask_permissions() {
 
 pub fn run(args: &[String]) -> i32 {
     if cfg!(windows) && args.iter().any(|a| a == "--system") { SYSTEM.store(true, Ordering::Relaxed); }
+    #[cfg(target_os = "macos")]
+    plat::record_started_exe_ino();
     plat::detach_console();
     let _ = paths::ensure(&paths::desktop_dir());
     let token = session::random_b64(24);
@@ -103,7 +105,16 @@ fn handle(conn: Box<dyn Conn>, token: &str) {
     let rest = parts.next().unwrap_or("");
     let mut out = conn;
     if rest == "doctor" {
-        let j = serde_json::json!({ "needs": plat::needs(), "agent": true, "system": system_mode() });
+        let mut j = serde_json::json!({
+            "needs": plat::needs(),
+            "agent": true,
+            "system": system_mode(),
+            "ver": env!("CARGO_PKG_VERSION"),
+        });
+        #[cfg(target_os = "macos")]
+        if let Some(ino) = plat::started_exe_ino() {
+            j["exe_ino"] = serde_json::json!(ino);
+        }
         let _ = writeln!(out, "{j}");
         return;
     }
@@ -159,6 +170,8 @@ pub fn bridge(a: &serve::Args) -> i32 {
         println!("{}", serde_json::json!({ "error": code, "detail": detail }));
         1
     };
+    #[cfg(target_os = "macos")]
+    plat::reload_if_stale();
     let Some((token, mut conn)) = open() else {
         return fail("not_logged_in", "Roamtty Desktop is not running: log in to the computer's desktop");
     };
@@ -204,12 +217,52 @@ pub fn ask_doctor() -> Option<serde_json::Value> {
 #[cfg(target_os = "macos")]
 mod plat {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::atomic::AtomicU64;
 
     pub const LABEL: &str = "com.roamtty.desktop";
+    static STARTED_EXE_INO: AtomicU64 = AtomicU64::new(0);
     fn socket() -> PathBuf { paths::desktop_dir().join("agent.sock") }
     pub fn app_dir() -> PathBuf { paths::root().join("Roamtty Desktop.app") }
     fn plist_path() -> PathBuf { paths::home().join("Library/LaunchAgents").join(format!("{LABEL}.plist")) }
+
+    fn current_exe_ino() -> Option<u64> {
+        let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok()?;
+        Some(std::fs::metadata(exe).ok()?.ino())
+    }
+
+    pub fn record_started_exe_ino() {
+        if let Some(ino) = current_exe_ino() {
+            STARTED_EXE_INO.store(ino, Ordering::Relaxed);
+        }
+    }
+
+    pub fn started_exe_ino() -> Option<u64> {
+        let ino = STARTED_EXE_INO.load(Ordering::Relaxed);
+        (ino != 0).then_some(ino)
+    }
+
+    /// If `Roamtty Desktop.app` on disk was replaced (e.g. by a headless voice upgrade) while an
+    /// older LaunchAgent process stayed running, macOS `tccd` rejects the stale PID's code signature
+    /// (`-67049`) and silently drops all `CGEvent::post` mouse/keyboard events. Reload quietly first.
+    pub fn reload_if_stale() {
+        let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) else { return };
+        let Ok(app_exe) = app_dir().join("Contents/MacOS/roamtty-desktop").canonicalize() else { return };
+        if exe != app_exe { return; }
+        let Some(doc) = ask_doctor() else { return };
+        let ver_ok = doc["ver"].as_str() == Some(env!("CARGO_PKG_VERSION"));
+        let ino_ok = current_exe_ino().is_some_and(|ino| doc["exe_ino"].as_u64() == Some(ino));
+        if ver_ok && ino_ok { return; }
+        crate::log!(
+            "agent stale (running ver={:?} ino={:?}, disk ver={} ino={:?}); reloading LaunchAgent",
+            doc["ver"].as_str(),
+            doc["exe_ino"].as_u64(),
+            env!("CARGO_PKG_VERSION"),
+            current_exe_ino()
+        );
+        let _ = install_inner(true);
+    }
 
     impl Conn for UnixStream {
         fn split(&self) -> std::io::Result<Box<dyn Conn>> { Ok(Box::new(self.try_clone()?)) }
@@ -248,7 +301,10 @@ mod plat {
 
     /// Builds `Roamtty Desktop.app` around this binary, signs it (Developer ID builds keep their
     /// signature; a bare binary is signed ad hoc), and (re)loads the LaunchAgent in the GUI session.
-    pub fn install() -> i32 {
+    pub fn install() -> i32 { install_inner(false) }
+
+    fn install_inner(quiet: bool) -> i32 {
+        let say = |msg: &str| { if !quiet { println!("{msg}"); } };
         let app = app_dir();
         let macos = app.join("Contents/MacOS");
         if paths::ensure(&macos).is_err() { return 1; }
@@ -258,7 +314,7 @@ mod plat {
             .args(["--verify", "--strict"]).arg(&app).status().is_ok_and(|s| s.success());
         if exe != target && !release {
             let tmp = target.with_extension("new");
-            if std::fs::copy(&exe, &tmp).is_err() || std::fs::rename(&tmp, &target).is_err() { println!("copy failed"); return 1; }
+            if std::fs::copy(&exe, &tmp).is_err() || std::fs::rename(&tmp, &target).is_err() { say("copy failed"); return 1; }
         }
         // A notarized Developer ID bundle (the release) is used as it is: touching it would break the
         // signature. A bare binary gets a bundle and an ad-hoc signature, so TCC can still record it.
@@ -266,7 +322,7 @@ mod plat {
             .map(|o| String::from_utf8_lossy(&o.stderr).contains("Authority=Developer ID Application")).unwrap_or(false);
         if !signed && std::fs::write(app.join("Contents/Info.plist"), info_plist()).is_err() { return 1; }
         if !signed && !run_quiet("codesign", &["--force", "--deep", "--options", "runtime", "-s", "-", app.to_str().unwrap()]) {
-            println!("codesign failed");
+            say("codesign failed");
             return 1;
         }
         let log = paths::log_dir().join("agent.log");
@@ -298,14 +354,14 @@ mod plat {
         }
         let bootstrap = || run_quiet("launchctl", &["bootstrap", &domain, plist_path().to_str().unwrap()]);
         if !(0..5).any(|i| { if i > 0 { std::thread::sleep(std::time::Duration::from_millis(500)); } bootstrap() }) {
-            println!("launchctl bootstrap failed: nobody logged in to the desktop?");
+            say("launchctl bootstrap failed: nobody logged in to the desktop?");
             return 5;
         }
         for _ in 0..50 {
-            if socket().exists() && ask_doctor().is_some() { println!("agent ok"); return 0; }
+            if socket().exists() && ask_doctor().is_some() { say("agent ok"); return 0; }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        println!("agent did not start");
+        say("agent did not start");
         1
     }
 
