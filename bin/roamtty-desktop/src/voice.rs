@@ -31,7 +31,7 @@ const MIC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SPK_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SPK_FRAME_MAX_LEN: usize = 1024 * 1024;
 const MAX_SPK_AUDIO_CHUNK: usize = 960;
-const MIC_SAMPLE_RATE: u32 = 16_000;
+pub(crate) const MIC_SAMPLE_RATE: u32 = 16_000;
 const CHANNELS: u8 = 1;
 const JETSKI_PREFIX: &[u8] = b"JETSKI-AUDIO/1 ";
 const SPK_ERR_MAX_BYTES: usize = 235;
@@ -49,6 +49,67 @@ const EV_CHANNEL_CAPACITY: usize = 512;
 const MAX_EVENT_DRAIN: usize = 64;
 const MAX_AGY_CONNS: usize = 32;
 const EXIT_BIND_FAILED: i32 = 10;
+const EXIT_CODEX_FAILED: i32 = 11;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VoiceBackend {
+    Agy,
+    Codex(crate::voice_codex::CodexConfig),
+}
+
+fn parse_backend(args: &[String]) -> Result<VoiceBackend, (&'static str, String)> {
+    match flag(args, "--backend").unwrap_or("agy") {
+        "agy" => Ok(VoiceBackend::Agy),
+        "codex" => {
+            let thread_id = match flag(args, "--codex-thread") {
+                Some(t) if !t.is_empty() => {
+                    if !crate::voice_codex::is_valid_thread_id(t) {
+                        return Err(("internal", "invalid --codex-thread".into()));
+                    }
+                    Some(t.to_string())
+                }
+                _ => None,
+            };
+            let cwd = flag(args, "--codex-cwd")
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let sock_path = flag(args, "--codex-sock")
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let voice = match flag(args, "--codex-voice") {
+                Some(v) if !v.is_empty() => {
+                    if !crate::voice_codex::is_valid_voice_name(v) {
+                        return Err(("internal", "invalid --codex-voice".into()));
+                    }
+                    Some(v.to_string())
+                }
+                _ => None,
+            };
+            Ok(VoiceBackend::Codex(crate::voice_codex::CodexConfig {
+                thread_id,
+                cwd,
+                sock_path,
+                voice,
+            }))
+        }
+        other => Err(("internal", format!("unsupported --backend: {other}"))),
+    }
+}
+
+fn daemon_err_path(sess: &str) -> PathBuf {
+    voice_dir().join(format!("{sess}.err"))
+}
+
+fn write_daemon_err(sess: &str, msg: &str) {
+    let _ = std::fs::write(daemon_err_path(sess), msg.as_bytes());
+}
+
+fn take_daemon_err(sess: &str) -> Option<String> {
+    let path = daemon_err_path(sess);
+    let text = std::fs::read_to_string(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    text.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
 
 fn voice_dir() -> PathBuf {
     paths::desktop_dir().join("voice")
@@ -70,7 +131,7 @@ fn print_start_error(code: &str, detail: Option<String>, min: Option<u32>, max: 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AttachReq {
+pub(crate) struct AttachReq {
     ipc_token: String,
     proto: u32,
     resume: Option<String>,
@@ -111,6 +172,10 @@ pub fn cmd(args: &[String]) -> i32 {
     };
     let resume = flag(args, "--resume").map(String::from);
     let token = flag(args, "--token").map(String::from);
+    let backend = match parse_backend(args) {
+        Ok(b) => b,
+        Err((code, detail)) => return print_start_error(code, Some(detail), None, None),
+    };
     let ssh_client = std::env::var("SSH_CLIENT").ok();
 
     // 1. If --resume <S> --token <T> was supplied, attempt takeover on that session's daemon first.
@@ -122,14 +187,14 @@ pub fn cmd(args: &[String]) -> i32 {
         }
     }
 
-    // 2. Otherwise (fresh start, expired daemon, or unauthorized resume token): evict any idle/disconnected
-    //    daemon still holding the preferred port (and clean up stale IPC files), then spawn a fresh daemon.
-    if port != 0 {
+    // 2. Otherwise (fresh start, expired daemon, or unauthorized resume token):
+    //    only the `agy` backend owns a loopback TCP port, so only `agy` evicts idle daemons on `port`.
+    if matches!(backend, VoiceBackend::Agy) && port != 0 {
         evict_idle_daemons_on_port(port);
     }
     let new_session = session::hex(&session::random_bytes(8));
     let idle_secs = idle_timeout_arg.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
-    match spawn_and_attach(&new_session, proto_ver, port, idle_secs, ssh_client) {
+    match spawn_and_attach(&new_session, proto_ver, port, idle_secs, ssh_client, &backend) {
         Ok(conn) => relay_to_stdio(conn),
         Err((code, detail)) => print_start_error(code, Some(detail), None, None),
     }
@@ -265,18 +330,52 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
     }
     let port = flag(args, "--port").and_then(|p| p.parse::<u16>().ok()).unwrap_or(DEFAULT_PORT);
     let idle_secs = flag(args, "--idle-timeout").and_then(|t| t.parse::<u64>().ok()).unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+    let backend = match parse_backend(args) {
+        Ok(b) => b,
+        Err((_, detail)) => {
+            crate::log!("voice-daemon invalid backend: {detail}");
+            return 2;
+        }
+    };
 
     if let Err(e) = paths::ensure(&voice_dir()) {
         crate::log!("voice-daemon dir error: {e}");
         return 1;
     }
-    let (mic_listener, mic_port) = match bind_mic_listener(port) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::log!("voice-daemon bind failed: {e}");
-            return EXIT_BIND_FAILED;
-        }
+
+    enum PreparedBackend {
+        Agy {
+            mic_listener: TcpListener,
+            mic_port: u16,
+        },
+        Codex(crate::voice_codex::PreparedCodexSession),
+    }
+
+    let prepared = match backend {
+        VoiceBackend::Agy => match bind_mic_listener(port) {
+            Ok((mic_listener, mic_port)) => PreparedBackend::Agy {
+                mic_listener,
+                mic_port,
+            },
+            Err(e) => {
+                crate::log!("voice-daemon bind failed: {e}");
+                return EXIT_BIND_FAILED;
+            }
+        },
+        VoiceBackend::Codex(cfg) => match crate::voice_codex::prepare(&cfg) {
+            Ok(session) => PreparedBackend::Codex(session),
+            Err(e) => {
+                crate::log!("voice-daemon codex prepare failed: {e}");
+                write_daemon_err(&sess_id, &e);
+                return EXIT_CODEX_FAILED;
+            }
+        },
     };
+    let mic_port = match &prepared {
+        PreparedBackend::Agy { mic_port, .. } => *mic_port,
+        PreparedBackend::Codex(_) => 0,
+    };
+
     let ipc_token = session::random_b64(24);
     let session = Session {
         session: sess_id.clone(),
@@ -297,13 +396,21 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
     let client_connected = Arc::new(AtomicBool::new(false));
     let next_stream_id = Arc::new(AtomicU32::new(1));
 
-    let mic_accept = spawn_mic_accept_loop(
-        mic_listener,
-        next_stream_id,
-        ev_tx.clone(),
-        client_connected.clone(),
-        shutdown.clone(),
-    );
+    let backend_thread = match prepared {
+        PreparedBackend::Agy { mic_listener, .. } => spawn_mic_accept_loop(
+            mic_listener,
+            next_stream_id,
+            ev_tx.clone(),
+            client_connected.clone(),
+            shutdown.clone(),
+        ),
+        PreparedBackend::Codex(codex_sess) => crate::voice_codex::spawn_backend(
+            codex_sess,
+            next_stream_id,
+            ev_tx.clone(),
+            shutdown.clone(),
+        ),
+    };
     spawn_ipc_accept_loop(ipc_listener, ipc_token, ev_tx.clone(), shutdown.clone());
 
     let mut engine = VoiceEngine::new(
@@ -318,7 +425,7 @@ pub fn daemon_cmd(args: &[String]) -> i32 {
     let exit = engine.run(ev_rx);
 
     shutdown.store(true, Ordering::SeqCst);
-    let _ = mic_accept.join();
+    let _ = backend_thread.join();
     ipc::cleanup(&sess_id);
     if let Some(c) = exit.active_client {
         c.close();
@@ -385,6 +492,7 @@ fn spawn_and_attach(
     port: u16,
     idle_secs: u64,
     ssh_client: Option<String>,
+    backend: &VoiceBackend,
 ) -> Result<Box<dyn IpcConn>, (&'static str, String)> {
     let exe = std::env::current_exe().map_err(|e| ("internal", e.to_string()))?;
     let mut cmd = std::process::Command::new(exe);
@@ -396,10 +504,30 @@ fn spawn_and_attach(
         &port.to_string(),
         "--idle-timeout",
         &idle_secs.to_string(),
-    ])
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
+    ]);
+    match backend {
+        VoiceBackend::Agy => {
+            cmd.args(["--backend", "agy"]);
+        }
+        VoiceBackend::Codex(cfg) => {
+            cmd.args(["--backend", "codex"]);
+            if let Some(tid) = &cfg.thread_id {
+                cmd.args(["--codex-thread", tid]);
+            }
+            if let Some(cwd) = &cfg.cwd {
+                cmd.args(["--codex-cwd", cwd]);
+            }
+            if let Some(sock) = &cfg.sock_path {
+                cmd.args(["--codex-sock", sock]);
+            }
+            if let Some(voice) = &cfg.voice {
+                cmd.args(["--codex-voice", voice]);
+            }
+        }
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(unix)]
     {
@@ -420,12 +548,21 @@ fn spawn_and_attach(
     }
 
     let mut child = cmd.spawn().map_err(|e| ("internal", format!("spawn voice-daemon: {e}")))?;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let ready_timeout = match backend {
+        VoiceBackend::Agy => Duration::from_secs(4),
+        VoiceBackend::Codex(_) => Duration::from_secs(16),
+    };
+    let deadline = Instant::now() + ready_timeout;
     while Instant::now() < deadline {
         if let Ok(Some(status)) = child.try_wait() {
             let code = status.code().unwrap_or(1);
             if code == EXIT_BIND_FAILED {
                 return Err(("bind_failed", format!("failed to bind loopback voice port (requested {port})")));
+            }
+            if code == EXIT_CODEX_FAILED {
+                let detail = take_daemon_err(sess_id)
+                    .unwrap_or_else(|| "Codex voice failed to initialize".into());
+                return Err(("codex_voice_failed", detail));
             }
             return Err(("internal", format!("voice-daemon exited early ({code})")));
         }
@@ -436,6 +573,7 @@ fn spawn_and_attach(
     }
     let _ = child.kill();
     let _ = child.wait();
+    let _ = take_daemon_err(sess_id);
     ipc::cleanup(sess_id);
     Err(("internal", "voice-daemon did not become ready in time".into()))
 }
@@ -750,19 +888,40 @@ fn read_exact_interruptible(
 // Core Voice Engine (transport-agnostic & directly testable)
 // ============================================================================
 
-struct MicQueue {
-    chunks: VecDeque<Vec<u8>>,
-    closed: bool,
+pub(crate) struct MicQueue {
+    pub(crate) chunks: VecDeque<Vec<u8>>,
+    pub(crate) closed: bool,
 }
 
-struct MicStreamHandle {
+pub(crate) struct MicStreamHandle {
     queue: Arc<(Mutex<MicQueue>, Condvar)>,
     opus_jb: Arc<Mutex<Option<VoiceJitterBuffer>>>,
-    sock: TcpStream,
+    closer: Box<dyn Fn() + Send + Sync>,
     announced_to_epoch: Option<u64>,
 }
 
 impl MicStreamHandle {
+    fn from_tcp(
+        queue: Arc<(Mutex<MicQueue>, Condvar)>,
+        opus_jb: Arc<Mutex<Option<VoiceJitterBuffer>>>,
+        sock: TcpStream,
+    ) -> Self {
+        Self::with_closer(queue, opus_jb, Box::new(move || { let _ = sock.shutdown(Shutdown::Both); }))
+    }
+
+    pub(crate) fn with_closer(
+        queue: Arc<(Mutex<MicQueue>, Condvar)>,
+        opus_jb: Arc<Mutex<Option<VoiceJitterBuffer>>>,
+        closer: Box<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            queue,
+            opus_jb,
+            closer,
+            announced_to_epoch: None,
+        }
+    }
+
     fn push(&self, pcm: Vec<u8>) {
         let (lock, cvar) = &*self.queue;
         let mut q = lock.lock().unwrap();
@@ -811,7 +970,7 @@ impl MicStreamHandle {
             q.chunks.clear();
         }
         cvar.notify_all();
-        let _ = self.sock.shutdown(Shutdown::Both);
+        (self.closer)();
     }
 }
 
@@ -917,7 +1076,7 @@ struct SpkStreamState {
     link_ctrl: VoiceLinkController,
 }
 
-enum Event {
+pub(crate) enum Event {
     ClientAttach {
         req: AttachReq,
         input: Box<dyn Read + Send>,
@@ -1431,7 +1590,8 @@ impl VoiceEngine {
                 }
             }
             Event::EvictIdle { port, reply_tx, flushed_rx } => {
-                if self.mic_port == port
+                if self.mic_port != 0
+                    && self.mic_port == port
                     && self.attached_once
                     && !self.client.as_ref().is_some_and(|c| c.is_connected())
                 {
@@ -2103,12 +2263,7 @@ fn handle_mic_conn(
     ));
     let opus_jb: Arc<Mutex<Option<VoiceJitterBuffer>>> = Arc::new(Mutex::new(None));
     let notified = Arc::new(AtomicBool::new(false));
-    let handle = MicStreamHandle {
-        queue: queue.clone(),
-        opus_jb: opus_jb.clone(),
-        sock: close_stream,
-        announced_to_epoch: None,
-    };
+    let handle = MicStreamHandle::from_tcp(queue.clone(), opus_jb.clone(), close_stream);
 
     if ev_tx.send(Event::AgyMicOpen { stream_id, handle }).is_err() {
         let _ = read_stream.shutdown(Shutdown::Both);

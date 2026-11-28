@@ -486,3 +486,212 @@ fn cli_voice_explicit_shutdown_rapid_reconnect_without_polling() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_voice_codex_backend_isolated_from_agy_and_clean_shutdown() {
+    use base64ct::{Base64, Encoding};
+    use serde_json::{json, Value};
+    use sha1::{Digest, Sha1};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let exe = env!("CARGO_BIN_EXE_roamtty-desktop");
+    let root = std::env::temp_dir().join(format!("roamtty-voice-codex-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    // 1. Invalid --backend returns structured StartError.
+    let bad = Command::new(exe)
+        .args(["voice", "--proto", "1", "--backend", "nope"])
+        .env("ROAMTTY_DESKTOP_ROOT", &root)
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(1));
+    let err: StartError = serde_json::from_slice(&bad.stdout).unwrap();
+    assert_eq!(err.error, "internal");
+
+    // 2. Start an `agy` daemon first on an ephemeral port and keep it alive (simulates active agy call).
+    let mut agy_proc = Command::new(exe)
+        .args(["voice", "--proto", "1", "--port", "0", "--idle-timeout", "30"])
+        .env("ROAMTTY_DESKTOP_ROOT", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut agy_stdin = agy_proc.stdin.take().unwrap();
+    let mut agy_out = BufReader::new(agy_proc.stdout.take().unwrap());
+    let mut agy_line = String::new();
+    agy_out.read_line(&mut agy_line).unwrap();
+    let agy_hello: VoiceHello = serde_json::from_str(&agy_line).unwrap();
+    assert_ne!(agy_hello.mic_port, 0);
+
+    // 3. Spin up a mock Codex app-server Unix WebSocket daemon.
+    let sock_path = root.join("mock-codex.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let stop_seen = Arc::new(AtomicBool::new(false));
+    let stop_seen_srv = stop_seen.clone();
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = conn.read(&mut tmp).unwrap();
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let req = String::from_utf8_lossy(&buf);
+        let key = req
+            .lines()
+            .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+            .unwrap()
+            .trim();
+        let mut hasher = Sha1::new();
+        hasher.update(key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let accept = Base64::encode_string(&hasher.finalize());
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+        conn.write_all(resp.as_bytes()).unwrap();
+
+        fn read_ws(conn: &mut std::os::unix::net::UnixStream) -> Option<Value> {
+            let mut h = [0u8; 2];
+            conn.read_exact(&mut h).ok()?;
+            let op = h[0] & 0x0F;
+            let mut plen = (h[1] & 0x7F) as usize;
+            if plen == 126 {
+                let mut b = [0u8; 2];
+                conn.read_exact(&mut b).ok()?;
+                plen = u16::from_be_bytes(b) as usize;
+            } else if plen == 127 {
+                let mut b = [0u8; 8];
+                conn.read_exact(&mut b).ok()?;
+                plen = u64::from_be_bytes(b) as usize;
+            }
+            let mut mask = [0u8; 4];
+            conn.read_exact(&mut mask).ok()?;
+            let mut data = vec![0u8; plen];
+            conn.read_exact(&mut data).ok()?;
+            for (i, b) in data.iter_mut().enumerate() {
+                *b ^= mask[i & 3];
+            }
+            if op == 8 {
+                return None;
+            }
+            serde_json::from_slice(&data).ok()
+        }
+
+        fn write_ws(conn: &mut std::os::unix::net::UnixStream, v: &Value) {
+            let s = serde_json::to_string(v).unwrap();
+            let b = s.as_bytes();
+            let mut frame = Vec::new();
+            frame.push(0x81);
+            if b.len() < 126 {
+                frame.push(b.len() as u8);
+            } else {
+                frame.push(126);
+                frame.extend_from_slice(&(b.len() as u16).to_be_bytes());
+            }
+            frame.extend_from_slice(b);
+            let _ = conn.write_all(&frame);
+        }
+
+        let mut ans_rtc = str0m::RtcConfig::new()
+            .set_crypto_provider(str0m_rust_crypto::default_provider().into())
+            .clear_codecs()
+            .enable_opus(true, false)
+            .build(Instant::now());
+        ans_rtc.add_local_candidate(
+            str0m::Candidate::host("127.0.0.1:49998".parse().unwrap(), str0m::net::Protocol::Udp)
+                .unwrap(),
+        );
+
+        while let Some(msg) = read_ws(&mut conn) {
+            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = msg.get("id").and_then(Value::as_u64);
+            match method {
+                "initialize" => write_ws(&mut conn, &json!({"id": id, "result": {}})),
+                "initialized" => {}
+                "thread/loaded/list" => {
+                    write_ws(&mut conn, &json!({"id": id, "result": {"data": ["thread-e2e-1"]}}));
+                }
+                "thread/realtime/start" => {
+                    let offer_str = msg["params"]["transport"]["sdp"].as_str().unwrap();
+                    let offer = str0m::change::SdpOffer::from_sdp_string(offer_str).unwrap();
+                    let answer = ans_rtc.sdp_api().accept_offer(offer).unwrap();
+                    write_ws(&mut conn, &json!({"id": id, "result": {}}));
+                    write_ws(
+                        &mut conn,
+                        &json!({
+                            "method": "thread/realtime/sdp",
+                            "params": { "threadId": "thread-e2e-1", "sdp": answer.to_sdp_string() }
+                        }),
+                    );
+                }
+                "thread/realtime/stop" => {
+                    stop_seen_srv.store(true, Ordering::SeqCst);
+                    write_ws(&mut conn, &json!({"id": id, "result": {}}));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // 4. Launch Codex voice concurrently with the active `agy` daemon.
+    let mut codex_proc = Command::new(exe)
+        .args([
+            "voice",
+            "--proto", "1",
+            "--backend", "codex",
+            "--codex-thread", "thread-e2e-1",
+            "--codex-sock", sock_path.to_str().unwrap(),
+            "--idle-timeout", "0",
+        ])
+        .env("ROAMTTY_DESKTOP_ROOT", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut codex_stdin = codex_proc.stdin.take().unwrap();
+    let mut codex_out = BufReader::new(codex_proc.stdout.take().unwrap());
+    let mut codex_line = String::new();
+    codex_out.read_line(&mut codex_line).unwrap();
+    let codex_hello: VoiceHello = serde_json::from_str(&codex_line).unwrap();
+    assert_eq!(codex_hello.mic_port, 0, "codex backend must not bind a loopback TCP mic port");
+    assert_eq!(codex_hello.codecs, vec!["opus", "pcm16"]);
+    assert!(codex_hello.udp.is_some());
+
+    // 5. Verify the concurrent `agy` daemon's loopback port is STILL bound and untouched!
+    assert!(
+        TcpListener::bind(("127.0.0.1", agy_hello.mic_port)).is_err(),
+        "starting codex voice must never evict or disturb active agy daemon"
+    );
+
+    // 6. Send explicit shutdown to codex -> daemon must call thread/realtime/stop and exit cleanly.
+    let (t, p) = proto::encode_client(&ClientMsg::Config(proto::Config {
+        shutdown: Some(true),
+        ..Default::default()
+    }));
+    proto::write_frame(&mut codex_stdin, t, &p).unwrap();
+    codex_stdin.flush().unwrap();
+    drop(codex_stdin);
+    drop(codex_out);
+    assert!(codex_proc.wait().unwrap().success());
+    server.join().unwrap();
+    assert!(stop_seen.load(Ordering::SeqCst), "codex shutdown must invoke thread/realtime/stop");
+
+    // 7. Cleanly shut down the `agy` daemon as well.
+    proto::write_frame(&mut agy_stdin, t, &p).unwrap();
+    agy_stdin.flush().unwrap();
+    drop(agy_stdin);
+    drop(agy_out);
+    assert!(agy_proc.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&root);
+}
